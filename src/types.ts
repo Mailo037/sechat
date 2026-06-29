@@ -77,6 +77,14 @@ export type VoiceParticipantState = {
   speaking?: boolean
 }
 
+export type VoiceKickState = {
+  authorId: string
+  kickedUntil: number
+  moderatorId?: string
+  moderatorName: string
+  reason: string
+}
+
 export type VoiceSignalType = "offer" | "answer" | "candidate"
 
 export type VoiceSignal = {

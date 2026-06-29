@@ -27,6 +27,7 @@ import type {
   SoundKind,
   UserModerationState,
   UsernameClaim,
+  VoiceKickState,
   VoiceParticipantState,
   VoiceSignal,
   VoiceSignalType,
@@ -493,6 +494,50 @@ export async function removeRemoteVoicePresence() {
 
   const roomId = getFirebaseRoomId()
   await deleteDoc(doc(current.db, "rooms", roomId, "voiceParticipants", user.uid))
+}
+
+export function listenToRemoteVoiceKick(
+  authorId: string,
+  onKick: (kick: VoiceKickState | null) => void,
+  onError: (error: Error) => void
+): Unsubscribe | null {
+  const current = getFirebaseServices()
+  if (!current || !authorId) return null
+
+  const roomId = getFirebaseRoomId()
+  return onSnapshot(
+    doc(current.db, "rooms", roomId, "voiceKicks", authorId),
+    (snapshot) => onKick(toVoiceKickState(authorId, snapshot.data())),
+    (error) => onError(error)
+  )
+}
+
+export async function kickRemoteVoiceParticipant(input: {
+  authorId: string
+  moderatorName: string
+  reason?: string
+}) {
+  const current = getFirebaseServices()
+  const user = await ensureAnonymousUser()
+  if (!current || !user || !input.authorId) {
+    throw new Error("Firebase is not configured")
+  }
+
+  const now = Date.now()
+  const roomId = getFirebaseRoomId()
+  await Promise.all([
+    setDoc(doc(current.db, "rooms", roomId, "voiceKicks", input.authorId), {
+      authorId: input.authorId,
+      clientCreatedAt: now,
+      createdAt: serverTimestamp(),
+      kickedUntil: now + 45000,
+      moderatorId: user.uid,
+      moderatorName: input.moderatorName.trim() || "Admin",
+      reason: input.reason?.trim() || "Removed from voice chat",
+    }),
+    deleteDoc(doc(current.db, "rooms", roomId, "voiceParticipants", input.authorId)),
+    deleteRemoteVoiceSignalsForUser(input.authorId),
+  ])
 }
 
 export function listenToRemoteVoiceSignals(
@@ -1048,6 +1093,33 @@ function toVoiceParticipant(
     lastSeenAt,
     name: typeof data.name === "string" && data.name.trim() ? data.name : "User",
     speaking: data.speaking === true,
+  }
+}
+
+function toVoiceKickState(
+  authorId: string,
+  data: DocumentData | undefined
+): VoiceKickState | null {
+  if (!data) return null
+
+  const kickedUntil =
+    typeof data.kickedUntil === "number" ? data.kickedUntil : 0
+  if (kickedUntil <= Date.now()) return null
+
+  return {
+    authorId:
+      typeof data.authorId === "string" && data.authorId ? data.authorId : authorId,
+    kickedUntil,
+    moderatorId:
+      typeof data.moderatorId === "string" ? data.moderatorId : undefined,
+    moderatorName:
+      typeof data.moderatorName === "string" && data.moderatorName.trim()
+        ? data.moderatorName
+        : "Admin",
+    reason:
+      typeof data.reason === "string" && data.reason.trim()
+        ? data.reason
+        : "Removed from voice chat",
   }
 }
 

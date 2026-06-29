@@ -213,6 +213,33 @@ service cloud.firestore {
         );
     }
 
+    function validVoiceKickPayload() {
+      return request.resource.data.keys().hasOnly([
+          "authorId",
+          "clientCreatedAt",
+          "createdAt",
+          "kickedUntil",
+          "moderatorId",
+          "moderatorName",
+          "reason"
+        ])
+        && request.resource.data.authorId is string
+        && request.resource.data.authorId.size() > 0
+        && request.resource.data.authorId.size() <= 160
+        && request.resource.data.clientCreatedAt is number
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.kickedUntil is number
+        && request.resource.data.kickedUntil > request.time.toMillis()
+        && request.resource.data.kickedUntil <= request.time.toMillis() + 10 * 60 * 1000
+        && request.resource.data.moderatorId == request.auth.uid
+        && request.resource.data.moderatorName is string
+        && request.resource.data.moderatorName.size() > 0
+        && request.resource.data.moderatorName.size() <= 80
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() > 0
+        && request.resource.data.reason.size() <= 180;
+    }
+
     function validFileContentType() {
       return request.resource.data.mimeType.matches('image/(avif|gif|jpeg|png|webp)')
         || request.resource.data.mimeType.matches('audio/.*')
@@ -326,7 +353,15 @@ service cloud.firestore {
           && authorId == request.auth.uid
           && notModerated(roomId)
           && validVoicePresencePayload(roomId);
-        allow delete: if signedIn() && authorId == request.auth.uid;
+        allow delete: if signedIn();
+      }
+
+      match /voiceKicks/{authorId} {
+        allow read: if signedIn() && authorId == request.auth.uid;
+        allow create, update: if signedIn()
+          && request.resource.data.authorId == authorId
+          && validVoiceKickPayload();
+        allow delete: if signedIn();
       }
 
       match /voiceSignals/{signalId} {
@@ -334,8 +369,7 @@ service cloud.firestore {
           && (resource.data.to == request.auth.uid || resource.data.from == request.auth.uid);
         allow create: if signedIn() && notModerated(roomId) && validVoiceSignalPayload();
         allow update: if false;
-        allow delete: if signedIn()
-          && (resource.data.to == request.auth.uid || resource.data.from == request.auth.uid);
+        allow delete: if signedIn();
       }
 
       match /files/{fileId} {

@@ -1,13 +1,16 @@
 import { getApps, initializeApp, type FirebaseApp } from "firebase/app"
 import {
+  browserLocalPersistence,
   connectAuthEmulator,
   getAuth,
   GoogleAuthProvider,
+  indexedDBLocalPersistence,
   linkWithPopup,
   onAuthStateChanged,
   signInAnonymously,
   signInWithPopup,
   signOut,
+  setPersistence,
   type Auth,
   type Unsubscribe,
   type User,
@@ -34,6 +37,8 @@ export type FirebaseAuthUser = {
 
 let services: FirebaseServices | null = null
 let emulatorsConnected = false
+let authPersistencePromise: Promise<void> | null = null
+let initialAuthStatePromise: Promise<User | null> | null = null
 
 function configValue(key: keyof SechatFirebaseConfig) {
   const value = __SECHAT_FIREBASE_CONFIG__[key]
@@ -100,6 +105,10 @@ export async function ensureAnonymousUser(): Promise<User | null> {
   const current = getFirebaseServices()
   if (!current) return null
 
+  await ensureIndexedDbAuthPersistence(current.auth)
+
+  const restoredUser = await waitForInitialAuthState(current.auth)
+  if (restoredUser) return restoredUser
   if (current.auth.currentUser) return current.auth.currentUser
 
   const credential = await signInAnonymously(current.auth)
@@ -118,6 +127,9 @@ export function listenToFirebaseAuth(
 export async function signInWithGoogleAccount() {
   const current = getFirebaseServices()
   if (!current) throw new Error("Firebase is not configured")
+
+  await ensureIndexedDbAuthPersistence(current.auth)
+  await waitForInitialAuthState(current.auth)
 
   const provider = new GoogleAuthProvider()
   provider.setCustomParameters({ prompt: "select_account" })
@@ -142,9 +154,41 @@ export async function signOutToAnonymousUser() {
   const current = getFirebaseServices()
   if (!current) return null
 
+  await ensureIndexedDbAuthPersistence(current.auth)
   await signOut(current.auth)
   const user = await ensureAnonymousUser()
   return toFirebaseAuthUser(user)
+}
+
+function ensureIndexedDbAuthPersistence(auth: Auth) {
+  authPersistencePromise ??= setPersistence(auth, indexedDBLocalPersistence).catch(
+    async (error) => {
+      console.warn("IndexedDB auth persistence failed, falling back to local persistence", error)
+      await setPersistence(auth, browserLocalPersistence)
+    }
+  )
+
+  return authPersistencePromise
+}
+
+function waitForInitialAuthState(auth: Auth) {
+  if (auth.currentUser) return Promise.resolve(auth.currentUser)
+
+  initialAuthStatePromise ??= new Promise<User | null>((resolve) => {
+    const unsubscribe = onAuthStateChanged(
+      auth,
+      (user) => {
+        unsubscribe()
+        resolve(user)
+      },
+      () => {
+        unsubscribe()
+        resolve(auth.currentUser)
+      }
+    )
+  })
+
+  return initialAuthStatePromise
 }
 
 function toRequiredFirebaseAuthUser(user: User) {

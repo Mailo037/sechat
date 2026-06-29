@@ -3,9 +3,11 @@ import {
   useMemo,
   useRef,
   useState,
+  type ClipboardEvent as ReactClipboardEvent,
   type CSSProperties,
   type DragEvent as ReactDragEvent,
   type FormEvent as ReactFormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react"
@@ -76,9 +78,11 @@ import {
   clearRemoteUserModeration,
   deleteRemoteMessage,
   deleteRemoteVoiceSignalsForUser,
+  kickRemoteVoiceParticipant,
   listenToRemoteMessages,
   listenToRemoteModeration,
   listenToRemoteUsers,
+  listenToRemoteVoiceKick,
   listenToRemoteVoiceParticipants,
   listenToRemoteVoiceSignals,
   prepareRemoteChat,
@@ -121,6 +125,17 @@ type LinkDialogState = {
 type MediaViewerState = {
   attachment: MessageAttachment
 }
+type MentionRange = {
+  end: number
+  query: string
+  start: number
+}
+type MentionSuggestion = {
+  avatar?: string
+  id: string
+  mention: string
+  name: string
+}
 type RecordingMode = "idle" | "recording" | "ready" | "processing" | "discarding"
 type AudioDraft = {
   dataUrl: string
@@ -161,8 +176,19 @@ type VoiceParticipant = {
   avatar?: string
   id: string
   isSelf: boolean
+  muted?: boolean
   name: string
   speaking?: boolean
+}
+type VoiceConnectionStats = {
+  connection: RTCPeerConnectionState | "idle"
+  jitterMs?: number
+  packetsLost: number
+  peers: number
+  pingMs?: number
+}
+type SinkAudioElement = HTMLAudioElement & {
+  setSinkId?: (sinkId: string) => Promise<void>
 }
 
 const AUDIO_BAR_COUNT = 44
@@ -464,6 +490,20 @@ function usernameValidationError(value: string) {
   return null
 }
 
+function activeMentionRange(value: string, cursorPosition: number): MentionRange | null {
+  const beforeCursor = value.slice(0, cursorPosition)
+  const match = /(^|\s)@([A-Za-z0-9_.-]{0,31})$/.exec(beforeCursor)
+  if (!match) return null
+
+  const query = match[2] ?? ""
+  const start = beforeCursor.length - query.length - 1
+  return {
+    end: cursorPosition,
+    query,
+    start,
+  }
+}
+
 function normalizeUsernameClaim(value: unknown): UsernameClaim | null {
   if (!value || typeof value !== "object") return null
   const claim = value as Partial<UsernameClaim>
@@ -751,12 +791,36 @@ function makeQuietWaveform(count = AUDIO_BAR_COUNT) {
   })
 }
 
+function averageRounded(values: number[]) {
+  if (!values.length) return undefined
+  const total = values.reduce((sum, value) => sum + value, 0)
+  return Math.max(0, Math.round(total / values.length))
+}
+
 function clampLevel(value: number) {
   return Math.max(0.04, Math.min(1, value))
 }
 
 function clampNumber(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value))
+}
+
+function formatVoiceConnectionStats(
+  stats: VoiceConnectionStats,
+  remoteEnabled: boolean
+) {
+  if (!remoteEnabled) return "Local only"
+  if (stats.peers === 0) return "Waiting for peers"
+
+  const state =
+    stats.connection !== "connected" && stats.connection !== "idle"
+      ? stats.connection
+      : null
+  const ping = stats.pingMs === undefined ? "Ping --" : `${stats.pingMs} ms`
+  const peers = `${stats.peers} peer${stats.peers === 1 ? "" : "s"}`
+  const loss = stats.packetsLost > 0 ? `${stats.packetsLost} lost` : "0 lost"
+
+  return [state, ping, peers, loss].filter(Boolean).join(" · ")
 }
 
 function toSessionDescriptionInit(
@@ -833,6 +897,16 @@ async function fileToAttachment(file: File): Promise<MessageAttachment> {
   }
 }
 
+function filesFromClipboard(clipboardData: DataTransfer) {
+  const files = Array.from(clipboardData.files ?? [])
+  if (files.length > 0) return files
+
+  return Array.from(clipboardData.items ?? [])
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => Boolean(file))
+}
+
 function formatFileSize(bytes: number) {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`
@@ -855,6 +929,14 @@ function isMicrophonePermissionError(error: unknown) {
     error instanceof DOMException &&
     (error.name === "NotAllowedError" || error.name === "SecurityError")
   )
+}
+
+function sortAudioDevices(devices: MediaDeviceInfo[]) {
+  return [...devices].sort((first, second) => {
+    if (first.deviceId === "default" && second.deviceId !== "default") return -1
+    if (second.deviceId === "default" && first.deviceId !== "default") return 1
+    return (first.label || first.deviceId).localeCompare(second.label || second.deviceId)
+  })
 }
 
 function useMediaQuery(query: string) {
@@ -904,6 +986,8 @@ function App() {
   const [recordingMode, setRecordingMode] = useState<RecordingMode>("idle")
   const [recordingElapsedMs, setRecordingElapsedMs] = useState(0)
   const [replyToId, setReplyToId] = useState<string | undefined>()
+  const [mentionRange, setMentionRange] = useState<MentionRange | null>(null)
+  const [mentionActiveIndex, setMentionActiveIndex] = useState(0)
   const [panel, setPanel] = useState<Panel>(null)
   const [adminUnlocked, setAdminUnlocked] = useState(readAdminUnlocked)
   const [adminStatus, setAdminStatus] = useState<string | null>(null)
@@ -968,6 +1052,26 @@ function App() {
     [displayedMessages]
   )
 
+  function jumpToMessage(messageId: string) {
+    const target = document.getElementById(messageElementId(messageId))
+    if (!target) return
+
+    if (highlightTimeoutRef.current !== null) {
+      window.clearTimeout(highlightTimeoutRef.current)
+      highlightTimeoutRef.current = null
+    }
+
+    target.scrollIntoView({
+      block: "center",
+      behavior: reduceMotion ? "auto" : "smooth",
+    })
+    setHighlightedMessageId(messageId)
+    highlightTimeoutRef.current = window.setTimeout(() => {
+      setHighlightedMessageId((current) => (current === messageId ? null : current))
+      highlightTimeoutRef.current = null
+    }, 1800)
+  }
+
   useEffect(() => {
     if (!ready || displayedMessages.length === 0) return
 
@@ -990,6 +1094,7 @@ function App() {
         behavior: reduceMotion ? "auto" : "smooth",
       })
       clearLinkedMessageHighlight()
+      clearMessageLinkHash()
       setHighlightedMessageId(messageId)
       highlightTimeoutRef.current = window.setTimeout(() => {
         setHighlightedMessageId((current) => (current === messageId ? null : current))
@@ -1052,6 +1157,39 @@ function App() {
     })
   }, [authorId, messages, profile.avatar, profile.name, remoteUsers, usernameClaim])
 
+  const usernameByAuthorId = useMemo(() => {
+    const usernames = new Map<string, string>()
+    for (const user of remoteUsers) {
+      usernames.set(user.id, user.usernameKey)
+    }
+    return usernames
+  }, [remoteUsers])
+
+  const mentionSuggestions = useMemo<MentionSuggestion[]>(() => {
+    if (!mentionRange) return []
+
+    const query = mentionRange.query.toLowerCase()
+    return moderationUsers
+      .filter((user) => user.id !== authorId && user.name.trim())
+      .map((user) => {
+        const mention = usernameByAuthorId.get(user.id) ?? usernameKeyFromName(user.name)
+        return {
+          avatar: user.avatar,
+          id: user.id,
+          mention,
+          name: user.name,
+        }
+      })
+      .filter((user) => {
+        if (!query) return true
+        return (
+          user.name.toLowerCase().includes(query) ||
+          user.mention.toLowerCase().includes(query)
+        )
+      })
+      .slice(0, 6)
+  }, [authorId, mentionRange, moderationUsers, usernameByAuthorId])
+
   const stateForStorage = useMemo<PersistedChatState>(
     () => ({
       version: CURRENT_DATA_VERSION,
@@ -1095,6 +1233,14 @@ function App() {
     if (!ready) return
     saveChatState(stateForStorage)
   }, [ready, stateForStorage])
+
+  useEffect(() => {
+    setMentionActiveIndex((current) =>
+      mentionSuggestions.length > 0
+        ? Math.min(current, mentionSuggestions.length - 1)
+        : 0
+    )
+  }, [mentionSuggestions.length])
 
   useEffect(() => {
     writeCachedSpamGuard(spamGuard)
@@ -2458,6 +2604,10 @@ function App() {
   }
 
   async function handleAttachmentFiles(fileList: FileList | null) {
+    await handleAttachmentFileArray(Array.from(fileList ?? []))
+  }
+
+  async function handleAttachmentFileArray(files: File[]) {
     if (!ready) return
 
     if (!hasUniqueUsername) {
@@ -2470,7 +2620,6 @@ function App() {
       return
     }
 
-    const files = Array.from(fileList ?? [])
     if (files.length === 0) return
 
     setAttachmentError(null)
@@ -2520,6 +2669,14 @@ function App() {
     playConfirmationSound("click")
   }
 
+  function pasteAttachmentFiles(event: ReactClipboardEvent<HTMLTextAreaElement>) {
+    const files = filesFromClipboard(event.clipboardData)
+    if (files.length === 0) return
+
+    event.preventDefault()
+    void handleAttachmentFileArray(files)
+  }
+
   function updateAvatarFromFile(file: File | undefined) {
     if (!file) return
     const reader = new FileReader()
@@ -2530,6 +2687,87 @@ function App() {
       }))
     }
     reader.readAsDataURL(file)
+  }
+
+  function updateMentionRange(value: string, cursorPosition: number | null) {
+    if (cursorPosition === null) {
+      setMentionRange(null)
+      return
+    }
+
+    const nextRange = activeMentionRange(value, cursorPosition)
+    setMentionRange(nextRange)
+    if (nextRange) {
+      setMentionActiveIndex(0)
+    }
+  }
+
+  function updateDraftFromTextarea(textarea: HTMLTextAreaElement) {
+    setDraft(textarea.value)
+    updateMentionRange(textarea.value, textarea.selectionStart)
+  }
+
+  function refreshMentionRangeFromTextarea() {
+    const textarea = textareaRef.current
+    if (!textarea) return
+    updateMentionRange(textarea.value, textarea.selectionStart)
+  }
+
+  function insertMention(suggestion: MentionSuggestion) {
+    if (!mentionRange) return
+
+    const mentionText = `@${suggestion.mention} `
+    const suffix = draft.slice(mentionRange.end).replace(/^\s/, "")
+    const nextDraft = `${draft.slice(0, mentionRange.start)}${mentionText}${suffix}`
+    const nextCaret = mentionRange.start + mentionText.length
+
+    setDraft(nextDraft)
+    setMentionRange(null)
+    setMentionActiveIndex(0)
+    playConfirmationSound("soft")
+
+    window.requestAnimationFrame(() => {
+      textareaRef.current?.focus()
+      textareaRef.current?.setSelectionRange(nextCaret, nextCaret)
+    })
+  }
+
+  function handleComposerKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    const mentionMenuOpen = mentionRange !== null && mentionSuggestions.length > 0
+
+    if (mentionMenuOpen) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault()
+        setMentionActiveIndex((current) => (current + 1) % mentionSuggestions.length)
+        return
+      }
+
+      if (event.key === "ArrowUp") {
+        event.preventDefault()
+        setMentionActiveIndex((current) =>
+          (current - 1 + mentionSuggestions.length) % mentionSuggestions.length
+        )
+        return
+      }
+
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault()
+        const suggestion = mentionSuggestions[mentionActiveIndex]
+        if (suggestion) insertMention(suggestion)
+        return
+      }
+
+      if (event.key === "Escape") {
+        event.preventDefault()
+        setMentionRange(null)
+        return
+      }
+    }
+
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault()
+      sendMessage()
+    }
   }
 
   const notificationIcon =
@@ -2644,6 +2882,7 @@ function App() {
         <AnimatePresence>
           {voiceChatOpen ? (
             <VoiceChatStage
+              adminUnlocked={adminUnlocked}
               authorId={authorId}
               profile={profile}
               reduceMotion={Boolean(reduceMotion)}
@@ -2774,6 +3013,7 @@ function App() {
                     onExternalLink={handleExternalLink}
                     onOpenMedia={setMediaViewer}
                     onDeleteMessage={deleteMessageAsAdmin}
+                    onJumpToMessage={jumpToMessage}
                     onReact={toggleReaction}
                     onReply={setReplyToId}
                   />
@@ -2922,6 +3162,15 @@ function App() {
                         </AnimatePresence>
 
                         <div className="composer-input-row">
+                          <AnimatePresence>
+                            {mentionRange && mentionSuggestions.length > 0 ? (
+                              <MentionMenu
+                                activeIndex={mentionActiveIndex}
+                                suggestions={mentionSuggestions}
+                                onSelect={insertMention}
+                              />
+                            ) : null}
+                          </AnimatePresence>
                           <Textarea
                             ref={textareaRef}
                             aria-label="Message"
@@ -2929,13 +3178,11 @@ function App() {
                             placeholder="Nachricht schreiben"
                             rows={1}
                             value={draft}
-                            onChange={(event) => setDraft(event.target.value)}
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter" && !event.shiftKey) {
-                                event.preventDefault()
-                                sendMessage()
-                              }
-                            }}
+                            onChange={(event) => updateDraftFromTextarea(event.currentTarget)}
+                            onClick={refreshMentionRangeFromTextarea}
+                            onKeyDown={handleComposerKeyDown}
+                            onPaste={pasteAttachmentFiles}
+                            onSelect={refreshMentionRangeFromTextarea}
                           />
                           <Button
                             aria-label={showSendAction ? "Send message" : "Record audio message"}
@@ -3006,7 +3253,47 @@ function App() {
   )
 }
 
+function MentionMenu({
+  activeIndex,
+  suggestions,
+  onSelect,
+}: {
+  activeIndex: number
+  suggestions: MentionSuggestion[]
+  onSelect: (suggestion: MentionSuggestion) => void
+}) {
+  return (
+    <motion.div
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      className="mention-menu"
+      exit={{ opacity: 0, y: 6, scale: 0.98 }}
+      initial={{ opacity: 0, y: 6, scale: 0.98 }}
+      role="listbox"
+      transition={{ duration: 0.15, ease: [0.2, 0.8, 0.2, 1] }}
+    >
+      {suggestions.map((suggestion, index) => (
+        <button
+          aria-selected={index === activeIndex}
+          className={cn("mention-option", index === activeIndex && "active")}
+          key={suggestion.id}
+          role="option"
+          type="button"
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => onSelect(suggestion)}
+        >
+          <ChatAvatar name={suggestion.name} size="sm" src={suggestion.avatar} />
+          <span>
+            <strong>{suggestion.name}</strong>
+            <small>@{suggestion.mention}</small>
+          </span>
+        </button>
+      ))}
+    </motion.div>
+  )
+}
+
 function VoiceChatStage({
+  adminUnlocked,
   authorId,
   profile,
   reduceMotion,
@@ -3014,6 +3301,7 @@ function VoiceChatStage({
   usernameKey,
   onClose,
 }: {
+  adminUnlocked: boolean
   authorId: string
   profile: Profile
   reduceMotion: boolean
@@ -3026,12 +3314,24 @@ function VoiceChatStage({
   const [voiceError, setVoiceError] = useState<string | null>(null)
   const [voiceWaveform, setVoiceWaveform] = useState(() => makeQuietWaveform(36))
   const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([])
+  const [audioOutputs, setAudioOutputs] = useState<MediaDeviceInfo[]>([])
   const [selectedInputId, setSelectedInputId] = useState("")
+  const [selectedOutputId, setSelectedOutputId] = useState("")
+  const [deafened, setDeafened] = useState(false)
+  const [voiceStats, setVoiceStats] = useState<VoiceConnectionStats>({
+    connection: "idle",
+    packetsLost: 0,
+    peers: 0,
+  })
   const [voiceLevel, setVoiceLevel] = useState(0)
   const [deviceMenuOpen, setDeviceMenuOpen] = useState(false)
+  const [mutedVoicePeers, setMutedVoicePeers] = useState<Set<string>>(
+    () => new Set()
+  )
   const [remoteVoiceParticipants, setRemoteVoiceParticipants] = useState<
     VoiceParticipantState[]
   >([])
+  const [voiceKickedUntil, setVoiceKickedUntil] = useState(0)
   const [micMeterVisible, setMicMeterVisible] = useState(() =>
     typeof window === "undefined"
       ? true
@@ -3051,37 +3351,50 @@ function VoiceChatStage({
   const voiceFrameRef = useRef<number | null>(null)
   const voiceJoinedAtRef = useRef<number | null>(null)
   const voicePresenceIntervalRef = useRef<number | null>(null)
+  const voiceStatsIntervalRef = useRef<number | null>(null)
+  const authorIdRef = useRef(authorId)
+  const connectedRef = useRef(false)
   const isSpeakingRef = useRef(false)
+  const leaveVoiceRef = useRef<() => void>(() => undefined)
+  const deafenedRef = useRef(false)
+  const micMeterVisibleRef = useRef(micMeterVisible)
+  const mutedVoicePeersRef = useRef<Set<string>>(new Set())
+  const remoteEnabledRef = useRef(remoteEnabled)
+  const selectedOutputIdRef = useRef("")
   const voiceMutedRef = useRef(false)
   const voiceStreamRef = useRef<MediaStream | null>(null)
   const isSpeaking = connected && !muted && voiceLevel > 0.18
   const visibleVoiceParticipants = useMemo<VoiceParticipant[]>(() => {
-    if (!connected) return []
-
     const remoteParticipants = remoteVoiceParticipants
       .filter((participant) => participant.id !== authorId)
       .map((participant) => ({
         avatar: participant.avatar,
         id: participant.id,
         isSelf: false,
+        muted: mutedVoicePeers.has(participant.id),
         name: participant.name,
         speaking: participant.speaking,
       }))
 
     return [
-      {
-        avatar: profile.avatar,
-        id: authorId,
-        isSelf: true,
-        name: profile.name || "You",
-        speaking: isSpeaking,
-      },
+      ...(connected
+        ? [
+            {
+              avatar: profile.avatar,
+              id: authorId,
+              isSelf: true,
+              name: profile.name || "You",
+              speaking: isSpeaking,
+            },
+          ]
+        : []),
       ...remoteParticipants,
     ].slice(0, 12)
   }, [
     authorId,
     connected,
     isSpeaking,
+    mutedVoicePeers,
     profile.avatar,
     profile.name,
     remoteVoiceParticipants,
@@ -3089,13 +3402,21 @@ function VoiceChatStage({
   const selectedInputLabel =
     audioInputs.find((device) => device.deviceId === selectedInputId)?.label ||
     "Default microphone"
-  const micMeterLabel = connected
-    ? muted
-      ? "Muted"
-      : isSpeaking
-        ? "Input active"
-        : "Input quiet"
-    : "Join to test"
+  const selectedOutputLabel =
+    audioOutputs.find((device) => device.deviceId === selectedOutputId)?.label ||
+    "Default speakers"
+  const micMeterLabel = !micMeterVisible
+    ? "Meter off"
+    : connected
+      ? muted
+        ? "Muted"
+        : isSpeaking
+          ? "Input active"
+          : "Input quiet"
+      : "Join to test"
+  const voiceStatusText = connected
+    ? formatVoiceConnectionStats(voiceStats, remoteEnabled)
+    : "Not connected"
 
   useEffect(() => {
     void refreshAudioInputs()
@@ -3113,13 +3434,36 @@ function VoiceChatStage({
 
   useEffect(() => {
     if (window.matchMedia("(max-width: 720px)").matches) {
+      micMeterVisibleRef.current = false
       setMicMeterVisible(false)
     }
   }, [])
 
   useEffect(() => {
+    connectedRef.current = connected
+  }, [connected])
+
+  useEffect(() => {
+    authorIdRef.current = authorId
+    remoteEnabledRef.current = remoteEnabled
+  }, [authorId, remoteEnabled])
+
+  useEffect(() => {
+    leaveVoiceRef.current = leaveVoice
+  })
+
+  useEffect(() => {
     isSpeakingRef.current = isSpeaking
   }, [isSpeaking])
+
+  useEffect(() => {
+    deafenedRef.current = deafened
+    mutedVoicePeersRef.current = mutedVoicePeers
+    selectedOutputIdRef.current = selectedOutputId
+    for (const [peerId, audioElement] of remoteAudioRefs.current.entries()) {
+      applyRemoteAudioSettings(audioElement, peerId)
+    }
+  }, [deafened, mutedVoicePeers, selectedOutputId])
 
   useEffect(() => {
     handleVoiceSignalRef.current = (signal) => {
@@ -3168,6 +3512,28 @@ function VoiceChatStage({
   useEffect(() => {
     if (!remoteEnabled || !authorId) return
 
+    const unsubscribe = listenToRemoteVoiceKick(
+      authorId,
+      (kick) => {
+        setVoiceKickedUntil(kick?.kickedUntil ?? 0)
+        if (!kick) return
+
+        if (connectedRef.current) {
+          leaveVoiceRef.current()
+        }
+        setVoiceError(`${kick.moderatorName} removed you from voice chat.`)
+      },
+      (error) => {
+        console.warn("Voice kick listener failed", error)
+      }
+    )
+
+    return () => unsubscribe?.()
+  }, [authorId, remoteEnabled])
+
+  useEffect(() => {
+    if (!remoteEnabled || !authorId) return
+
     const unsubscribe = listenToRemoteVoiceSignals(
       authorId,
       (signals) => {
@@ -3206,6 +3572,7 @@ function VoiceChatStage({
 
   useEffect(() => {
     return () => {
+      removeVoiceRemoteSession()
       cleanupVoiceResources(false)
     }
   }, [])
@@ -3217,8 +3584,29 @@ function VoiceChatStage({
     }
   }
 
+  function pauseVoiceMeter() {
+    cleanupVoiceMeter()
+    setVoiceWaveform(makeQuietWaveform(36))
+    setVoiceLevel(0)
+  }
+
+  function setInputMeterVisible(visible: boolean) {
+    micMeterVisibleRef.current = visible
+    setMicMeterVisible(visible)
+
+    if (!visible) {
+      pauseVoiceMeter()
+      return
+    }
+
+    if (connectedRef.current && voiceAnalyserRef.current) {
+      runVoiceMeter()
+    }
+  }
+
   function cleanupVoiceResources(resetLevel = true) {
     cleanupVoiceMeter()
+    stopVoiceStatsPolling()
     closeAllPeerConnections()
     voiceStreamRef.current?.getTracks().forEach((track) => track.stop())
     voiceStreamRef.current = null
@@ -3263,6 +3651,132 @@ function VoiceChatStage({
     offeredPeersRef.current.clear()
   }
 
+  function resetVoiceStats() {
+    setVoiceStats({
+      connection: "idle",
+      packetsLost: 0,
+      peers: 0,
+    })
+  }
+
+  function getVoiceConnectionState(
+    states: RTCPeerConnectionState[]
+  ): VoiceConnectionStats["connection"] {
+    if (states.length === 0) return "idle"
+    if (states.includes("failed")) return "failed"
+    if (states.includes("disconnected")) return "disconnected"
+    if (states.includes("connecting")) return "connecting"
+    if (states.includes("new")) return "new"
+    if (states.includes("connected")) return "connected"
+    if (states.includes("closed")) return "closed"
+    return "idle"
+  }
+
+  async function collectVoiceConnectionStats() {
+    const peerConnections = Array.from(peerConnectionsRef.current.values()).filter(
+      (peerConnection) => peerConnection.connectionState !== "closed"
+    )
+
+    if (!connectedRef.current) {
+      resetVoiceStats()
+      return
+    }
+
+    if (peerConnections.length === 0) {
+      setVoiceStats({
+        connection: "idle",
+        packetsLost: 0,
+        peers: 0,
+      })
+      return
+    }
+
+    const pingSamples: number[] = []
+    const jitterSamples: number[] = []
+    let packetsLost = 0
+
+    await Promise.all(
+      peerConnections.map(async (peerConnection) => {
+        try {
+          const stats = await peerConnection.getStats()
+          stats.forEach((entry) => {
+            const stat = entry as RTCStats & Record<string, unknown>
+            const roundTripTime =
+              typeof stat.roundTripTime === "number"
+                ? stat.roundTripTime
+                : typeof stat.currentRoundTripTime === "number"
+                  ? stat.currentRoundTripTime
+                  : undefined
+
+            if (
+              roundTripTime !== undefined &&
+              (stat.type === "candidate-pair" || stat.type === "remote-inbound-rtp")
+            ) {
+              pingSamples.push(roundTripTime * 1000)
+            }
+
+            if (
+              typeof stat.jitter === "number" &&
+              (stat.type === "inbound-rtp" || stat.type === "remote-inbound-rtp")
+            ) {
+              jitterSamples.push(stat.jitter * 1000)
+            }
+
+            if (
+              typeof stat.packetsLost === "number" &&
+              (stat.type === "inbound-rtp" || stat.type === "remote-inbound-rtp")
+            ) {
+              packetsLost += Math.max(0, stat.packetsLost)
+            }
+          })
+        } catch (error) {
+          console.warn("Could not read voice connection stats", error)
+        }
+      })
+    )
+
+    setVoiceStats({
+      connection: getVoiceConnectionState(
+        peerConnections.map((peerConnection) => peerConnection.connectionState)
+      ),
+      jitterMs: averageRounded(jitterSamples),
+      packetsLost,
+      peers: peerConnections.length,
+      pingMs: averageRounded(pingSamples),
+    })
+  }
+
+  function startVoiceStatsPolling() {
+    stopVoiceStatsPolling()
+    void collectVoiceConnectionStats()
+    voiceStatsIntervalRef.current = window.setInterval(() => {
+      void collectVoiceConnectionStats()
+    }, 2000)
+  }
+
+  function stopVoiceStatsPolling() {
+    if (voiceStatsIntervalRef.current !== null) {
+      window.clearInterval(voiceStatsIntervalRef.current)
+      voiceStatsIntervalRef.current = null
+    }
+    resetVoiceStats()
+  }
+
+  function applyRemoteAudioSettings(audioElement: HTMLAudioElement, peerId?: string) {
+    audioElement.muted =
+      deafenedRef.current ||
+      (Boolean(peerId) && mutedVoicePeersRef.current.has(peerId as string))
+
+    const sinkElement = audioElement as SinkAudioElement
+    const outputId = selectedOutputIdRef.current
+    if (!sinkElement.setSinkId || !outputId) return
+
+    sinkElement.setSinkId(outputId).catch((error) => {
+      console.warn("Could not change voice output device", error)
+      setVoiceError("Could not switch output device in this browser.")
+    })
+  }
+
   function getOrCreatePeerConnection(peerId: string) {
     const current = peerConnectionsRef.current.get(peerId)
     if (current) return current
@@ -3294,6 +3808,7 @@ function VoiceChatStage({
         audioElement = new Audio()
         audioElement.autoplay = true
         audioElement.setAttribute("playsinline", "true")
+        applyRemoteAudioSettings(audioElement, peerId)
         remoteAudioRefs.current.set(peerId, audioElement)
       }
 
@@ -3314,6 +3829,7 @@ function VoiceChatStage({
       ) {
         closePeerConnection(peerId)
       }
+      void collectVoiceConnectionStats()
     }
 
     peerConnectionsRef.current.set(peerId, peerConnection)
@@ -3445,9 +3961,22 @@ function VoiceChatStage({
     }
   }
 
+  function removeVoiceRemoteSession() {
+    stopVoicePresenceHeartbeat()
+    if (!remoteEnabledRef.current) return
+
+    void removeRemoteVoicePresence().catch((error) => {
+      console.warn("Could not remove voice presence", error)
+    })
+    void deleteRemoteVoiceSignalsForUser(authorIdRef.current).catch((error) => {
+      console.warn("Could not remove voice signals", error)
+    })
+  }
+
   function runVoiceMeter() {
     const analyser = voiceAnalyserRef.current
     if (!analyser) return
+    if (voiceFrameRef.current !== null) return
 
     const samples = new Uint8Array(analyser.fftSize)
     let lastUpdate = 0
@@ -3455,6 +3984,10 @@ function VoiceChatStage({
     const tick = (time: number) => {
       const currentAnalyser = voiceAnalyserRef.current
       if (!currentAnalyser) return
+      if (!micMeterVisibleRef.current) {
+        voiceFrameRef.current = null
+        return
+      }
 
       if (time - lastUpdate > 55) {
         if (voiceMutedRef.current) {
@@ -3488,15 +4021,27 @@ function VoiceChatStage({
 
     try {
       const devices = await navigator.mediaDevices.enumerateDevices()
-      const inputs = devices.filter((device) => device.kind === "audioinput")
+      const inputs = sortAudioDevices(
+        devices.filter((device) => device.kind === "audioinput")
+      )
+      const outputs = sortAudioDevices(
+        devices.filter((device) => device.kind === "audiooutput")
+      )
       setAudioInputs(inputs)
+      setAudioOutputs(outputs)
       setSelectedInputId((current) => current || inputs[0]?.deviceId || "")
+      setSelectedOutputId((current) => current || outputs[0]?.deviceId || "")
     } catch {
       // Device labels may be unavailable until permission is granted.
     }
   }
 
   async function joinVoice(deviceId = selectedInputId) {
+    if (voiceKickedUntil > Date.now()) {
+      setVoiceError("You were removed from voice chat. Try again in a moment.")
+      return
+    }
+
     if (
       !navigator.mediaDevices?.getUserMedia ||
       typeof AudioContext === "undefined" ||
@@ -3549,7 +4094,12 @@ function VoiceChatStage({
       } else {
         setVoiceError("Voice audio needs Firebase remote chat to reach other users.")
       }
-      runVoiceMeter()
+      if (micMeterVisibleRef.current) {
+        runVoiceMeter()
+      } else {
+        pauseVoiceMeter()
+      }
+      startVoiceStatsPolling()
     } catch (error) {
       console.warn("Voice chat failed", error)
       cleanupVoiceResources()
@@ -3563,21 +4113,54 @@ function VoiceChatStage({
   }
 
   function leaveVoice() {
-    stopVoicePresenceHeartbeat()
-    if (remoteEnabled) {
-      void removeRemoteVoicePresence().catch((error) => {
-        console.warn("Could not remove voice presence", error)
-      })
-      void deleteRemoteVoiceSignalsForUser(authorId).catch((error) => {
-        console.warn("Could not remove voice signals", error)
-      })
-    }
+    removeVoiceRemoteSession()
     cleanupVoiceResources()
     setConnected(false)
     setMuted(false)
+    setDeafened(false)
     setDeviceMenuOpen(false)
     voiceJoinedAtRef.current = null
     setVoiceWaveform(makeQuietWaveform(36))
+    resetVoiceStats()
+  }
+
+  function toggleVoiceParticipantMute(peerId: string) {
+    setMutedVoicePeers((current) => {
+      const next = new Set(current)
+      if (next.has(peerId)) {
+        next.delete(peerId)
+      } else {
+        next.add(peerId)
+      }
+      return next
+    })
+  }
+
+  function removeMutedVoicePeer(peerId: string) {
+    setMutedVoicePeers((current) => {
+      if (!current.has(peerId)) return current
+      const next = new Set(current)
+      next.delete(peerId)
+      return next
+    })
+  }
+
+  function kickVoiceParticipant(participant: VoiceParticipant) {
+    if (!adminUnlocked || participant.isSelf || !remoteEnabled) return
+
+    setVoiceError(null)
+    void kickRemoteVoiceParticipant({
+      authorId: participant.id,
+      moderatorName: profile.name || "Admin",
+    })
+      .then(() => {
+        closePeerConnection(participant.id)
+        removeMutedVoicePeer(participant.id)
+      })
+      .catch((error) => {
+        console.warn("Could not kick voice participant", error)
+        setVoiceError("Could not remove that user from voice chat.")
+      })
   }
 
   function changeInputDevice(deviceId: string) {
@@ -3585,6 +4168,20 @@ function VoiceChatStage({
     setDeviceMenuOpen(false)
     if (connected) {
       void joinVoice(deviceId)
+    }
+  }
+
+  function changeOutputDevice(deviceId: string) {
+    selectedOutputIdRef.current = deviceId
+    setSelectedOutputId(deviceId)
+    for (const audioElement of remoteAudioRefs.current.values()) {
+      const sinkElement = audioElement as SinkAudioElement
+      if (sinkElement.setSinkId && deviceId) {
+        sinkElement.setSinkId(deviceId).catch((error) => {
+          console.warn("Could not change voice output device", error)
+          setVoiceError("Could not switch output device in this browser.")
+        })
+      }
     }
   }
 
@@ -3621,9 +4218,7 @@ function VoiceChatStage({
           transition={{ duration: 0.22, ease: [0.2, 0.8, 0.2, 1] }}
         >
           <strong>{connected ? "Connected" : "Join voice"}</strong>
-          <span>
-            {connected ? (muted ? "Muted" : isSpeaking ? "Speaking now" : "Listening") : "Not connected"}
-          </span>
+          {voiceStatusText ? <span>{voiceStatusText}</span> : null}
         </motion.div>
         <Button
           aria-label="Close voice chat"
@@ -3648,9 +4243,13 @@ function VoiceChatStage({
         <div className="voice-participant-grid" aria-label="Voice participants">
           {visibleVoiceParticipants.map((participant) => (
             <VoiceParticipantCard
+              adminUnlocked={adminUnlocked}
               key={participant.id}
+              muted={Boolean(participant.muted)}
               participant={participant}
               speaking={participant.isSelf ? isSpeaking : Boolean(participant.speaking)}
+              onKick={kickVoiceParticipant}
+              onToggleMute={toggleVoiceParticipantMute}
             />
           ))}
         </div>
@@ -3709,7 +4308,7 @@ function VoiceChatStage({
                 className="voice-meter-toggle"
                 data-tooltip="Hide input meter"
                 type="button"
-                onClick={() => setMicMeterVisible(false)}
+                onClick={() => setInputMeterVisible(false)}
               >
                 <CaretUp weight="bold" />
               </button>
@@ -3724,7 +4323,7 @@ function VoiceChatStage({
               key="mic-meter-reveal"
               transition={{ duration: 0.16, ease: [0.2, 0.8, 0.2, 1] }}
               type="button"
-              onClick={() => setMicMeterVisible(true)}
+              onClick={() => setInputMeterVisible(true)}
             >
               {muted ? <MicrophoneSlash weight="duotone" /> : <Microphone weight="duotone" />}
               <span>{micMeterLabel}</span>
@@ -3815,6 +4414,49 @@ function VoiceChatStage({
                     )}
                   </div>
 
+                  <div className="voice-device-menu-head compact">
+                    <strong>Output device</strong>
+                    <span>{selectedOutputLabel}</span>
+                  </div>
+
+                  <div className="voice-device-options output-options">
+                    {audioOutputs.length > 0 ? (
+                      audioOutputs.map((device, index) => {
+                        const active = device.deviceId === selectedOutputId
+                        return (
+                          <button
+                            className={cn("voice-device-option", active && "active")}
+                            key={device.deviceId || index}
+                            type="button"
+                            onClick={() => changeOutputDevice(device.deviceId)}
+                          >
+                            <span>{device.label || `Speakers ${index + 1}`}</span>
+                            {active ? <Check weight="bold" /> : null}
+                          </button>
+                        )
+                      })
+                    ) : (
+                      <button
+                        className="voice-device-option active"
+                        type="button"
+                        onClick={() => changeOutputDevice("")}
+                      >
+                        <span>Browser default speakers</span>
+                        <Check weight="bold" />
+                      </button>
+                    )}
+                  </div>
+
+                  <button
+                    aria-pressed={deafened}
+                    className={cn("voice-device-option deafen-option", deafened && "active")}
+                    type="button"
+                    onClick={() => setDeafened((current) => !current)}
+                  >
+                    <span>{deafened ? "Undeafen" : "Deafen"}</span>
+                    {deafened ? <SpeakerSlash weight="bold" /> : <SpeakerHigh weight="bold" />}
+                  </button>
+
                   <div className={cn("voice-device-level", isSpeaking && "live")}>
                     <div>
                       <strong>Input level</strong>
@@ -3832,16 +4474,32 @@ function VoiceChatStage({
           </div>
 
           {connected ? (
-            <Button
-              className="voice-control-button leave"
-              data-tooltip="Leave voice"
-              size="icon-lg"
-              type="button"
-              variant="ghost"
-              onClick={leaveVoice}
-            >
-              <PhoneDisconnect data-icon="inline-start" weight="duotone" />
-            </Button>
+            <>
+              <Button
+                className={cn("voice-control-button deafen", deafened && "active")}
+                data-tooltip={deafened ? "Undeafen" : "Deafen"}
+                size="icon-lg"
+                type="button"
+                variant="ghost"
+                onClick={() => setDeafened((current) => !current)}
+              >
+                {deafened ? (
+                  <SpeakerSlash data-icon="inline-start" weight="duotone" />
+                ) : (
+                  <SpeakerHigh data-icon="inline-start" weight="duotone" />
+                )}
+              </Button>
+              <Button
+                className="voice-control-button leave"
+                data-tooltip="Leave voice"
+                size="icon-lg"
+                type="button"
+                variant="ghost"
+                onClick={leaveVoice}
+              >
+                <PhoneDisconnect data-icon="inline-start" weight="duotone" />
+              </Button>
+            </>
           ) : (
             <Button
               className="voice-join-button"
@@ -3859,22 +4517,154 @@ function VoiceChatStage({
 }
 
 function VoiceParticipantCard({
+  adminUnlocked,
+  muted,
+  onKick,
+  onToggleMute,
   participant,
   speaking,
 }: {
+  adminUnlocked: boolean
+  muted: boolean
+  onKick: (participant: VoiceParticipant) => void
+  onToggleMute: (peerId: string) => void
   participant: VoiceParticipant
   speaking: boolean
 }) {
+  const [menuOpen, setMenuOpen] = useState(false)
+  const cardRef = useRef<HTMLDivElement | null>(null)
+  const longPressTimerRef = useRef<number | null>(null)
+  const pointerStartRef = useRef<{ x: number; y: number } | null>(null)
+  const canOpenMenu = !participant.isSelf
+
+  useEffect(() => {
+    if (!menuOpen) return
+
+    const close = (event: PointerEvent) => {
+      const target = event.target
+      if (target instanceof Node && cardRef.current?.contains(target)) return
+      setMenuOpen(false)
+    }
+
+    window.addEventListener("pointerdown", close)
+    return () => window.removeEventListener("pointerdown", close)
+  }, [menuOpen])
+
+  function clearLongPressTimer() {
+    if (longPressTimerRef.current !== null) {
+      window.clearTimeout(longPressTimerRef.current)
+      longPressTimerRef.current = null
+    }
+  }
+
+  function openMenu() {
+    if (!canOpenMenu) return
+    setMenuOpen(true)
+  }
+
+  function handleContextMenu(event: ReactMouseEvent<HTMLDivElement>) {
+    if (!canOpenMenu) return
+    event.preventDefault()
+    openMenu()
+  }
+
+  function handlePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!canOpenMenu || event.pointerType === "mouse") return
+    pointerStartRef.current = { x: event.clientX, y: event.clientY }
+    clearLongPressTimer()
+    longPressTimerRef.current = window.setTimeout(openMenu, 420)
+  }
+
+  function handlePointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    const start = pointerStartRef.current
+    if (!start) return
+
+    const moved = Math.hypot(event.clientX - start.x, event.clientY - start.y)
+    if (moved > 14) {
+      clearLongPressTimer()
+    }
+  }
+
+  function handlePointerEnd() {
+    clearLongPressTimer()
+    pointerStartRef.current = null
+  }
+
+  function handleToggleMute() {
+    onToggleMute(participant.id)
+    setMenuOpen(false)
+  }
+
+  function handleKick() {
+    onKick(participant)
+    setMenuOpen(false)
+  }
+
   return (
     <div
       aria-label={`${participant.isSelf ? "You" : participant.name}${speaking ? ", speaking" : ", in voice"}`}
-      className={cn("voice-participant-card", speaking && "speaking")}
-      data-tooltip={`${participant.isSelf ? "You" : participant.name}${speaking ? " is speaking" : ""}`}
+      className={cn(
+        "voice-participant-card",
+        speaking && "speaking",
+        muted && "muted",
+        menuOpen && "has-menu"
+      )}
+      data-tooltip={`${participant.isSelf ? "You" : participant.name}${muted ? " is muted for you" : speaking ? " is speaking" : ""}`}
+      ref={cardRef}
+      role={canOpenMenu ? "button" : undefined}
+      tabIndex={canOpenMenu ? 0 : undefined}
+      onContextMenu={handleContextMenu}
+      onKeyDown={(event) => {
+        if (!canOpenMenu || (event.key !== "Enter" && event.key !== " ")) return
+        event.preventDefault()
+        openMenu()
+      }}
+      onPointerCancel={handlePointerEnd}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerEnd}
     >
       <div className="voice-participant-avatar">
         <ChatAvatar name={participant.name} size="lg" src={participant.avatar} />
-        <span className="voice-speaking-indicator" />
+        <span className="voice-speaking-indicator">
+          {muted ? <SpeakerSlash weight="bold" /> : null}
+        </span>
       </div>
+
+      <AnimatePresence>
+        {menuOpen ? (
+          <motion.div
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            className="voice-participant-menu"
+            exit={{ opacity: 0, y: 4, scale: 0.96 }}
+            initial={{ opacity: 0, y: 4, scale: 0.96 }}
+            role="menu"
+            transition={{ duration: 0.14, ease: [0.2, 0.8, 0.2, 1] }}
+          >
+            <button
+              data-tooltip={muted ? "Hear this user again" : "Mute this user locally"}
+              role="menuitem"
+              type="button"
+              onClick={handleToggleMute}
+            >
+              {muted ? <SpeakerHigh weight="duotone" /> : <SpeakerSlash weight="duotone" />}
+              <span>{muted ? "Unmute" : "Mute"}</span>
+            </button>
+            {adminUnlocked ? (
+              <button
+                className="danger"
+                data-tooltip="Kick user from voice chat"
+                role="menuitem"
+                type="button"
+                onClick={handleKick}
+              >
+                <PhoneDisconnect weight="duotone" />
+                <span>Kick</span>
+              </button>
+            ) : null}
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
     </div>
   )
 }
@@ -5482,6 +6272,15 @@ function messageIdFromHash(hash: string) {
   }
 }
 
+function clearMessageLinkHash() {
+  if (typeof window === "undefined") return
+  if (!messageIdFromHash(window.location.hash)) return
+
+  const url = new URL(window.location.href)
+  url.hash = ""
+  window.history.replaceState(window.history.state, "", url.toString())
+}
+
 function messageLinkFor(messageId: string) {
   const hash = `${MESSAGE_LINK_HASH_PREFIX}${encodeURIComponent(messageId)}`
   if (typeof window === "undefined") return `#${hash}`
@@ -5748,6 +6547,7 @@ function MessageBlock({
   onExternalLink,
   onOpenMedia,
   onDeleteMessage,
+  onJumpToMessage,
   onReact,
   onReply,
   profile,
@@ -5761,6 +6561,7 @@ function MessageBlock({
   onExternalLink: (url: string, displayUrl: string) => void
   onOpenMedia: (state: MediaViewerState) => void
   onDeleteMessage: (message: ChatMessage) => void | Promise<void>
+  onJumpToMessage: (messageId: string) => void
   onReact: (messageId: string, emoji: string) => void
   onReply: (messageId: string) => void
   profile: Profile
@@ -5805,6 +6606,7 @@ function MessageBlock({
               quote={quoteFor(message)}
               onDelete={() => void onDeleteMessage(message)}
               onExternalLink={onExternalLink}
+              onJumpToMessage={onJumpToMessage}
               onOpenMedia={onOpenMedia}
               onReact={onReact}
               onReply={() => onReply(message.id)}
@@ -5826,6 +6628,7 @@ function MessageBubble({
   message,
   onDelete,
   onExternalLink,
+  onJumpToMessage,
   onOpenMedia,
   onReact,
   onReply,
@@ -5841,6 +6644,7 @@ function MessageBubble({
   message: ChatMessage
   onDelete: () => void
   onExternalLink: (url: string, displayUrl: string) => void
+  onJumpToMessage: (messageId: string) => void
   onOpenMedia: (state: MediaViewerState) => void
   onReact: (messageId: string, emoji: string) => void
   onReply: () => void
@@ -6227,7 +7031,13 @@ function MessageBubble({
                   progress={message.uploadProgress ?? 0}
                 />
               ) : quote ? (
-                <button className="quote-button" type="button">
+                <button
+                  className="quote-button"
+                  data-ignore-long-press="true"
+                  data-tooltip="Jump to replied message"
+                  type="button"
+                  onClick={() => onJumpToMessage(quote.id)}
+                >
                   <strong>
                     {quote.authorId === authorId ? profile.name : quote.authorName}
                   </strong>
