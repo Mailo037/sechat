@@ -28,6 +28,7 @@ import {
   File as FileIcon,
   DotsThreeVertical,
   GlobeSimple,
+  LinkSimple,
   LockKey,
   Microphone,
   MicrophoneSlash,
@@ -77,6 +78,7 @@ import {
   deleteRemoteVoiceSignalsForUser,
   listenToRemoteMessages,
   listenToRemoteModeration,
+  listenToRemoteUsers,
   listenToRemoteVoiceParticipants,
   listenToRemoteVoiceSignals,
   prepareRemoteChat,
@@ -92,6 +94,7 @@ import { loadChatState, saveChatState } from "@/lib/storage"
 import { cn } from "@/lib/utils"
 import type {
   ChatMessage,
+  ChatUser,
   MessageAttachment,
   MessageReaction,
   MessageType,
@@ -114,6 +117,9 @@ type LinkDialogState = {
   origin: string
   url: string
   displayUrl: string
+}
+type MediaViewerState = {
+  attachment: MessageAttachment
 }
 type RecordingMode = "idle" | "recording" | "ready" | "processing" | "discarding"
 type AudioDraft = {
@@ -173,6 +179,10 @@ const ACCEPTED_ATTACHMENT_TYPES = [
   "image/jpeg",
   "image/png",
   "image/webp",
+  "video/mp4",
+  "video/quicktime",
+  "video/webm",
+  "video/ogg",
   "audio/aac",
   "audio/mp4",
   "audio/mpeg",
@@ -192,6 +202,7 @@ const ATTACHMENT_ACCEPT = [
   "image/jpeg",
   "image/png",
   "image/webp",
+  "video/*",
   "audio/*",
   "application/pdf",
   "text/plain",
@@ -223,6 +234,7 @@ const ADMIN_TIMEOUT_MS = 15 * 60 * 1000
 const ADMIN_BAN_MS = 100 * 365 * 24 * 60 * 60 * 1000
 const ADMIN_SESSION_KEY = "sechat-admin-unlocked"
 const SPAM_GUARD_CACHE_KEY = "sechat-spam-guard"
+const MESSAGE_LINK_HASH_PREFIX = "message-"
 const USERNAME_MIN_LENGTH = 3
 const USERNAME_MAX_KEY_LENGTH = 24
 
@@ -807,11 +819,14 @@ async function fileToAttachment(file: File): Promise<MessageAttachment> {
   const isImageFile =
     file.type.startsWith("image/") ||
     /\.(avif|gif|jpe?g|png|webp)$/i.test(file.name)
+  const isVideoFile =
+    file.type.startsWith("video/") ||
+    /\.(m4v|mov|mp4|ogv|webm)$/i.test(file.name)
 
   return {
     id: makeId("attachment"),
     dataUrl,
-    kind: isImageFile ? "image" : "file",
+    kind: isImageFile ? "image" : isVideoFile ? "video" : "file",
     mimeType: file.type || "application/octet-stream",
     name: file.name || "Attachment",
     size: file.size,
@@ -874,6 +889,7 @@ function App() {
   const [spamNow, setSpamNow] = useState(Date.now())
   const [trustedSites, setTrustedSites] = useState<string[]>([])
   const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [remoteUsers, setRemoteUsers] = useState<ChatUser[]>([])
   const [pendingMessages, setPendingMessages] = useState<ChatMessage[]>([])
   const [authorId, setAuthorId] = useState("me")
   const [draft, setDraft] = useState("")
@@ -895,11 +911,13 @@ function App() {
     useState<UserModerationState | null>(null)
   const [remoteModerationReady, setRemoteModerationReady] = useState(false)
   const [pendingLink, setPendingLink] = useState<LinkDialogState | null>(null)
+  const [mediaViewer, setMediaViewer] = useState<MediaViewerState | null>(null)
   const [permission, setPermission] = useState(getNotificationPermission())
   const [unread, setUnread] = useState(0)
   const [voiceChatOpen, setVoiceChatOpen] = useState(false)
   const [voiceChatWidth, setVoiceChatWidth] = useState(420)
   const [voiceStageHeight, setVoiceStageHeight] = useState(340)
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null)
   const analyserRef = useRef<AnalyserNode | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
   const audioDraftRef = useRef<AudioDraft | null>(null)
@@ -922,6 +940,7 @@ function App() {
   const streamRef = useRef<MediaStream | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const scrollRef = useRef<HTMLDivElement | null>(null)
+  const highlightTimeoutRef = useRef<number | null>(null)
   const cleanupRan = useRef(false)
   const remoteEnabled = remoteChatAvailable()
   const mobileReplyGesture = useMediaQuery("(max-width: 720px)")
@@ -949,10 +968,72 @@ function App() {
     [displayedMessages]
   )
 
+  useEffect(() => {
+    if (!ready || displayedMessages.length === 0) return
+
+    function clearLinkedMessageHighlight() {
+      if (highlightTimeoutRef.current !== null) {
+        window.clearTimeout(highlightTimeoutRef.current)
+        highlightTimeoutRef.current = null
+      }
+    }
+
+    function focusLinkedMessage() {
+      const messageId = messageIdFromHash(window.location.hash)
+      if (!messageId) return
+
+      const target = document.getElementById(messageElementId(messageId))
+      if (!target) return
+
+      target.scrollIntoView({
+        block: "center",
+        behavior: reduceMotion ? "auto" : "smooth",
+      })
+      clearLinkedMessageHighlight()
+      setHighlightedMessageId(messageId)
+      highlightTimeoutRef.current = window.setTimeout(() => {
+        setHighlightedMessageId((current) => (current === messageId ? null : current))
+        highlightTimeoutRef.current = null
+      }, 1800)
+    }
+
+    focusLinkedMessage()
+    window.addEventListener("hashchange", focusLinkedMessage)
+    return () => {
+      window.removeEventListener("hashchange", focusLinkedMessage)
+    }
+  }, [displayedMessages, ready, reduceMotion])
+
   const moderationUsers = useMemo<ModerationUser[]>(() => {
     const users = new Map<string, ModerationUser>()
 
+    for (const user of remoteUsers) {
+      const isSelf = user.id === authorId
+      users.set(user.id, {
+        avatar: isSelf ? profile.avatar : "",
+        id: user.id,
+        isSelf,
+        lastSeenAt: user.lastSeenAt,
+        messageCount: 0,
+        name: isSelf ? profile.name : user.name,
+      })
+    }
+
+    if (usernameClaim) {
+      const current = users.get(authorId)
+      users.set(authorId, {
+        avatar: profile.avatar,
+        id: authorId,
+        isSelf: true,
+        lastSeenAt: Math.max(current?.lastSeenAt ?? 0, Date.now()),
+        messageCount: current?.messageCount ?? 0,
+        name: profile.name,
+      })
+    }
+
     for (const message of messages) {
+      if (!message.authorId) continue
+
       const isSelf = message.authorId === authorId
       const current = users.get(message.authorId)
       users.set(message.authorId, {
@@ -965,8 +1046,11 @@ function App() {
       })
     }
 
-    return Array.from(users.values()).sort((a, b) => b.lastSeenAt - a.lastSeenAt)
-  }, [authorId, messages, profile.avatar, profile.name])
+    return Array.from(users.values()).sort((a, b) => {
+      if (a.isSelf !== b.isSelf) return a.isSelf ? -1 : 1
+      return b.lastSeenAt - a.lastSeenAt
+    })
+  }, [authorId, messages, profile.avatar, profile.name, remoteUsers, usernameClaim])
 
   const stateForStorage = useMemo<PersistedChatState>(
     () => ({
@@ -1086,6 +1170,22 @@ function App() {
     )
 
     return () => unsubscribeMessages?.()
+  }, [remoteEnabled])
+
+  useEffect(() => {
+    if (!remoteEnabled) {
+      setRemoteUsers([])
+      return
+    }
+
+    const unsubscribeUsers = listenToRemoteUsers(
+      setRemoteUsers,
+      (error) => {
+        console.warn("Remote users listener failed", error)
+      }
+    )
+
+    return () => unsubscribeUsers?.()
   }, [remoteEnabled])
 
   useEffect(() => {
@@ -2664,6 +2764,7 @@ function App() {
                     key={group.id}
                     authorId={authorId}
                     group={group}
+                    highlightedMessageId={highlightedMessageId}
                     mobileReplyGesture={mobileReplyGesture}
                     adminUnlocked={adminUnlocked}
                     profile={profile}
@@ -2671,6 +2772,7 @@ function App() {
                       messages.find((item) => item.id === message.replyToId)
                     }
                     onExternalLink={handleExternalLink}
+                    onOpenMedia={setMediaViewer}
                     onDeleteMessage={deleteMessageAsAdmin}
                     onReact={toggleReaction}
                     onReply={setReplyToId}
@@ -2890,6 +2992,12 @@ function App() {
               origin={pendingLink.origin}
               onCancel={() => setPendingLink(null)}
               onOpen={openPendingLink}
+            />
+          ) : null}
+          {mediaViewer ? (
+            <MediaViewerDialog
+              attachment={mediaViewer.attachment}
+              onClose={() => setMediaViewer(null)}
             />
           ) : null}
         </AnimatePresence>
@@ -5245,6 +5353,8 @@ function AttachmentPreview({
       <div className="attachment-preview-thumb">
         {attachment.kind === "image" ? (
           <img alt="" src={attachment.dataUrl} />
+        ) : attachment.kind === "video" ? (
+          <video aria-hidden="true" muted playsInline preload="metadata" src={attachment.dataUrl} />
         ) : (
           <FileIcon weight="duotone" />
         )}
@@ -5314,6 +5424,15 @@ function isAudioAttachment(attachment: MessageAttachment) {
   return attachment.mimeType.toLowerCase().startsWith("audio/")
 }
 
+function isVideoAttachment(attachment: MessageAttachment) {
+  const mimeType = attachment.mimeType.toLowerCase().split(";")[0]
+  return (
+    attachment.kind === "video" ||
+    mimeType.startsWith("video/") ||
+    /\.(m4v|mov|mp4|ogv|webm)$/i.test(attachment.name)
+  )
+}
+
 function isGifAttachment(attachment: MessageAttachment) {
   return (
     attachment.mimeType.toLowerCase().split(";")[0] === "image/gif" ||
@@ -5348,6 +5467,30 @@ function downloadItems(items: DownloadItem[]) {
   items.forEach((item) => downloadUrl(item.url, item.filename))
 }
 
+function messageElementId(messageId: string) {
+  return `${MESSAGE_LINK_HASH_PREFIX}${messageId}`
+}
+
+function messageIdFromHash(hash: string) {
+  const cleanHash = hash.replace(/^#/, "")
+  if (!cleanHash.startsWith(MESSAGE_LINK_HASH_PREFIX)) return null
+
+  try {
+    return decodeURIComponent(cleanHash.slice(MESSAGE_LINK_HASH_PREFIX.length))
+  } catch {
+    return null
+  }
+}
+
+function messageLinkFor(messageId: string) {
+  const hash = `${MESSAGE_LINK_HASH_PREFIX}${encodeURIComponent(messageId)}`
+  if (typeof window === "undefined") return `#${hash}`
+
+  const url = new URL(window.location.href)
+  url.hash = hash
+  return url.toString()
+}
+
 function shouldIgnoreLongPress(target: EventTarget | null) {
   return (
     target instanceof Element &&
@@ -5357,7 +5500,61 @@ function shouldIgnoreLongPress(target: EventTarget | null) {
   )
 }
 
-function MessageAttachments({ attachments }: { attachments?: MessageAttachment[] }) {
+function MediaViewerDialog({
+  attachment,
+  onClose,
+}: {
+  attachment: MessageAttachment
+  onClose: () => void
+}) {
+  const isVideo = isVideoAttachment(attachment)
+
+  return (
+    <Modal
+      ariaLabel="Media viewer"
+      className="media-viewer-dialog"
+      isOpen
+      onClose={onClose}
+    >
+      <div className="media-viewer-head">
+        <div>
+          <strong id="media-viewer-title">{attachment.name}</strong>
+          <span>{formatFileSize(attachment.size)}</span>
+        </div>
+        <button
+          aria-label={`Download ${attachment.name}`}
+          className="media-viewer-download"
+          data-tooltip={`Download ${attachment.name}`}
+          type="button"
+          onClick={() => downloadAttachment(attachment)}
+        >
+          <DownloadSimple weight="bold" />
+        </button>
+      </div>
+      <div className="media-viewer-body">
+        {isVideo ? (
+          <video
+            autoPlay
+            controls
+            playsInline
+            preload="metadata"
+            src={attachment.dataUrl}
+          />
+        ) : (
+          <img alt={attachment.name} src={attachment.dataUrl} />
+        )}
+      </div>
+    </Modal>
+  )
+}
+
+function MessageAttachments({
+  attachments,
+  onOpenMedia,
+}: {
+  attachments?: MessageAttachment[]
+  onOpenMedia: (state: MediaViewerState) => void
+}) {
   if (!attachments?.length) return null
 
   return (
@@ -5371,9 +5568,47 @@ function MessageAttachments({ attachments }: { attachments?: MessageAttachment[]
               className={cn("message-image-attachment", isGif && "gif-attachment")}
               key={attachment.id}
             >
-              <a href={attachment.dataUrl} rel="noreferrer" target="_blank">
+              <button
+                aria-label={`Open ${attachment.name}`}
+                className="message-media-preview"
+                type="button"
+                onClick={() => onOpenMedia({ attachment })}
+              >
                 <img alt={attachment.name} src={attachment.dataUrl} />
-              </a>
+              </button>
+              <button
+                aria-label={`Download ${attachment.name}`}
+                className="attachment-download-button"
+                data-tooltip={`Download ${attachment.name}`}
+                type="button"
+                onClick={() => downloadAttachment(attachment)}
+              >
+                <DownloadSimple weight="bold" />
+              </button>
+            </div>
+          )
+        }
+
+        if (isVideoAttachment(attachment)) {
+          return (
+            <div className="message-video-attachment" key={attachment.id}>
+              <button
+                aria-label={`Open ${attachment.name}`}
+                className="message-media-preview"
+                type="button"
+                onClick={() => onOpenMedia({ attachment })}
+              >
+                <video
+                  aria-hidden="true"
+                  muted
+                  playsInline
+                  preload="metadata"
+                  src={attachment.dataUrl}
+                />
+                <span className="message-video-play">
+                  <Play weight="fill" />
+                </span>
+              </button>
               <button
                 aria-label={`Download ${attachment.name}`}
                 className="attachment-download-button"
@@ -5508,8 +5743,10 @@ function MessageBlock({
   adminUnlocked,
   authorId,
   group,
+  highlightedMessageId,
   mobileReplyGesture,
   onExternalLink,
+  onOpenMedia,
   onDeleteMessage,
   onReact,
   onReply,
@@ -5519,8 +5756,10 @@ function MessageBlock({
   adminUnlocked: boolean
   authorId: string
   group: MessageGroup
+  highlightedMessageId: string | null
   mobileReplyGesture: boolean
   onExternalLink: (url: string, displayUrl: string) => void
+  onOpenMedia: (state: MediaViewerState) => void
   onDeleteMessage: (message: ChatMessage) => void | Promise<void>
   onReact: (messageId: string, emoji: string) => void
   onReply: (messageId: string) => void
@@ -5559,12 +5798,14 @@ function MessageBlock({
               authorId={authorId}
               compact={index > 0}
               displayName={displayName}
+              highlighted={highlightedMessageId === message.id}
               mobileReplyGesture={mobileReplyGesture}
               message={message}
               profile={profile}
               quote={quoteFor(message)}
               onDelete={() => void onDeleteMessage(message)}
               onExternalLink={onExternalLink}
+              onOpenMedia={onOpenMedia}
               onReact={onReact}
               onReply={() => onReply(message.id)}
             />
@@ -5580,10 +5821,12 @@ function MessageBubble({
   authorId,
   compact,
   displayName,
+  highlighted,
   mobileReplyGesture,
   message,
   onDelete,
   onExternalLink,
+  onOpenMedia,
   onReact,
   onReply,
   profile,
@@ -5593,10 +5836,12 @@ function MessageBubble({
   authorId: string
   compact: boolean
   displayName: string
+  highlighted: boolean
   mobileReplyGesture: boolean
   message: ChatMessage
   onDelete: () => void
   onExternalLink: (url: string, displayUrl: string) => void
+  onOpenMedia: (state: MediaViewerState) => void
   onReact: (messageId: string, emoji: string) => void
   onReply: () => void
   profile: Profile
@@ -5604,7 +5849,7 @@ function MessageBubble({
 }) {
   const [actionMenuOpen, setActionMenuOpen] = useState(false)
   const [actionFeedback, setActionFeedback] = useState<
-    "reply" | "copy" | "download" | "reaction" | "delete" | null
+    "reply" | "copy" | "download" | "reaction" | "delete" | "link" | null
   >(null)
   const [reactionMenuOpen, setReactionMenuOpen] = useState(false)
   const [swipeIntent, setSwipeIntent] = useState<"reply" | "copy" | null>(null)
@@ -5625,8 +5870,10 @@ function MessageBubble({
   const canDownload = !isPending && downloads.length > 0
   const canCopy = !isPending && message.messageType !== "audio" && hasText
   const canDelete = adminUnlocked && !isPending
+  const canCopyLink = !isPending
   const canReply = !isPending
   const canReact = !isPending
+  const hasActionMenu = canCopy || canDownload || canDelete || canCopyLink
 
   useEffect(() => {
     return () => {
@@ -5671,7 +5918,7 @@ function MessageBubble({
   }
 
   function triggerActionFeedback(
-    action: "reply" | "copy" | "download" | "reaction" | "delete"
+    action: "reply" | "copy" | "download" | "reaction" | "delete" | "link"
   ) {
     clearActionFeedbackTimer()
     setActionFeedback(action)
@@ -5692,6 +5939,14 @@ function MessageBubble({
     if (!canCopy) return
     triggerActionFeedback("copy")
     navigator.clipboard?.writeText(messagePreview(message)).catch(() => undefined)
+  }
+
+  function copyMessageLink() {
+    if (!canCopyLink) return
+    triggerActionFeedback("link")
+    navigator.clipboard?.writeText(messageLinkFor(message.id)).catch(() => undefined)
+    setActionMenuOpen(false)
+    setReactionMenuOpen(false)
   }
 
   function reactToMessage(emoji: string) {
@@ -5850,11 +6105,13 @@ function MessageBubble({
   return (
     <motion.div
       ref={bubbleLineRef}
+      id={messageElementId(message.id)}
       className={cn(
         "bubble-line",
         message.messageType === "audio" && "audio-bubble",
         isPending && "pending-bubble-line",
         mobileReplyGesture && "swipe-reply",
+        highlighted && "linked-message",
         compact && "compact"
       )}
       drag={mobileReplyGesture && !isPending ? "x" : false}
@@ -5923,6 +6180,16 @@ function MessageBubble({
                 Copy
               </button>
             ) : null}
+            {canCopyLink ? (
+              <button
+                data-tooltip="Copy message link"
+                type="button"
+                onClick={copyMessageLink}
+              >
+                <LinkSimple weight="bold" />
+                Link
+              </button>
+            ) : null}
             {canDownload ? (
               <button data-tooltip="Download" type="button" onClick={downloadMessage}>
                 <DownloadSimple weight="bold" />
@@ -5945,7 +6212,10 @@ function MessageBubble({
       </AnimatePresence>
       <div className="bubble-stack">
         {message.messageType !== "audio" && hasAttachments && !isPending ? (
-          <MessageAttachments attachments={message.attachments} />
+          <MessageAttachments
+            attachments={message.attachments}
+            onOpenMedia={onOpenMedia}
+          />
         ) : null}
 
         {showTextBubble ? (
@@ -6051,65 +6321,31 @@ function MessageBubble({
             </button>
           </Tooltip>
         ) : null}
-        {canCopy ? (
+        {hasActionMenu ? (
           <Tooltip
-            content="Copy message"
+            content="More actions"
             side="top"
             tooltipClassName="chat-tooltip"
           >
             <button
-              aria-label="Copy message"
+              aria-expanded={actionMenuOpen}
+              aria-label="Open message actions"
               className={cn(
-                "message-action copy-action",
-                actionFeedback === "copy" && "is-confirming"
+                "message-action more-action",
+                actionMenuOpen && "is-confirming",
+                actionFeedback === "copy" && "copy-action is-confirming",
+                actionFeedback === "download" && "download-action is-confirming",
+                actionFeedback === "delete" && "delete-action is-confirming",
+                actionFeedback === "link" && "link-action is-confirming"
               )}
               type="button"
-              onClick={copyMessage}
+              onClick={() => {
+                setReactionMenuOpen(false)
+                setActionMenuOpen((open) => !open)
+              }}
             >
               <span className="icon-motion">
-                <CopySimple weight="bold" />
-              </span>
-            </button>
-          </Tooltip>
-        ) : null}
-        {canDownload ? (
-          <Tooltip
-            content="Download"
-            side="top"
-            tooltipClassName="chat-tooltip"
-          >
-            <button
-              aria-label="Download message media"
-              className={cn(
-                "message-action download-action",
-                actionFeedback === "download" && "is-confirming"
-              )}
-              type="button"
-              onClick={downloadMessage}
-            >
-              <span className="icon-motion">
-                <DownloadSimple weight="bold" />
-              </span>
-            </button>
-          </Tooltip>
-        ) : null}
-        {canDelete ? (
-          <Tooltip
-            content="Delete message"
-            side="top"
-            tooltipClassName="chat-tooltip"
-          >
-            <button
-              aria-label="Delete message"
-              className={cn(
-                "message-action delete-action",
-                actionFeedback === "delete" && "is-confirming"
-              )}
-              type="button"
-              onClick={deleteAndCloseMenu}
-            >
-              <span className="icon-motion">
-                <Trash weight="bold" />
+                <DotsThreeVertical weight="bold" />
               </span>
             </button>
           </Tooltip>

@@ -20,6 +20,7 @@ import {
 
 import type {
   ChatMessage,
+  ChatUser,
   MessageAttachment,
   MessageReaction,
   MessageType,
@@ -79,6 +80,10 @@ const ALLOWED_ATTACHMENT_MIME_TYPES = new Set([
   "image/webp",
   "text/markdown",
   "text/plain",
+  "video/mp4",
+  "video/ogg",
+  "video/quicktime",
+  "video/webm",
 ])
 const ALLOWED_ATTACHMENT_EXTENSIONS = [".gif", ".md", ".txt", ".zip"]
 const firestoreFileDataCache = new Map<string, string>()
@@ -209,6 +214,28 @@ export function listenToRemoteMessages(
     unsubscribeMessages()
     unsubscribeReactions()
   }
+}
+
+export function listenToRemoteUsers(
+  onUsers: (users: ChatUser[]) => void,
+  onError: (error: Error) => void
+): Unsubscribe | null {
+  const current = getFirebaseServices()
+  if (!current) return null
+
+  const roomId = getFirebaseRoomId()
+  return onSnapshot(
+    collection(current.db, "rooms", roomId, "usernames"),
+    (snapshot) => {
+      const users = snapshot.docs
+        .map(toChatUser)
+        .filter((user): user is ChatUser => Boolean(user))
+        .sort((a, b) => b.lastSeenAt - a.lastSeenAt)
+
+      onUsers(users)
+    },
+    (error) => onError(error)
+  )
 }
 
 export async function sendRemoteMessage(input: SendRemoteMessageInput) {
@@ -548,7 +575,9 @@ function sanitizeAttachment(attachment: MessageAttachment): MessageAttachment | 
     typeof attachment.name !== "string" ||
     typeof attachment.mimeType !== "string" ||
     typeof attachment.size !== "number" ||
-    (attachment.kind !== "image" && attachment.kind !== "file")
+    (attachment.kind !== "image" &&
+      attachment.kind !== "file" &&
+      attachment.kind !== "video")
   ) {
     return null
   }
@@ -588,6 +617,7 @@ function isAllowedRemoteAttachment(attachment: MessageAttachment) {
 
   const mimeType = attachment.mimeType.toLowerCase().split(";")[0]
   if (mimeType.startsWith("audio/")) return true
+  if (mimeType.startsWith("video/")) return true
   if (ALLOWED_ATTACHMENT_MIME_TYPES.has(mimeType)) return true
 
   const name = attachment.name.toLowerCase()
@@ -944,6 +974,34 @@ function toChatMessage(snapshot: QueryDocumentSnapshot<DocumentData>): ChatMessa
   }
 }
 
+function toChatUser(snapshot: QueryDocumentSnapshot<DocumentData>): ChatUser | null {
+  const data = snapshot.data()
+  const id = typeof data.authorId === "string" ? data.authorId : ""
+  const name =
+    typeof data.displayName === "string" && data.displayName.trim()
+      ? data.displayName.trim()
+      : ""
+  const usernameKey =
+    typeof data.usernameKey === "string" && data.usernameKey.trim()
+      ? data.usernameKey.trim()
+      : snapshot.id
+  const lastSeenAt =
+    typeof data.clientUpdatedAt === "number"
+      ? data.clientUpdatedAt
+      : typeof data.updatedAt?.toMillis === "function"
+        ? data.updatedAt.toMillis()
+        : Date.now()
+
+  if (!id || !name || !usernameKey) return null
+
+  return {
+    id,
+    lastSeenAt,
+    name,
+    usernameKey,
+  }
+}
+
 function toRemoteReaction(
   snapshot: QueryDocumentSnapshot<DocumentData>
 ): RemoteReaction | null {
@@ -1098,7 +1156,9 @@ function normalizeAttachments(value: unknown): MessageAttachment[] | undefined {
     return (
       typeof attachment.id === "string" &&
       typeof attachment.dataUrl === "string" &&
-      (attachment.kind === "image" || attachment.kind === "file") &&
+      (attachment.kind === "image" ||
+        attachment.kind === "file" ||
+        attachment.kind === "video") &&
       typeof attachment.mimeType === "string" &&
       typeof attachment.name === "string" &&
       typeof attachment.size === "number"

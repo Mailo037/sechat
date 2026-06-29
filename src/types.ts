@@ -7,7 +7,7 @@ export type MessageType = "text" | "audio"
 export type MessageAttachment = {
   id: string
   dataUrl: string
-  kind: "image" | "file"
+  kind: "image" | "file" | "video"
   mimeType: string
   name: string
   size: number
@@ -22,6 +22,13 @@ export type UsernameClaim = {
   authorId: string
   key: string
   name: string
+}
+
+export type ChatUser = {
+  id: string
+  lastSeenAt: number
+  name: string
+  usernameKey: string
 }
 
 export type NotificationSettings = {
