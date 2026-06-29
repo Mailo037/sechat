@@ -197,7 +197,13 @@ const VOICE_RTC_CONFIG: RTCConfiguration = {
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
 }
 const MAX_RECORDING_MS = 120000
-const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
+const ATTACHMENT_LIMITS = {
+  image: 10 * 1024 * 1024,
+  audio: 25 * 1024 * 1024,
+  video: 80 * 1024 * 1024,
+  file: 15 * 1024 * 1024,
+} as const
+type AttachmentLimitKind = keyof typeof ATTACHMENT_LIMITS
 const MAX_ATTACHMENT_COUNT = 6
 const ACCEPTED_ATTACHMENT_TYPES = [
   "image/avif",
@@ -630,6 +636,50 @@ function isAcceptedAttachmentFile(file: File) {
   return ACCEPTED_ATTACHMENT_EXTENSIONS.some((extension) =>
     fileName.endsWith(extension)
   )
+}
+
+function attachmentLimitKindForFile(file: File): AttachmentLimitKind {
+  const mimeType = file.type.toLowerCase()
+  const fileName = file.name.toLowerCase()
+
+  if (
+    mimeType.startsWith("image/") ||
+    /\.(avif|gif|jpe?g|png|webp)$/.test(fileName)
+  ) {
+    return "image"
+  }
+  if (
+    mimeType.startsWith("video/") ||
+    /\.(m4v|mov|mp4|ogv|webm)$/.test(fileName)
+  ) {
+    return "video"
+  }
+  if (
+    mimeType.startsWith("audio/") ||
+    /\.(aac|m4a|mp3|oga|ogg|opus|wav|webm)$/.test(fileName)
+  ) {
+    return "audio"
+  }
+
+  return "file"
+}
+
+function attachmentLimitForFile(file: File) {
+  return ATTACHMENT_LIMITS[attachmentLimitKindForFile(file)]
+}
+
+function attachmentLimitLabel(kind: AttachmentLimitKind) {
+  switch (kind) {
+    case "audio":
+      return "audio files"
+    case "image":
+      return "images"
+    case "video":
+      return "videos"
+    case "file":
+    default:
+      return "files"
+  }
 }
 
 function hasReaction(
@@ -2650,7 +2700,7 @@ function App() {
     const remainingSlots = MAX_ATTACHMENT_COUNT - attachmentDrafts.length
     const acceptedFiles = files.slice(0, Math.max(0, remainingSlots))
     const oversizedFile = acceptedFiles.find(
-      (file) => file.size > MAX_ATTACHMENT_BYTES
+      (file) => file.size > attachmentLimitForFile(file)
     )
     const unsupportedFile = acceptedFiles.find(
       (file) => !isAcceptedAttachmentFile(file)
@@ -2662,7 +2712,12 @@ function App() {
     }
 
     if (oversizedFile) {
-      setAttachmentError(`${oversizedFile.name} is larger than 8 MB.`)
+      const limitKind = attachmentLimitKindForFile(oversizedFile)
+      setAttachmentError(
+        `${oversizedFile.name} is larger than ${formatFileSize(
+          ATTACHMENT_LIMITS[limitKind]
+        )} for ${attachmentLimitLabel(limitKind)}.`
+      )
       return
     }
 

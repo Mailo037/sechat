@@ -3,15 +3,16 @@
 This app can run in two modes:
 
 - Local-only: `FIREBASE_ENABLED=false`, messages stay in IndexedDB.
-- Firebase-backed: `FIREBASE_ENABLED=true`, messages sync through Firestore.
+- Firebase-backed: `FIREBASE_ENABLED=true`, messages sync through Firestore and large uploads use Firebase Storage.
 
 ## Firebase project
 
-1. Create a Firebase project.
+1. Create or select the `sechat-app` Firebase project.
 2. Add a Web app and copy the Firebase config values into Vercel environment variables.
 3. Enable Authentication and turn on anonymous sign-in.
-4. Create a Firestore database.
-5. Deploy the Firestore rules:
+4. Create the default Firestore database, `(default)`.
+5. Enable Firebase Storage.
+6. Deploy the Firestore and Storage rules:
 
 ```bash
 npm run firebase:deploy:rules
@@ -26,12 +27,24 @@ FIREBASE_ENABLED=true
 FIREBASE_API_KEY=...
 FIREBASE_AUTH_DOMAIN=...
 FIREBASE_PROJECT_ID=...
+FIREBASE_STORAGE_BUCKET=...
 FIREBASE_MESSAGING_SENDER_ID=...
 FIREBASE_APP_ID=...
-FIREBASE_DATABASE_ID=chat
+FIREBASE_DATABASE_ID=
 FIREBASE_ROOM_ID=main
 WEB_PASSWORD=...
 ```
+
+Leave `FIREBASE_DATABASE_ID` empty for the default Firestore database. If
+`FIREBASE_STORAGE_BUCKET` is empty, the app falls back to
+`<project-id>.firebasestorage.app`, which matches new Firebase Storage buckets.
+
+Current upload limits are enforced in the browser and in Storage rules:
+
+- Images: 10 MB
+- Audio and voice messages: 25 MB
+- Videos: 80 MB
+- PDF, text, markdown, and zip files: 15 MB
 
 The Vite build maps these build-time env vars into the app's internal Firebase
 config. Firebase Web config is still browser-visible by design, so Firestore

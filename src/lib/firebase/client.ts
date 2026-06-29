@@ -20,11 +20,17 @@ import {
   getFirestore,
   type Firestore,
 } from "firebase/firestore"
+import {
+  connectStorageEmulator,
+  getStorage,
+  type FirebaseStorage,
+} from "firebase/storage"
 
 type FirebaseServices = {
   app: FirebaseApp
   auth: Auth
   db: Firestore
+  storage: FirebaseStorage
 }
 
 export type FirebaseAuthUser = {
@@ -66,9 +72,19 @@ export function getFirebaseDatabaseId() {
   return configValue("databaseId")
 }
 
+export function getFirebaseStorageBucket() {
+  const configuredBucket = configValue("storageBucket")
+  if (configuredBucket) return configuredBucket
+
+  const projectId = configValue("projectId")
+  return projectId ? `${projectId}.firebasestorage.app` : ""
+}
+
 export function getFirebaseServices() {
   if (!firebaseRemoteEnabled() || !firebaseConfigReady()) return null
   if (services) return services
+
+  const storageBucket = getFirebaseStorageBucket()
 
   const app =
     getApps()[0] ??
@@ -76,6 +92,7 @@ export function getFirebaseServices() {
       apiKey: configValue("apiKey"),
       authDomain: configValue("authDomain"),
       projectId: configValue("projectId"),
+      storageBucket,
       messagingSenderId: configValue("messagingSenderId"),
       appId: configValue("appId"),
     })
@@ -83,7 +100,8 @@ export function getFirebaseServices() {
   const auth = getAuth(app)
   const databaseId = getFirebaseDatabaseId()
   const db = databaseId ? getFirestore(app, databaseId) : getFirestore(app)
-  services = { app, auth, db }
+  const storage = getStorage(app)
+  services = { app, auth, db, storage }
 
   connectEmulators(services)
 
@@ -98,6 +116,7 @@ function connectEmulators(current: FirebaseServices) {
   const host = configValue("emulatorHost") || "127.0.0.1"
   connectAuthEmulator(current.auth, `http://${host}:9099`, { disableWarnings: true })
   connectFirestoreEmulator(current.db, host, 8080)
+  connectStorageEmulator(current.storage, host, 9199)
   emulatorsConnected = true
 }
 

@@ -53,7 +53,7 @@ service cloud.firestore {
           || request.resource.data.messageType == "audio"
         )
         && request.resource.data.audioUrl is string
-        && request.resource.data.audioUrl.size() <= 800000
+        && request.resource.data.audioUrl.size() <= 4096
         && request.resource.data.audioMimeType is string
         && request.resource.data.audioMimeType.size() <= 80
         && request.resource.data.audioDurationMs is number
@@ -240,76 +240,6 @@ service cloud.firestore {
         && request.resource.data.reason.size() <= 180;
     }
 
-    function validFileContentType() {
-      return request.resource.data.mimeType.matches('image/(avif|gif|jpeg|png|webp)')
-        || request.resource.data.mimeType.matches('audio/.*')
-        || request.resource.data.mimeType.matches('video/(mp4|ogg|quicktime|webm)')
-        || request.resource.data.mimeType in [
-          'application/pdf',
-          'application/zip',
-          'application/x-zip-compressed',
-          'text/markdown',
-          'text/plain'
-        ];
-    }
-
-    function validFilePayload() {
-      return request.resource.data.keys().hasOnly([
-          "authorId",
-          "chunkCount",
-          "clientCreatedAt",
-          "createdAt",
-          "kind",
-          "mimeType",
-          "name",
-          "size",
-          "type"
-        ])
-        && request.resource.data.authorId == request.auth.uid
-        && request.resource.data.chunkCount is number
-        && request.resource.data.chunkCount > 0
-        && request.resource.data.chunkCount <= 80
-        && request.resource.data.clientCreatedAt is number
-        && request.resource.data.createdAt == request.time
-        && request.resource.data.kind is string
-        && request.resource.data.kind in ["audio", "file", "image", "video"]
-        && request.resource.data.mimeType is string
-        && request.resource.data.mimeType.size() > 0
-        && request.resource.data.mimeType.size() <= 120
-        && validFileContentType()
-        && request.resource.data.name is string
-        && request.resource.data.name.size() > 0
-        && request.resource.data.name.size() <= 180
-        && request.resource.data.size is number
-        && request.resource.data.size > 0
-        && request.resource.data.size <= 8 * 1024 * 1024
-        && request.resource.data.type is string
-        && request.resource.data.type in ["attachments", "audio"];
-    }
-
-    function validFileChunkPayload() {
-      return request.resource.data.keys().hasOnly([
-          "authorId",
-          "clientCreatedAt",
-          "createdAt",
-          "data",
-          "index",
-          "size"
-        ])
-        && request.resource.data.authorId == request.auth.uid
-        && request.resource.data.clientCreatedAt is number
-        && request.resource.data.createdAt == request.time
-        && request.resource.data.data is string
-        && request.resource.data.data.size() > 0
-        && request.resource.data.data.size() <= 240000
-        && request.resource.data.index is number
-        && request.resource.data.index >= 0
-        && request.resource.data.index < 100
-        && request.resource.data.size is number
-        && request.resource.data.size > 0
-        && request.resource.data.size <= 240000;
-    }
-
     match /rooms/{roomId} {
       allow read: if signedIn();
       allow write: if false;
@@ -374,12 +304,12 @@ service cloud.firestore {
 
       match /files/{fileId} {
         allow read: if signedIn();
-        allow create: if signedIn() && validFilePayload();
+        allow create: if false;
         allow update, delete: if false;
 
         match /chunks/{chunkId} {
           allow read: if signedIn();
-          allow create: if signedIn() && validFileChunkPayload();
+          allow create: if false;
           allow update, delete: if false;
         }
       }

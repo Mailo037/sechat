@@ -8,8 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "firebase:emulators": "npx firebase-tools emulators:start --only auth,firestore",
-    "firebase:deploy:rules": "npx firebase-tools deploy --only firestore:rules,firestore:indexes"
+    "firebase:emulators": "npx firebase-tools emulators:start --project sechat-app --only auth,firestore,storage",
+    "firebase:deploy:rules": "npx firebase-tools deploy --project sechat-app --only firestore:rules,firestore:indexes,storage"
   },
   "dependencies": {
     "@base-ui/react": "^1.6.0",

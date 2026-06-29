@@ -1,0 +1,58 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return signedIn() && request.auth.uid == userId;
+    }
+
+    function isImage() {
+      return request.resource.contentType.matches('image/(avif|gif|jpeg|png|webp)');
+    }
+
+    function isAudio() {
+      return request.resource.contentType.matches('audio/.*');
+    }
+
+    function isVideo() {
+      return request.resource.contentType.matches('video/(mp4|ogg|quicktime|webm)');
+    }
+
+    function isDocument() {
+      return request.resource.contentType in [
+        'application/pdf',
+        'application/zip',
+        'application/x-zip-compressed',
+        'text/markdown',
+        'text/plain'
+      ];
+    }
+
+    function validAttachmentSize() {
+      return (isImage() && request.resource.size <= 10 * 1024 * 1024)
+        || (isAudio() && request.resource.size <= 25 * 1024 * 1024)
+        || (isVideo() && request.resource.size <= 80 * 1024 * 1024)
+        || (isDocument() && request.resource.size <= 15 * 1024 * 1024);
+    }
+
+    function validVoiceSize() {
+      return isAudio() && request.resource.size <= 25 * 1024 * 1024;
+    }
+
+    match /rooms/{roomId}/attachments/{userId}/{fileName} {
+      allow read: if signedIn();
+      allow create, update: if isOwner(userId) && validAttachmentSize();
+      allow delete: if isOwner(userId);
+    }
+
+    match /rooms/{roomId}/audio/{userId}/{fileName} {
+      allow read: if signedIn();
+      allow create, update: if isOwner(userId) && validVoiceSize();
+      allow delete: if isOwner(userId);
+    }
+  }
+}

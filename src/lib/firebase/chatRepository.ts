@@ -17,6 +17,12 @@ import {
   type QueryDocumentSnapshot,
   type Unsubscribe,
 } from "firebase/firestore"
+import {
+  getDownloadURL,
+  ref,
+  uploadBytesResumable,
+  type FirebaseStorage,
+} from "firebase/storage"
 
 import type {
   ChatMessage,
@@ -67,9 +73,14 @@ export class UsernameTakenError extends Error {
   }
 }
 
-const MAX_REMOTE_UPLOAD_BYTES = 8 * 1024 * 1024
+const REMOTE_UPLOAD_LIMITS = {
+  image: 10 * 1024 * 1024,
+  audio: 25 * 1024 * 1024,
+  video: 80 * 1024 * 1024,
+  file: 15 * 1024 * 1024,
+} as const
+type RemoteUploadKind = keyof typeof REMOTE_UPLOAD_LIMITS
 const FIRESTORE_FILE_PREFIX = "firestore-file:"
-const FIRESTORE_FILE_CHUNK_CHAR_LIMIT = 240000
 const ALLOWED_ATTACHMENT_MIME_TYPES = new Set([
   "application/pdf",
   "application/zip",
@@ -260,7 +271,7 @@ export async function sendRemoteMessage(input: SendRemoteMessageInput) {
 
   const remoteAttachments = await uploadRemoteAttachments(
     attachments,
-    current.db,
+    current.storage,
     roomId,
     user.uid,
     input.onUploadProgress
@@ -270,7 +281,7 @@ export async function sendRemoteMessage(input: SendRemoteMessageInput) {
     filename: `voice-message-${Date.now()}.${extensionFromMime(input.audioMimeType)}`,
     mimeType: input.audioMimeType,
     roomId,
-    db: current.db,
+    storage: current.storage,
     type: "audio",
     kind: "audio",
     userId: user.uid,
@@ -656,11 +667,14 @@ function isValidUsernameKey(key: string) {
 }
 
 function isAllowedRemoteAttachment(attachment: MessageAttachment) {
-  if (attachment.size <= 0 || attachment.size > MAX_REMOTE_UPLOAD_BYTES) {
+  if (
+    attachment.size <= 0 ||
+    attachment.size > remoteUploadLimitFor(attachment.kind, attachment.mimeType)
+  ) {
     return false
   }
 
-  const mimeType = attachment.mimeType.toLowerCase().split(";")[0]
+  const mimeType = cleanMimeType(attachment.mimeType)
   if (mimeType.startsWith("audio/")) return true
   if (mimeType.startsWith("video/")) return true
   if (ALLOWED_ATTACHMENT_MIME_TYPES.has(mimeType)) return true
@@ -673,7 +687,7 @@ function isAllowedRemoteAttachment(attachment: MessageAttachment) {
 
 async function uploadRemoteAttachments(
   attachments: MessageAttachment[],
-  db: Firestore,
+  storage: FirebaseStorage,
   roomId: string,
   userId: string,
   onUploadProgress?: (progress: number) => void
@@ -685,15 +699,15 @@ async function uploadRemoteAttachments(
     (attachment) => !isAllowedRemoteAttachment(attachment)
   )
   if (invalidAttachment) {
-    throw new Error(`${invalidAttachment.name} is not allowed for upload`)
+    throw new Error(
+      `${invalidAttachment.name} is not allowed for upload or exceeds the size limit.`
+    )
   }
 
-  const prepared = await Promise.all(
-    safeAttachments.map(async (attachment) => ({
-      attachment,
-      uploadBytes: uploadByteSize(attachment.dataUrl, attachment.size),
-    }))
-  )
+  const prepared = safeAttachments.map((attachment) => ({
+    attachment,
+    uploadBytes: attachment.size,
+  }))
   const totalBytes = prepared.reduce((sum, item) => sum + item.uploadBytes, 0)
   let completedBytes = 0
   const uploaded: Array<MessageAttachment | null> = []
@@ -701,11 +715,11 @@ async function uploadRemoteAttachments(
   for (const item of prepared) {
     const remoteUrl = await uploadRemoteDataUrl({
       dataUrl: item.attachment.dataUrl,
-      db,
       filename: item.attachment.name,
       kind: item.attachment.kind,
       mimeType: item.attachment.mimeType,
       roomId,
+      storage,
       type: "attachments",
       userId,
       onProgress: (progress) => {
@@ -737,21 +751,21 @@ async function uploadRemoteAttachments(
 
 async function uploadRemoteDataUrl({
   dataUrl,
-  db,
   filename,
   kind,
   mimeType,
   roomId,
+  storage,
   type,
   userId,
   onProgress,
 }: {
   dataUrl?: string
-  db: Firestore
   filename: string
   kind: "audio" | MessageAttachment["kind"]
   mimeType?: string
   roomId: string
+  storage: FirebaseStorage
   type: "attachments" | "audio"
   userId: string
   onProgress?: (progress: number) => void
@@ -760,22 +774,23 @@ async function uploadRemoteDataUrl({
   if (!dataUrl.startsWith("data:")) return dataUrl
 
   const blob = await dataUrlToBlob(dataUrl)
-  const cleanMimeType = (mimeType || blob.type).toLowerCase().split(";")[0]
-  if (blob.size <= 0 || blob.size > MAX_REMOTE_UPLOAD_BYTES) {
-    throw new Error(`${filename} is too large`)
+  const resolvedMimeType = cleanMimeType(mimeType || blob.type)
+  const uploadKind = remoteUploadKindFor(kind, resolvedMimeType)
+  const uploadLimit = REMOTE_UPLOAD_LIMITS[uploadKind]
+  if (blob.size <= 0 || blob.size > uploadLimit) {
+    throw new Error(`${filename} is larger than ${formatRemoteUploadLimit(uploadLimit)}.`)
   }
-  if (type === "audio" && !cleanMimeType.startsWith("audio/")) {
+  if (type === "audio" && !resolvedMimeType.startsWith("audio/")) {
     throw new Error("Audio upload must be an audio file")
   }
 
-  return uploadFirestoreFile({
-    dataUrl,
-    db,
+  return uploadStorageFile({
+    blob,
     filename,
-    kind,
-    mimeType,
+    kind: uploadKind,
+    mimeType: resolvedMimeType,
     roomId,
-    size: blob.size,
+    storage,
     type,
     userId,
     onProgress,
@@ -791,72 +806,66 @@ async function dataUrlToBlob(dataUrl: string) {
   return response.blob()
 }
 
-async function uploadFirestoreFile({
-  dataUrl,
-  db,
+function uploadStorageFile({
+  blob,
   filename,
   kind,
   mimeType,
   roomId,
-  size,
+  storage,
   type,
   userId,
   onProgress,
 }: {
-  dataUrl: string
-  db: Firestore
+  blob: Blob
   filename: string
-  kind: "audio" | MessageAttachment["kind"]
-  mimeType?: string
+  kind: RemoteUploadKind
+  mimeType: string
   roomId: string
-  size: number
+  storage: FirebaseStorage
   type: "attachments" | "audio"
   userId: string
   onProgress?: (progress: number) => void
 }) {
-  const fileRef = doc(collection(db, "rooms", roomId, "files"))
-  const chunks = chunkString(dataUrl, FIRESTORE_FILE_CHUNK_CHAR_LIMIT)
-  const cleanMimeType =
-    mimeType?.split(";")[0]?.trim().toLowerCase() || "application/octet-stream"
-
-  await setDoc(fileRef, {
-    authorId: userId,
-    chunkCount: chunks.length,
-    clientCreatedAt: Date.now(),
-    createdAt: serverTimestamp(),
-    kind,
-    mimeType: cleanMimeType,
-    name: sanitizeFileMetadataName(filename),
-    size,
+  const storagePath = [
+    "rooms",
+    sanitizeStoragePathSegment(roomId),
     type,
+    sanitizeStoragePathSegment(userId),
+    `${Date.now()}-${randomStorageId()}-${sanitizeFileMetadataName(filename)}`,
+  ].join("/")
+  const uploadRef = ref(storage, storagePath)
+  const uploadTask = uploadBytesResumable(uploadRef, blob, {
+    contentType: mimeType || "application/octet-stream",
+    customMetadata: {
+      kind,
+      originalName: sanitizeFileMetadataName(filename),
+      roomId,
+      userId,
+    },
   })
 
-  for (const [index, chunk] of chunks.entries()) {
-    await setDoc(
-      doc(
-        db,
-        "rooms",
-        roomId,
-        "files",
-        fileRef.id,
-        "chunks",
-        index.toString().padStart(4, "0")
-      ),
-      {
-        authorId: userId,
-        clientCreatedAt: Date.now(),
-        createdAt: serverTimestamp(),
-        data: chunk,
-        index,
-        size: chunk.length,
+  return new Promise<string>((resolve, reject) => {
+    uploadTask.on(
+      "state_changed",
+      (snapshot) => {
+        const progress =
+          snapshot.totalBytes > 0
+            ? snapshot.bytesTransferred / snapshot.totalBytes
+            : 0.01
+        onProgress?.(Math.max(0.01, Math.min(0.99, progress)))
+      },
+      reject,
+      async () => {
+        try {
+          onProgress?.(1)
+          resolve(await getDownloadURL(uploadTask.snapshot.ref))
+        } catch (error) {
+          reject(error)
+        }
       }
     )
-    onProgress?.((index + 1) / chunks.length)
-  }
-
-  firestoreFileDataCache.set(fileRef.id, dataUrl)
-
-  return `${FIRESTORE_FILE_PREFIX}${fileRef.id}`
+  })
 }
 
 function sanitizeFileMetadataName(filename: string) {
@@ -868,16 +877,44 @@ function sanitizeFileMetadataName(filename: string) {
   return clean || "attachment"
 }
 
-function uploadByteSize(dataUrl: string, fallbackSize: number) {
-  return dataUrl.startsWith("data:") ? dataUrl.length : fallbackSize
+function cleanMimeType(mimeType?: string) {
+  return mimeType?.split(";")[0]?.trim().toLowerCase() || "application/octet-stream"
 }
 
-function chunkString(value: string, chunkSize: number) {
-  const chunks: string[] = []
-  for (let index = 0; index < value.length; index += chunkSize) {
-    chunks.push(value.slice(index, index + chunkSize))
+function remoteUploadKindFor(
+  kind: "audio" | MessageAttachment["kind"],
+  mimeType?: string
+): RemoteUploadKind {
+  const clean = cleanMimeType(mimeType)
+  if (kind === "audio" || clean.startsWith("audio/")) return "audio"
+  if (kind === "image" || clean.startsWith("image/")) return "image"
+  if (kind === "video" || clean.startsWith("video/")) return "video"
+  return "file"
+}
+
+function remoteUploadLimitFor(
+  kind: "audio" | MessageAttachment["kind"],
+  mimeType?: string
+) {
+  return REMOTE_UPLOAD_LIMITS[remoteUploadKindFor(kind, mimeType)]
+}
+
+function formatRemoteUploadLimit(bytes: number) {
+  return bytes < 1024 * 1024
+    ? `${Math.round(bytes / 1024)} KB`
+    : `${Math.round(bytes / (1024 * 1024))} MB`
+}
+
+function sanitizeStoragePathSegment(value: string) {
+  return value.replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "") || "default"
+}
+
+function randomStorageId() {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID().slice(0, 8)
   }
-  return chunks
+
+  return Math.random().toString(36).slice(2, 10)
 }
 
 function extensionFromMime(mimeType?: string) {

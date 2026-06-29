@@ -1,10 +1,11 @@
 # sechat
 
-Minimal realtime chat app built with React, Vite, Firebase Auth, Firestore, and IndexedDB fallback storage.
+Minimal realtime chat app built with React, Vite, Firebase Auth, Firestore, Firebase Storage, and IndexedDB fallback storage.
 
 ## Features
 
 - Realtime Firestore chat with anonymous Firebase Auth
+- Firebase Storage uploads for images, videos, audio, and files
 - Local IndexedDB storage fallback
 - Message replies, mentions, links, file/image attachments, and voice messages
 - Mobile swipe gestures for reply/copy actions
