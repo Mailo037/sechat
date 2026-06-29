@@ -2,8 +2,8 @@
 
 This app can run in two modes:
 
-- Local-only: `VITE_FIREBASE_ENABLED=false`, messages stay in IndexedDB.
-- Firebase-backed: `VITE_FIREBASE_ENABLED=true`, messages sync through Firestore.
+- Local-only: `FIREBASE_ENABLED=false`, messages stay in IndexedDB.
+- Firebase-backed: `FIREBASE_ENABLED=true`, messages sync through Firestore.
 
 ## Firebase project
 
@@ -22,16 +22,26 @@ npm run firebase:deploy:rules
 Copy `.env.example` into Vercel Project Settings -> Environment Variables and fill:
 
 ```bash
-VITE_FIREBASE_ENABLED=true
-VITE_FIREBASE_API_KEY=...
-VITE_FIREBASE_AUTH_DOMAIN=...
-VITE_FIREBASE_PROJECT_ID=...
-VITE_FIREBASE_STORAGE_BUCKET=...
-VITE_FIREBASE_MESSAGING_SENDER_ID=...
-VITE_FIREBASE_APP_ID=...
-VITE_FIREBASE_DATABASE_ID=chat
-VITE_FIREBASE_ROOM_ID=main
+FIREBASE_ENABLED=true
+FIREBASE_API_KEY=...
+FIREBASE_AUTH_DOMAIN=...
+FIREBASE_PROJECT_ID=...
+FIREBASE_MESSAGING_SENDER_ID=...
+FIREBASE_APP_ID=...
+FIREBASE_DATABASE_ID=chat
+FIREBASE_ROOM_ID=main
+WEB_PASSWORD=...
 ```
+
+The Vite build maps these build-time env vars into the app's internal Firebase
+config. Firebase Web config is still browser-visible by design, so Firestore
+security rules remain the real protection.
+
+`WEB_PASSWORD` unlocks the in-app admin popup for moderation logs, message
+deletion, and manual user timeouts/bans. Because this is a static frontend,
+treat it as a UI gate, not a server-side security boundary. For stronger
+production moderation, move these actions behind a server/API that verifies an
+admin role before writing moderation documents or deleting messages.
 
 ## Local emulator mode
 
@@ -44,6 +54,6 @@ npm run firebase:emulators
 Then set:
 
 ```bash
-VITE_FIREBASE_ENABLED=true
-VITE_FIREBASE_USE_EMULATORS=true
+FIREBASE_ENABLED=true
+FIREBASE_USE_EMULATORS=true
 ```

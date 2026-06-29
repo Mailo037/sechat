@@ -216,20 +216,31 @@ export function TooltipLayer() {
     const handlePointerOut = (event: PointerEvent) => hideForTarget(resolveTooltipTarget(event.target))
     const handleFocusIn = (event: FocusEvent) => showForTarget(resolveTooltipTarget(event.target))
     const handleFocusOut = (event: FocusEvent) => hideForTarget(resolveTooltipTarget(event.target))
+    const hideTooltip = () => {
+      activeTargetRef.current = null
+      setState(null)
+    }
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        activeTargetRef.current = null
-        setState(null)
+        hideTooltip()
       }
     }
     const handleReposition = () => {
-      if (activeTargetRef.current) {
-        setState(tooltipStateForElement(activeTargetRef.current))
+      const activeTarget = activeTargetRef.current
+      if (activeTarget) {
+        if (!activeTarget.isConnected) {
+          hideTooltip()
+          return
+        }
+
+        setState(tooltipStateForElement(activeTarget))
       }
     }
 
     document.addEventListener("pointerover", handlePointerOver)
     document.addEventListener("pointerout", handlePointerOut)
+    document.addEventListener("pointerdown", hideTooltip, true)
+    document.addEventListener("pointercancel", hideTooltip, true)
     document.addEventListener("focusin", handleFocusIn)
     document.addEventListener("focusout", handleFocusOut)
     document.addEventListener("keydown", handleKeyDown)
@@ -238,6 +249,8 @@ export function TooltipLayer() {
     return () => {
       document.removeEventListener("pointerover", handlePointerOver)
       document.removeEventListener("pointerout", handlePointerOut)
+      document.removeEventListener("pointerdown", hideTooltip, true)
+      document.removeEventListener("pointercancel", hideTooltip, true)
       document.removeEventListener("focusin", handleFocusIn)
       document.removeEventListener("focusout", handleFocusOut)
       document.removeEventListener("keydown", handleKeyDown)
@@ -261,7 +274,7 @@ export function TooltipLayer() {
       ref={tooltipRef}
       role="tooltip"
       className={cn(
-        "pointer-events-none fixed z-[220] max-w-[calc(100vw-1rem)] rounded-md border border-border bg-popover px-2 py-1 text-center text-xs font-medium text-popover-foreground shadow-lg shadow-black/15",
+        "chat-tooltip pointer-events-none fixed z-[220] max-w-[calc(100vw-1rem)] rounded-md border border-border bg-popover px-2 py-1 text-center text-xs font-medium text-popover-foreground shadow-lg shadow-black/15 transition-opacity duration-150",
         position ? "visible opacity-100" : "invisible opacity-0"
       )}
       style={{ top: position?.top ?? 0, left: position?.left ?? 0 }}

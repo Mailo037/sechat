@@ -27,9 +27,48 @@ export type NotificationSettings = {
 }
 
 export type SpamGuardState = {
+  banReason?: string
+  banSource?: "admin" | "spam"
   strikes: number
   lastTriggeredAt?: number
   bannedUntil?: number
+  log?: SpamModerationLogEntry[]
+}
+
+export type SpamModerationLogEntry = {
+  id: string
+  action: "ban" | "clear" | "delete" | "timeout" | "warn"
+  at: number
+  bannedUntil?: number
+  reason: string
+  strikes: number
+  targetAuthorId?: string
+  targetAuthorName?: string
+}
+
+export type ModerationUser = {
+  avatar?: string
+  id: string
+  isSelf: boolean
+  lastSeenAt: number
+  messageCount: number
+  name: string
+}
+
+export type UserModerationState = {
+  action: "ban" | "timeout"
+  at: number
+  authorId: string
+  authorName: string
+  bannedUntil: number
+  moderatorName: string
+  reason: string
+}
+
+export type MessageReaction = {
+  emoji: string
+  authorId: AuthorId
+  authorName: string
 }
 
 export type ChatMessage = {
@@ -46,6 +85,9 @@ export type ChatMessage = {
   audioMimeType?: string
   audioDurationMs?: number
   attachments?: MessageAttachment[]
+  reactions?: MessageReaction[]
+  sendStatus?: "sending" | "failed"
+  uploadProgress?: number
   waveform?: number[]
 }
 

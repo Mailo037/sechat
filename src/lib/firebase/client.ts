@@ -18,34 +18,33 @@ type FirebaseServices = {
   db: Firestore
 }
 
-const requiredEnv = [
-  "VITE_FIREBASE_API_KEY",
-  "VITE_FIREBASE_AUTH_DOMAIN",
-  "VITE_FIREBASE_PROJECT_ID",
-  "VITE_FIREBASE_APP_ID",
-] as const
-
 let services: FirebaseServices | null = null
 let emulatorsConnected = false
 
-function envValue(key: (typeof requiredEnv)[number]) {
-  return import.meta.env[key]?.trim()
+function configValue(key: keyof SechatFirebaseConfig) {
+  const value = __SECHAT_FIREBASE_CONFIG__[key]
+  return typeof value === "string" ? value.trim() : ""
 }
 
 export function firebaseRemoteEnabled() {
-  return import.meta.env.VITE_FIREBASE_ENABLED === "true"
+  return __SECHAT_FIREBASE_CONFIG__.enabled === true
 }
 
 export function firebaseConfigReady() {
-  return requiredEnv.every((key) => Boolean(envValue(key)))
+  return Boolean(
+    configValue("apiKey") &&
+      configValue("authDomain") &&
+      configValue("projectId") &&
+      configValue("appId")
+  )
 }
 
 export function getFirebaseRoomId() {
-  return import.meta.env.VITE_FIREBASE_ROOM_ID?.trim() || "main"
+  return configValue("roomId") || "main"
 }
 
 export function getFirebaseDatabaseId() {
-  return import.meta.env.VITE_FIREBASE_DATABASE_ID?.trim()
+  return configValue("databaseId")
 }
 
 export function getFirebaseServices() {
@@ -55,12 +54,11 @@ export function getFirebaseServices() {
   const app =
     getApps()[0] ??
     initializeApp({
-      apiKey: envValue("VITE_FIREBASE_API_KEY"),
-      authDomain: envValue("VITE_FIREBASE_AUTH_DOMAIN"),
-      projectId: envValue("VITE_FIREBASE_PROJECT_ID"),
-      storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET?.trim(),
-      messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID?.trim(),
-      appId: envValue("VITE_FIREBASE_APP_ID"),
+      apiKey: configValue("apiKey"),
+      authDomain: configValue("authDomain"),
+      projectId: configValue("projectId"),
+      messagingSenderId: configValue("messagingSenderId"),
+      appId: configValue("appId"),
     })
 
   const auth = getAuth(app)
@@ -74,11 +72,11 @@ export function getFirebaseServices() {
 }
 
 function connectEmulators(current: FirebaseServices) {
-  if (emulatorsConnected || import.meta.env.VITE_FIREBASE_USE_EMULATORS !== "true") {
+  if (emulatorsConnected || __SECHAT_FIREBASE_CONFIG__.useEmulators !== true) {
     return
   }
 
-  const host = import.meta.env.VITE_FIREBASE_EMULATOR_HOST?.trim() || "127.0.0.1"
+  const host = configValue("emulatorHost") || "127.0.0.1"
   connectAuthEmulator(current.auth, `http://${host}:9099`, { disableWarnings: true })
   connectFirestoreEmulator(current.db, host, 8080)
   emulatorsConnected = true

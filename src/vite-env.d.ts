@@ -1,19 +1,24 @@
 /// <reference types="vite/client" />
 
 interface ImportMetaEnv {
-  readonly VITE_FIREBASE_ENABLED?: string
-  readonly VITE_FIREBASE_API_KEY?: string
-  readonly VITE_FIREBASE_AUTH_DOMAIN?: string
-  readonly VITE_FIREBASE_PROJECT_ID?: string
-  readonly VITE_FIREBASE_STORAGE_BUCKET?: string
-  readonly VITE_FIREBASE_MESSAGING_SENDER_ID?: string
-  readonly VITE_FIREBASE_APP_ID?: string
-  readonly VITE_FIREBASE_DATABASE_ID?: string
-  readonly VITE_FIREBASE_ROOM_ID?: string
-  readonly VITE_FIREBASE_USE_EMULATORS?: string
-  readonly VITE_FIREBASE_EMULATOR_HOST?: string
+  readonly VITE_WEB_PASSWORD?: string
 }
 
 interface ImportMeta {
   readonly env: ImportMetaEnv
 }
+
+type SechatFirebaseConfig = {
+  readonly enabled: boolean
+  readonly apiKey: string
+  readonly authDomain: string
+  readonly projectId: string
+  readonly messagingSenderId: string
+  readonly appId: string
+  readonly databaseId: string
+  readonly roomId: string
+  readonly useEmulators: boolean
+  readonly emulatorHost: string
+}
+
+declare const __SECHAT_FIREBASE_CONFIG__: SechatFirebaseConfig

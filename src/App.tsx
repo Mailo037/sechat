@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type FormEvent as ReactFormEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react"
@@ -17,18 +18,26 @@ import {
   BellRinging,
   BellSlash,
   Camera,
+  CaretUp,
+  Check,
   CopySimple,
+  Clock,
+  Prohibit,
   DownloadSimple,
   File as FileIcon,
   DotsThreeVertical,
   GlobeSimple,
   LockKey,
   Microphone,
+  MicrophoneSlash,
   Pause,
   Paperclip,
   PencilSimple,
+  PhoneCall,
+  PhoneDisconnect,
   Play,
   ShieldCheck,
+  Smiley,
   SpeakerHigh,
   SpeakerSlash,
   Stop,
@@ -45,7 +54,7 @@ import { Label } from "@/components/ui/label"
 import { Modal } from "@/components/ui/modal"
 import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
-import { Tooltip } from "@/components/ui/tooltip"
+import { Tooltip, TooltipLayer } from "@/components/ui/tooltip"
 import {
   getNotificationPermission,
   playNotificationSound,
@@ -55,23 +64,32 @@ import {
   unlockAudio,
 } from "@/lib/notificationAudio"
 import {
+  clearRemoteUserModeration,
+  deleteRemoteMessage,
   listenToRemoteMessages,
+  listenToRemoteModeration,
   prepareRemoteChat,
   remoteChatAvailable,
   sendRemoteMessage,
+  sendRemoteReaction,
+  setRemoteUserModeration,
 } from "@/lib/firebase/chatRepository"
 import { loadChatState, saveChatState } from "@/lib/storage"
 import { cn } from "@/lib/utils"
 import type {
   ChatMessage,
   MessageAttachment,
+  MessageReaction,
   MessageType,
+  ModerationUser,
   NotificationSettings,
   PersistedChatState,
   Profile,
   SoundKind,
+  SpamModerationLogEntry,
   SpamGuardState,
   UiSoundKind,
+  UserModerationState,
 } from "@/types"
 
 type Panel = "profile" | "notifications" | "trusted" | null
@@ -106,12 +124,73 @@ type SpamCandidate = {
   body: string
   messageType: MessageType
 }
+type PendingMessageInput = {
+  attachments?: MessageAttachment[]
+  audioDurationMs?: number
+  audioMimeType?: string
+  audioUrl?: string
+  body: string
+  messageType?: MessageType
+  replyToId?: string
+  waveform?: number[]
+}
+type VoiceParticipant = {
+  avatar?: string
+  id: string
+  isSelf: boolean
+  name: string
+}
 
 const AUDIO_BAR_COUNT = 44
 const MESSAGE_AUDIO_BAR_COUNT = 28
 const MAX_RECORDING_MS = 120000
 const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
 const MAX_ATTACHMENT_COUNT = 6
+const ACCEPTED_ATTACHMENT_TYPES = [
+  "image/avif",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "audio/aac",
+  "audio/mp4",
+  "audio/mpeg",
+  "audio/ogg",
+  "audio/wav",
+  "audio/webm",
+  "application/pdf",
+  "text/plain",
+  "text/markdown",
+  "application/zip",
+  "application/x-zip-compressed",
+]
+const ACCEPTED_ATTACHMENT_EXTENSIONS = [".gif", ".md", ".txt", ".zip"]
+const ATTACHMENT_ACCEPT = [
+  "image/avif",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "audio/*",
+  "application/pdf",
+  "text/plain",
+  "text/markdown",
+  ".gif",
+  ".md",
+  ".txt",
+  ".zip",
+].join(",")
+const REACTION_OPTIONS = ["👍", "❤️", "😂", "😮", "😢", "🔥"]
+const FLUENT_ANIMATED_EMOJI_BASE =
+  "https://raw.githubusercontent.com/microsoft/fluentui-emoji-animated/main/assets"
+const REACTION_ANIMATED_EMOJIS: Record<string, string> = {
+  "👍": `${FLUENT_ANIMATED_EMOJI_BASE}/Thumbs%20up/Default/animated/thumbs_up_animated_default.png`,
+  "❤️": `${FLUENT_ANIMATED_EMOJI_BASE}/Red%20heart/animated/red_heart_animated.png`,
+  "😂": `${FLUENT_ANIMATED_EMOJI_BASE}/Face%20with%20tears%20of%20joy/animated/face_with_tears_of_joy_animated.png`,
+  "😮": `${FLUENT_ANIMATED_EMOJI_BASE}/Face%20with%20open%20mouth/animated/face_with_open_mouth_animated.png`,
+  "😢": `${FLUENT_ANIMATED_EMOJI_BASE}/Crying%20face/animated/crying_face_animated.png`,
+  "🔥": `${FLUENT_ANIMATED_EMOJI_BASE}/Fire/animated/fire_animated.png`,
+}
 const SPAM_FAST_SEND_MS = 950
 const SPAM_BURST_WINDOW_MS = 9000
 const SPAM_BURST_LIMIT = 5
@@ -119,6 +198,10 @@ const SPAM_DUPLICATE_WINDOW_MS = 30000
 const SPAM_STRIKE_RESET_MS = 120000
 const SPAM_BAN_TRIGGER_COUNT = 3
 const SPAM_BAN_MS = 5 * 60 * 1000
+const ADMIN_TIMEOUT_MS = 15 * 60 * 1000
+const ADMIN_BAN_MS = 100 * 365 * 24 * 60 * 60 * 1000
+const ADMIN_SESSION_KEY = "sechat-admin-unlocked"
+const SPAM_GUARD_CACHE_KEY = "sechat-spam-guard"
 
 const defaultProfile: Profile = {
   name: "You",
@@ -147,7 +230,57 @@ const defaultNotifications: NotificationSettings = {
 }
 
 const defaultSpamGuard: SpamGuardState = {
+  log: [],
   strikes: 0,
+}
+
+function readCachedSpamGuard() {
+  if (typeof window === "undefined") return defaultSpamGuard
+
+  try {
+    const raw = window.localStorage.getItem(SPAM_GUARD_CACHE_KEY)
+    if (!raw) return defaultSpamGuard
+    return normalizeSpamGuard(JSON.parse(raw))
+  } catch {
+    return defaultSpamGuard
+  }
+}
+
+function writeCachedSpamGuard(spamGuard: SpamGuardState) {
+  if (typeof window === "undefined") return
+
+  try {
+    const normalized = normalizeSpamGuard(spamGuard)
+    if (!normalized.bannedUntil && normalized.strikes === 0) {
+      window.localStorage.removeItem(SPAM_GUARD_CACHE_KEY)
+      return
+    }
+
+    window.localStorage.setItem(SPAM_GUARD_CACHE_KEY, JSON.stringify(normalized))
+  } catch {
+    // Local persistence is defensive; IndexedDB remains the primary store.
+  }
+}
+
+function mergeSpamGuardStates(
+  primary: SpamGuardState,
+  secondary: SpamGuardState
+) {
+  const now = Date.now()
+  const primaryBan = primary.bannedUntil && primary.bannedUntil > now
+    ? primary.bannedUntil
+    : 0
+  const secondaryBan = secondary.bannedUntil && secondary.bannedUntil > now
+    ? secondary.bannedUntil
+    : 0
+
+  if (primaryBan || secondaryBan) {
+    return primaryBan >= secondaryBan ? primary : secondary
+  }
+
+  const primaryTriggeredAt = primary.lastTriggeredAt ?? 0
+  const secondaryTriggeredAt = secondary.lastTriggeredAt ?? 0
+  return primaryTriggeredAt >= secondaryTriggeredAt ? primary : secondary
 }
 
 const CURRENT_DATA_VERSION = 2
@@ -275,6 +408,17 @@ function normalizeSpamGuard(value: unknown): SpamGuardState {
     typeof input.lastTriggeredAt === "number" ? input.lastTriggeredAt : undefined
 
   return {
+    banReason:
+      typeof input.banReason === "string" && input.banReason.trim()
+        ? input.banReason
+        : undefined,
+    banSource:
+      input.banSource === "admin" || input.banSource === "spam"
+        ? input.banSource
+        : bannedUntil
+          ? "spam"
+          : undefined,
+    log: normalizeModerationLog(input.log),
     strikes:
       lastTriggeredAt && now - lastTriggeredAt <= SPAM_STRIKE_RESET_MS
         ? Math.max(0, Math.min(SPAM_BAN_TRIGGER_COUNT, input.strikes ?? 0))
@@ -282,6 +426,28 @@ function normalizeSpamGuard(value: unknown): SpamGuardState {
     lastTriggeredAt,
     bannedUntil,
   }
+}
+
+function normalizeModerationLog(value: unknown): SpamModerationLogEntry[] {
+  if (!Array.isArray(value)) return []
+
+  return value
+    .filter((item): item is SpamModerationLogEntry => {
+      if (!item || typeof item !== "object") return false
+      const entry = item as Partial<SpamModerationLogEntry>
+      return (
+        typeof entry.id === "string" &&
+        (entry.action === "warn" ||
+          entry.action === "ban" ||
+          entry.action === "timeout" ||
+          entry.action === "delete" ||
+          entry.action === "clear") &&
+        typeof entry.at === "number" &&
+        typeof entry.reason === "string" &&
+        typeof entry.strikes === "number"
+      )
+    })
+    .slice(0, 20)
 }
 
 function spamFingerprint(candidate: SpamCandidate) {
@@ -299,9 +465,115 @@ function spamFingerprint(candidate: SpamCandidate) {
 
 function formatRemainingTime(milliseconds: number) {
   const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1000))
+  if (totalSeconds > 365 * 24 * 60 * 60) return "after an admin unban"
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = totalSeconds % 60
   return `${minutes}:${seconds.toString().padStart(2, "0")}`
+}
+
+function moderationActionLabel(action: SpamModerationLogEntry["action"]) {
+  switch (action) {
+    case "ban":
+      return "Ban"
+    case "clear":
+      return "Restriction cleared"
+    case "delete":
+      return "Message deleted"
+    case "timeout":
+      return "Timeout"
+    case "warn":
+    default:
+      return "Warning"
+  }
+}
+
+function isAcceptedAttachmentFile(file: File) {
+  const mimeType = file.type.toLowerCase()
+  if (ACCEPTED_ATTACHMENT_TYPES.includes(mimeType)) return true
+  if (mimeType.startsWith("audio/")) return true
+
+  const fileName = file.name.toLowerCase()
+  return ACCEPTED_ATTACHMENT_EXTENSIONS.some((extension) =>
+    fileName.endsWith(extension)
+  )
+}
+
+function hasReaction(
+  reactions: MessageReaction[] | undefined,
+  emoji: string,
+  authorId: string
+) {
+  return Boolean(
+    reactions?.some(
+      (reaction) => reaction.emoji === emoji && reaction.authorId === authorId
+    )
+  )
+}
+
+function toggleReactionList(
+  reactions: MessageReaction[] | undefined,
+  emoji: string,
+  authorId: string,
+  authorName: string,
+  active: boolean
+) {
+  const current = reactions ?? []
+  const withoutReaction = current.filter(
+    (reaction) => !(reaction.emoji === emoji && reaction.authorId === authorId)
+  )
+
+  if (!active) return withoutReaction
+
+  return [
+    ...withoutReaction,
+    {
+      authorId,
+      authorName,
+      emoji,
+    },
+  ]
+}
+
+function updateMessageReaction(
+  messages: ChatMessage[],
+  messageId: string,
+  emoji: string,
+  authorId: string,
+  authorName: string,
+  active: boolean
+) {
+  return messages.map((message) =>
+    message.id === messageId
+      ? {
+          ...message,
+          reactions: toggleReactionList(
+            message.reactions,
+            emoji,
+            authorId,
+            authorName,
+            active
+          ),
+        }
+      : message
+  )
+}
+
+function summarizeReactions(reactions: MessageReaction[] | undefined) {
+  const summary = new Map<string, { count: number; reactions: MessageReaction[] }>()
+  reactions?.forEach((reaction) => {
+    const current = summary.get(reaction.emoji) ?? {
+      count: 0,
+      reactions: [],
+    }
+    current.count += 1
+    current.reactions.push(reaction)
+    summary.set(reaction.emoji, current)
+  })
+
+  return Array.from(summary.entries()).map(([emoji, value]) => ({
+    emoji,
+    ...value,
+  }))
 }
 
 function getMessageSoundKind(
@@ -350,6 +622,35 @@ function initials(name: string) {
     .join("")
 }
 
+function configuredAdminPassword() {
+  return (import.meta.env.VITE_WEB_PASSWORD ?? "").trim()
+}
+
+function readAdminUnlocked() {
+  if (typeof window === "undefined") return false
+
+  try {
+    return window.sessionStorage.getItem(ADMIN_SESSION_KEY) === "true"
+  } catch {
+    return false
+  }
+}
+
+function writeAdminUnlocked(unlocked: boolean) {
+  if (typeof window === "undefined") return
+
+  try {
+    if (unlocked) {
+      window.sessionStorage.setItem(ADMIN_SESSION_KEY, "true")
+      return
+    }
+
+    window.sessionStorage.removeItem(ADMIN_SESSION_KEY)
+  } catch {
+    // Session storage is only a convenience cache for the local admin gate.
+  }
+}
+
 function makeId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
@@ -363,6 +664,10 @@ function makeQuietWaveform(count = AUDIO_BAR_COUNT) {
 
 function clampLevel(value: number) {
   return Math.max(0.04, Math.min(1, value))
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value))
 }
 
 function compactWaveform(values: number[], targetCount = AUDIO_BAR_COUNT) {
@@ -470,11 +775,12 @@ function App() {
   const [profile, setProfile] = useState<Profile>(defaultProfile)
   const [notifications, setNotifications] =
     useState<NotificationSettings>(defaultNotifications)
-  const [spamGuard, setSpamGuard] = useState<SpamGuardState>(defaultSpamGuard)
+  const [spamGuard, setSpamGuard] = useState<SpamGuardState>(readCachedSpamGuard)
   const [spamWarning, setSpamWarning] = useState<string | null>(null)
   const [spamNow, setSpamNow] = useState(Date.now())
   const [trustedSites, setTrustedSites] = useState<string[]>([])
   const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [pendingMessages, setPendingMessages] = useState<ChatMessage[]>([])
   const [authorId, setAuthorId] = useState("me")
   const [draft, setDraft] = useState("")
   const [attachmentDrafts, setAttachmentDrafts] = useState<MessageAttachment[]>([])
@@ -488,9 +794,17 @@ function App() {
   const [recordingElapsedMs, setRecordingElapsedMs] = useState(0)
   const [replyToId, setReplyToId] = useState<string | undefined>()
   const [panel, setPanel] = useState<Panel>(null)
+  const [adminUnlocked, setAdminUnlocked] = useState(readAdminUnlocked)
+  const [adminStatus, setAdminStatus] = useState<string | null>(null)
+  const [activeModeration, setActiveModeration] =
+    useState<UserModerationState | null>(null)
+  const [remoteModerationReady, setRemoteModerationReady] = useState(false)
   const [pendingLink, setPendingLink] = useState<LinkDialogState | null>(null)
   const [permission, setPermission] = useState(getNotificationPermission())
   const [unread, setUnread] = useState(0)
+  const [voiceChatOpen, setVoiceChatOpen] = useState(false)
+  const [voiceChatWidth, setVoiceChatWidth] = useState(420)
+  const [voiceStageHeight, setVoiceStageHeight] = useState(340)
   const analyserRef = useRef<AnalyserNode | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
   const audioDraftRef = useRef<AudioDraft | null>(null)
@@ -522,7 +836,58 @@ function App() {
     [messages, replyToId]
   )
 
-  const messageGroups = useMemo(() => groupMessages(messages), [messages])
+  const displayedMessages = useMemo(
+    () => [...messages, ...pendingMessages],
+    [messages, pendingMessages]
+  )
+  const messageGroups = useMemo(
+    () => groupMessages(displayedMessages),
+    [displayedMessages]
+  )
+  const voiceParticipants = useMemo(() => {
+    const participants = new Map<string, VoiceParticipant>()
+    participants.set(authorId, {
+      avatar: profile.avatar,
+      id: authorId,
+      isSelf: true,
+      name: profile.name,
+    })
+
+    for (const message of displayedMessages) {
+      const isSelf = message.authorId === authorId
+      const existing = participants.get(message.authorId)
+      const nextName = isSelf ? profile.name : message.authorName
+      const nextAvatar = isSelf ? profile.avatar : message.avatar
+
+      participants.set(message.authorId, {
+        avatar: nextAvatar || existing?.avatar || "",
+        id: message.authorId,
+        isSelf,
+        name: nextName || existing?.name || "Unknown",
+      })
+    }
+
+    return Array.from(participants.values()).slice(0, 12)
+  }, [authorId, displayedMessages, profile.avatar, profile.name])
+
+  const moderationUsers = useMemo<ModerationUser[]>(() => {
+    const users = new Map<string, ModerationUser>()
+
+    for (const message of messages) {
+      const isSelf = message.authorId === authorId
+      const current = users.get(message.authorId)
+      users.set(message.authorId, {
+        avatar: isSelf ? profile.avatar : message.avatar || current?.avatar || "",
+        id: message.authorId,
+        isSelf,
+        lastSeenAt: Math.max(current?.lastSeenAt ?? 0, message.createdAt),
+        messageCount: (current?.messageCount ?? 0) + 1,
+        name: isSelf ? profile.name : message.authorName || current?.name || "User",
+      })
+    }
+
+    return Array.from(users.values()).sort((a, b) => b.lastSeenAt - a.lastSeenAt)
+  }, [authorId, messages, profile.avatar, profile.name])
 
   const stateForStorage = useMemo<PersistedChatState>(
     () => ({
@@ -542,9 +907,12 @@ function App() {
     loadChatState().then((stored) => {
       if (!isMounted) return
       const next = normalizeStoredState(stored)
+      const cachedSpamGuard = readCachedSpamGuard()
+      const nextSpamGuard = mergeSpamGuardStates(next.spamGuard, cachedSpamGuard)
       setProfile(next.profile)
       setNotifications(next.notifications)
-      setSpamGuard(next.spamGuard)
+      setSpamGuard(nextSpamGuard)
+      writeCachedSpamGuard(nextSpamGuard)
       setTrustedSites(next.trustedSites)
       setMessages(next.messages)
       setReady(true)
@@ -561,6 +929,10 @@ function App() {
   }, [ready, stateForStorage])
 
   useEffect(() => {
+    writeCachedSpamGuard(spamGuard)
+  }, [spamGuard])
+
+  useEffect(() => {
     const bannedUntil = spamGuard.bannedUntil
     if (!bannedUntil) return
 
@@ -573,6 +945,7 @@ function App() {
         setSpamGuard((current) =>
           current.bannedUntil && current.bannedUntil <= now
             ? {
+                log: current.log ?? [],
                 strikes: 0,
                 lastTriggeredAt: current.lastTriggeredAt,
               }
@@ -587,7 +960,8 @@ function App() {
   useEffect(() => {
     if (!remoteEnabled) return
 
-    let unsubscribe: (() => void) | null = null
+    let unsubscribeMessages: (() => void) | null = null
+    let unsubscribeModeration: (() => void) | null = null
     let cancelled = false
 
     prepareRemoteChat()
@@ -595,12 +969,22 @@ function App() {
         if (cancelled || !remoteAuthorId) return
         setAuthorId(remoteAuthorId)
 
-        unsubscribe = listenToRemoteMessages(
+        unsubscribeMessages = listenToRemoteMessages(
           (nextMessages) => {
             setMessages(nextMessages)
           },
           (error) => {
             console.warn("Remote chat listener failed", error)
+          }
+        )
+        unsubscribeModeration = listenToRemoteModeration(
+          remoteAuthorId,
+          (moderation) => {
+            setRemoteModerationReady(true)
+            setActiveModeration(moderation)
+          },
+          (error) => {
+            console.warn("Remote moderation listener failed", error)
           }
         )
       })
@@ -610,9 +994,58 @@ function App() {
 
     return () => {
       cancelled = true
-      unsubscribe?.()
+      unsubscribeMessages?.()
+      unsubscribeModeration?.()
     }
   }, [remoteEnabled])
+
+  useEffect(() => {
+    if (!remoteEnabled) {
+      setRemoteModerationReady(true)
+    }
+  }, [remoteEnabled])
+
+  useEffect(() => {
+    const now = Date.now()
+
+    if (!activeModeration || activeModeration.bannedUntil <= now) {
+      if (!remoteModerationReady) return
+      setSpamGuard((current) =>
+        current.banSource === "admin"
+          ? {
+              log: current.log ?? [],
+              strikes: 0,
+              lastTriggeredAt: current.lastTriggeredAt,
+            }
+          : current
+      )
+      return
+    }
+
+    const entry: SpamModerationLogEntry = {
+      id: `admin-${activeModeration.authorId}-${activeModeration.at}`,
+      action: activeModeration.action,
+      at: activeModeration.at,
+      bannedUntil: activeModeration.bannedUntil,
+      reason: activeModeration.reason,
+      strikes: SPAM_BAN_TRIGGER_COUNT,
+      targetAuthorId: activeModeration.authorId,
+      targetAuthorName: activeModeration.authorName,
+    }
+
+    setSpamGuard((current) => ({
+      banReason: activeModeration.reason,
+      banSource: "admin",
+      bannedUntil: activeModeration.bannedUntil,
+      lastTriggeredAt: activeModeration.at,
+      log: [
+        entry,
+        ...(current.log ?? []).filter((item) => item.id !== entry.id),
+      ].slice(0, 20),
+      strikes: SPAM_BAN_TRIGGER_COUNT,
+    }))
+    setSpamNow(now)
+  }, [activeModeration, remoteModerationReady])
 
   useEffect(() => {
     if (!ready || cleanupRan.current) return
@@ -630,7 +1063,7 @@ function App() {
       top: scrollRef.current.scrollHeight,
       behavior: reduceMotion ? "auto" : "smooth",
     })
-  }, [messages.length, reduceMotion])
+  }, [displayedMessages.length, reduceMotion])
 
   useEffect(() => {
     if (!ready) return
@@ -824,12 +1257,23 @@ function App() {
     )
     const bannedUntil =
       nextStrikes >= SPAM_BAN_TRIGGER_COUNT ? now + SPAM_BAN_MS : undefined
+    const nextLogEntry: SpamModerationLogEntry = {
+      id: makeId("moderation"),
+      action: bannedUntil ? "ban" : "warn",
+      at: now,
+      bannedUntil,
+      reason,
+      strikes: nextStrikes,
+    }
 
-    setSpamGuard({
+    setSpamGuard((current) => ({
+      banReason: bannedUntil ? reason : undefined,
+      banSource: bannedUntil ? "spam" : undefined,
       strikes: nextStrikes,
       lastTriggeredAt: now,
       bannedUntil,
-    })
+      log: [nextLogEntry, ...(current.log ?? [])].slice(0, 20),
+    }))
     setSpamNow(now)
 
     if (bannedUntil) {
@@ -912,6 +1356,10 @@ function App() {
   function allowOutgoingMessage(candidate: SpamCandidate) {
     const now = Date.now()
 
+    if (!ready) {
+      return false
+    }
+
     if (spamGuard.bannedUntil && spamGuard.bannedUntil > now) {
       setSpamNow(now)
       return false
@@ -926,6 +1374,220 @@ function App() {
     recordAllowedSend(candidate)
     setSpamWarning(null)
     return true
+  }
+
+  function createPendingMessage(input: PendingMessageInput): ChatMessage {
+    return {
+      id: makeId("pending"),
+      authorId,
+      authorName: profile.name,
+      avatar: profile.avatar,
+      body: input.body,
+      createdAt: Date.now(),
+      attachments: input.attachments,
+      audioDurationMs: input.audioDurationMs,
+      audioMimeType: input.audioMimeType,
+      audioUrl: input.audioUrl,
+      messageType: input.messageType,
+      replyToId: input.replyToId,
+      sendStatus: "sending",
+      uploadProgress: 0,
+      waveform: input.waveform,
+    }
+  }
+
+  function updatePendingProgress(id: string, progress: number) {
+    setPendingMessages((current) =>
+      current.map((message) =>
+        message.id === id
+          ? { ...message, uploadProgress: Math.max(0, Math.min(1, progress)) }
+          : message
+      )
+    )
+  }
+
+  function removePendingMessage(id: string) {
+    setPendingMessages((current) =>
+      current.filter((message) => message.id !== id)
+    )
+  }
+
+  function pushModerationLog(entry: SpamModerationLogEntry) {
+    setSpamGuard((current) => ({
+      ...current,
+      log: [entry, ...(current.log ?? [])].slice(0, 20),
+    }))
+  }
+
+  async function deleteMessageAsAdmin(message: ChatMessage) {
+    if (!adminUnlocked || message.sendStatus === "sending") return
+
+    setMessages((current) => current.filter((item) => item.id !== message.id))
+    setPendingMessages((current) => current.filter((item) => item.id !== message.id))
+    setReplyToId((current) => (current === message.id ? undefined : current))
+    pushModerationLog({
+      id: makeId("moderation"),
+      action: "delete",
+      at: Date.now(),
+      reason: `Deleted a message from ${message.authorName || "User"}`,
+      strikes: 0,
+      targetAuthorId: message.authorId,
+      targetAuthorName: message.authorName,
+    })
+    setAdminStatus("Message deleted.")
+    playConfirmationSound("done")
+
+    if (!remoteEnabled || message.id.startsWith("me") || message.id.startsWith("audio")) {
+      return
+    }
+
+    try {
+      await deleteRemoteMessage(message.id)
+    } catch (error) {
+      console.warn("Remote delete failed", error)
+      setAdminStatus("Deleted locally. Remote delete failed.")
+    }
+  }
+
+  async function moderateUser(
+    user: ModerationUser,
+    action: UserModerationState["action"]
+  ) {
+    if (!adminUnlocked) return
+
+    const now = Date.now()
+    const bannedUntil = now + (action === "ban" ? ADMIN_BAN_MS : ADMIN_TIMEOUT_MS)
+    const reason =
+      action === "ban"
+        ? "Banned by an admin"
+        : `Timed out for ${formatRemainingTime(ADMIN_TIMEOUT_MS)}`
+    const logEntry: SpamModerationLogEntry = {
+      id: makeId("moderation"),
+      action,
+      at: now,
+      bannedUntil,
+      reason: `${reason}: ${user.name}`,
+      strikes: SPAM_BAN_TRIGGER_COUNT,
+      targetAuthorId: user.id,
+      targetAuthorName: user.name,
+    }
+
+    pushModerationLog(logEntry)
+    setAdminStatus(action === "ban" ? `${user.name} banned.` : `${user.name} timed out.`)
+    playConfirmationSound("done")
+
+    if (user.id === authorId) {
+      setActiveModeration({
+        action,
+        at: now,
+        authorId,
+        authorName: profile.name,
+        bannedUntil,
+        moderatorName: profile.name,
+        reason,
+      })
+    }
+
+    if (!remoteEnabled) {
+      setAdminStatus("Remote chat is off. Action was logged locally.")
+      return
+    }
+
+    try {
+      await setRemoteUserModeration({
+        action,
+        authorId: user.id,
+        authorName: user.name,
+        bannedUntil,
+        moderatorName: profile.name,
+        reason,
+      })
+    } catch (error) {
+      console.warn("Remote moderation failed", error)
+      setAdminStatus("Moderation was logged locally. Remote update failed.")
+    }
+  }
+
+  async function clearUserModeration(user: ModerationUser) {
+    if (!adminUnlocked) return
+
+    pushModerationLog({
+      id: makeId("moderation"),
+      action: "clear",
+      at: Date.now(),
+      reason: `Cleared restrictions for ${user.name}`,
+      strikes: 0,
+      targetAuthorId: user.id,
+      targetAuthorName: user.name,
+    })
+    setAdminStatus(`${user.name} can send again.`)
+    playConfirmationSound("soft")
+
+    if (user.id === authorId) {
+      setActiveModeration(null)
+      setSpamGuard((current) =>
+        current.banSource === "admin"
+          ? {
+              log: current.log ?? [],
+              strikes: 0,
+              lastTriggeredAt: current.lastTriggeredAt,
+            }
+          : current
+      )
+    }
+
+    if (!remoteEnabled) return
+
+    try {
+      await clearRemoteUserModeration(user.id)
+    } catch (error) {
+      console.warn("Remote moderation clear failed", error)
+      setAdminStatus("Local clear logged. Remote clear failed.")
+    }
+  }
+
+  async function toggleReaction(messageId: string, emoji: string) {
+    if (messageId.startsWith("pending")) return
+
+    const message = messages.find((item) => item.id === messageId)
+    if (!message) return
+
+    const nextActive = !hasReaction(message.reactions, emoji, authorId)
+    setMessages((current) =>
+      updateMessageReaction(
+        current,
+        messageId,
+        emoji,
+        authorId,
+        profile.name,
+        nextActive
+      )
+    )
+    playConfirmationSound("pop")
+
+    if (!remoteEnabled) return
+
+    try {
+      const remoteAuthorId = await sendRemoteReaction({
+        active: nextActive,
+        authorName: profile.name,
+        emoji,
+        messageId,
+      })
+      setAuthorId(remoteAuthorId)
+    } catch (error) {
+      console.warn("Remote reaction failed", error)
+      setMessages((current) =>
+        updateMessageReaction(
+          current,
+          messageId,
+          emoji,
+          authorId,
+          profile.name,
+          !nextActive
+        )
+      )
+    }
   }
 
   async function sendMessage() {
@@ -964,18 +1626,31 @@ function App() {
     setReplyToId(undefined)
 
     if (remoteEnabled) {
+      const pendingMessage = createPendingMessage({
+        attachments,
+        body,
+        messageType: "text",
+        replyToId,
+      })
+      setPendingMessages((current) => [...current, pendingMessage])
+
       try {
         const remoteAuthorId = await sendRemoteMessage({
           authorName: profile.name,
           avatar: profile.avatar,
           body,
           attachments,
+          onUploadProgress: (progress) =>
+            updatePendingProgress(pendingMessage.id, progress),
           replyToId,
         })
         setAuthorId(remoteAuthorId)
+        updatePendingProgress(pendingMessage.id, 1)
+        window.setTimeout(() => removePendingMessage(pendingMessage.id), 280)
         return
       } catch (error) {
         console.warn("Remote send failed; keeping message local", error)
+        removePendingMessage(pendingMessage.id)
       }
     }
 
@@ -1025,12 +1700,25 @@ function App() {
     setReplyToId(undefined)
 
     if (remoteEnabled) {
+      const pendingMessage = createPendingMessage({
+        audioDurationMs: draftAudio.durationMs,
+        audioMimeType: draftAudio.mimeType,
+        audioUrl: draftAudio.dataUrl,
+        body: sent.body,
+        messageType: "audio",
+        replyToId,
+        waveform: draftAudio.waveform,
+      })
+      setPendingMessages((current) => [...current, pendingMessage])
+
       try {
         const remoteAuthorId = await sendRemoteMessage({
           authorName: profile.name,
           avatar: profile.avatar,
           body: sent.body,
           messageType: "audio",
+          onUploadProgress: (progress) =>
+            updatePendingProgress(pendingMessage.id, progress),
           replyToId,
           audioUrl: draftAudio.dataUrl,
           audioMimeType: draftAudio.mimeType,
@@ -1038,9 +1726,12 @@ function App() {
           waveform: draftAudio.waveform,
         })
         setAuthorId(remoteAuthorId)
+        updatePendingProgress(pendingMessage.id, 1)
+        window.setTimeout(() => removePendingMessage(pendingMessage.id), 280)
         return true
       } catch (error) {
         console.warn("Remote audio send failed; keeping message local", error)
+        removePendingMessage(pendingMessage.id)
       }
     }
 
@@ -1049,6 +1740,8 @@ function App() {
   }
 
   async function startRecording() {
+    if (!ready) return
+
     if (spamGuard.bannedUntil && spamGuard.bannedUntil > Date.now()) {
       setSpamNow(Date.now())
       return
@@ -1352,6 +2045,8 @@ function App() {
   }
 
   async function handleAttachmentFiles(fileList: FileList | null) {
+    if (!ready) return
+
     if (spamGuard.bannedUntil && spamGuard.bannedUntil > Date.now()) {
       setSpamNow(Date.now())
       return
@@ -1367,6 +2062,9 @@ function App() {
     const oversizedFile = acceptedFiles.find(
       (file) => file.size > MAX_ATTACHMENT_BYTES
     )
+    const unsupportedFile = acceptedFiles.find(
+      (file) => !isAcceptedAttachmentFile(file)
+    )
 
     if (remainingSlots <= 0) {
       setAttachmentError(`You can attach up to ${MAX_ATTACHMENT_COUNT} files.`)
@@ -1375,6 +2073,11 @@ function App() {
 
     if (oversizedFile) {
       setAttachmentError(`${oversizedFile.name} is larger than 8 MB.`)
+      return
+    }
+
+    if (unsupportedFile) {
+      setAttachmentError(`${unsupportedFile.name} is not a supported file type.`)
       return
     }
 
@@ -1423,23 +2126,164 @@ function App() {
   const showSendAction = hasDraft || sendFlightId !== null
   const spamBannedUntil = spamGuard.bannedUntil ?? 0
   const isSpamBanned = spamBannedUntil > spamNow
+  const shouldHideComposerBar = !ready || isSpamBanned
   const spamRemainingMs = Math.max(0, spamBannedUntil - spamNow)
   const composerError = recordingError ?? attachmentError ?? spamWarning
+  const chatShellStyle = voiceChatOpen
+    ? ({
+        "--voice-chat-width": `${voiceChatWidth}px`,
+        "--voice-stage-height": `${voiceStageHeight}px`,
+      } as CSSProperties)
+    : undefined
+
+  function toggleVoiceChat() {
+    setPanel(null)
+    setVoiceChatOpen((current) => !current)
+    playConfirmationSound("soft")
+  }
+
+  function closeVoiceChat() {
+    setVoiceChatOpen(false)
+  }
+
+  function startVoiceChatResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!voiceChatOpen) return
+
+    event.preventDefault()
+    const isMobileLayout = window.matchMedia("(max-width: 720px)").matches
+
+    if (isMobileLayout) {
+      const startY = event.clientY
+      const startHeight = voiceStageHeight
+      const viewportHeight = window.innerHeight
+      const minHeight = Math.min(280, Math.max(190, viewportHeight * 0.26))
+      const maxHeight = Math.max(minHeight, viewportHeight - 220)
+
+      const move = (moveEvent: globalThis.PointerEvent) => {
+        const nextHeight = clampNumber(
+          startHeight + moveEvent.clientY - startY,
+          minHeight,
+          maxHeight
+        )
+        setVoiceStageHeight(nextHeight)
+      }
+
+      const stop = () => {
+        document.removeEventListener("pointermove", move)
+        document.removeEventListener("pointerup", stop)
+        document.removeEventListener("pointercancel", stop)
+        document.body.classList.remove("resizing-voice-stage")
+      }
+
+      document.body.classList.add("resizing-voice-stage")
+      document.addEventListener("pointermove", move)
+      document.addEventListener("pointerup", stop)
+      document.addEventListener("pointercancel", stop)
+      return
+    }
+
+    const startX = event.clientX
+    const startWidth = voiceChatWidth
+    const viewportWidth = window.innerWidth
+    const minWidth = Math.min(380, Math.max(320, viewportWidth - 120))
+    const maxWidth = Math.min(640, Math.max(minWidth, viewportWidth - 320))
+
+    const move = (moveEvent: globalThis.PointerEvent) => {
+      const nextWidth = clampNumber(
+        startWidth + startX - moveEvent.clientX,
+        minWidth,
+        maxWidth
+      )
+      setVoiceChatWidth(nextWidth)
+    }
+
+    const stop = () => {
+      document.removeEventListener("pointermove", move)
+      document.removeEventListener("pointerup", stop)
+      document.removeEventListener("pointercancel", stop)
+      document.body.classList.remove("resizing-voice-chat")
+    }
+
+    document.body.classList.add("resizing-voice-chat")
+    document.addEventListener("pointermove", move)
+    document.addEventListener("pointerup", stop)
+    document.addEventListener("pointercancel", stop)
+  }
 
   return (
     <main className="chat-app">
-      <div className="chat-shell">
+      <TooltipLayer />
+      <div
+        className={cn("chat-shell", voiceChatOpen && "voice-active")}
+        style={chatShellStyle}
+      >
+        <AnimatePresence>
+          {voiceChatOpen ? (
+            <VoiceChatStage
+              participants={voiceParticipants}
+              reduceMotion={Boolean(reduceMotion)}
+              onClose={closeVoiceChat}
+            />
+          ) : null}
+        </AnimatePresence>
+
+        {voiceChatOpen ? (
+          <div
+            aria-label="Resize voice chat"
+            className="voice-chat-resizer"
+            role="separator"
+            tabIndex={0}
+            onKeyDown={(event) => {
+              const isMobileLayout = window.matchMedia("(max-width: 720px)").matches
+              const isHeightKey = event.key === "ArrowUp" || event.key === "ArrowDown"
+              const isWidthKey = event.key === "ArrowLeft" || event.key === "ArrowRight"
+
+              if (isMobileLayout) {
+                if (!isHeightKey) return
+                event.preventDefault()
+                setVoiceStageHeight((current) =>
+                  clampNumber(
+                    current + (event.key === "ArrowDown" ? 24 : -24),
+                    Math.min(280, Math.max(190, window.innerHeight * 0.26)),
+                    Math.max(260, window.innerHeight - 220)
+                  )
+                )
+                return
+              }
+
+              if (!isWidthKey) return
+              event.preventDefault()
+              setVoiceChatWidth((current) =>
+                clampNumber(
+                  current + (event.key === "ArrowLeft" ? 24 : -24),
+                  380,
+                  Math.min(640, Math.max(380, window.innerWidth - 320))
+                )
+              )
+            }}
+            onPointerDown={startVoiceChatResize}
+          />
+        ) : null}
+
         <TopLeftDock
           activePanel={panel}
+          adminStatus={adminStatus}
+          adminUnlocked={adminUnlocked}
+          moderationLog={spamGuard.log ?? []}
+          moderationUsers={moderationUsers}
           notificationIcon={notificationIcon}
           notifications={notifications}
           permission={permission}
           profile={profile}
           trustedSites={trustedSites}
           unread={unread}
+          voiceChatOpen={voiceChatOpen}
           onAvatarFile={updateAvatarFromFile}
+          onAdminUnlockedChange={setAdminUnlocked}
           onBrowserToggle={updateBrowserNotifications}
+          onClearUserModeration={clearUserModeration}
           onClose={() => setPanel(null)}
+          onModerateUser={moderateUser}
           onPanelChange={(next) => {
             setPanel((current) => (current === next ? null : next))
             if (next === "notifications") setUnread(0)
@@ -1451,6 +2295,7 @@ function App() {
           onUiSoundKindChange={updateUiSoundKind}
           onUiSoundPreview={previewUiSound}
           onUiSoundToggle={updateUiSoundToggle}
+          onVoiceToggle={toggleVoiceChat}
         />
 
         <section className="chat-window" aria-label="Chat">
@@ -1463,11 +2308,14 @@ function App() {
                     authorId={authorId}
                     group={group}
                     mobileReplyGesture={mobileReplyGesture}
+                    adminUnlocked={adminUnlocked}
                     profile={profile}
                     quoteFor={(message) =>
                       messages.find((item) => item.id === message.replyToId)
                     }
                     onExternalLink={handleExternalLink}
+                    onDeleteMessage={deleteMessageAsAdmin}
+                    onReact={toggleReaction}
                     onReply={setReplyToId}
                   />
                 ))
@@ -1479,16 +2327,23 @@ function App() {
             className={cn("composer", recordingMode !== "idle" && "recording-active")}
             onSubmit={(event) => {
               event.preventDefault()
-              if (recordingMode !== "idle" || isSpamBanned) return
+              if (recordingMode !== "idle" || shouldHideComposerBar) return
               sendMessage()
             }}
           >
-            {isSpamBanned ? (
-              <SpamBanNotice remainingMs={spamRemainingMs} />
+            {!ready ? (
+              <ComposerStatusNotice message="Loading chat state..." />
+            ) : isSpamBanned ? (
+              <SpamBanNotice
+                reason={spamGuard.banReason}
+                remainingMs={spamRemainingMs}
+                source={spamGuard.banSource}
+              />
             ) : (
               <>
                 <input
                   hidden
+                  accept={ATTACHMENT_ACCEPT}
                   multiple
                   ref={fileInputRef}
                   aria-label="Attachment files"
@@ -1541,8 +2396,8 @@ function App() {
                       <Button
                         aria-label="Add attachment"
                         className="composer-plus-button"
+                        data-tooltip="Add attachment"
                         size="icon-lg"
-                        title="Add attachment"
                         type="button"
                         variant="ghost"
                         onClick={() => fileInputRef.current?.click()}
@@ -1580,8 +2435,8 @@ function App() {
                               </div>
                               <Button
                                 aria-label="Cancel reply"
+                                data-tooltip="Cancel reply"
                                 size="icon-sm"
-                                title="Cancel reply"
                                 type="button"
                                 variant="ghost"
                                 onClick={() => setReplyToId(undefined)}
@@ -1614,8 +2469,8 @@ function App() {
                               "composer-pill-action",
                               showSendAction && "send-ready"
                             )}
+                            data-tooltip={showSendAction ? "Send message" : "Record audio message"}
                             size="icon"
-                            title={showSendAction ? "Send message" : "Record audio message"}
                             type={hasDraft ? "submit" : "button"}
                             variant="ghost"
                             onClick={hasDraft || sendFlightId ? undefined : startRecording}
@@ -1671,7 +2526,529 @@ function App() {
   )
 }
 
-function SpamBanNotice({ remainingMs }: { remainingMs: number }) {
+function VoiceChatStage({
+  participants,
+  reduceMotion,
+  onClose,
+}: {
+  participants: VoiceParticipant[]
+  reduceMotion: boolean
+  onClose: () => void
+}) {
+  const [connected, setConnected] = useState(false)
+  const [muted, setMuted] = useState(false)
+  const [voiceError, setVoiceError] = useState<string | null>(null)
+  const [voiceWaveform, setVoiceWaveform] = useState(() => makeQuietWaveform(36))
+  const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([])
+  const [selectedInputId, setSelectedInputId] = useState("")
+  const [voiceLevel, setVoiceLevel] = useState(0)
+  const [deviceMenuOpen, setDeviceMenuOpen] = useState(false)
+  const [micMeterVisible, setMicMeterVisible] = useState(() =>
+    typeof window === "undefined"
+      ? true
+      : !window.matchMedia("(max-width: 720px)").matches
+  )
+  const voiceAnalyserRef = useRef<AnalyserNode | null>(null)
+  const voiceAudioContextRef = useRef<AudioContext | null>(null)
+  const voiceFrameRef = useRef<number | null>(null)
+  const voiceMutedRef = useRef(false)
+  const voiceStreamRef = useRef<MediaStream | null>(null)
+  const isSpeaking = connected && !muted && voiceLevel > 0.18
+  const selectedInputLabel =
+    audioInputs.find((device) => device.deviceId === selectedInputId)?.label ||
+    "Default microphone"
+  const micMeterLabel = connected
+    ? muted
+      ? "Muted"
+      : isSpeaking
+        ? "Input active"
+        : "Input quiet"
+    : "Join to test"
+
+  useEffect(() => {
+    void refreshAudioInputs()
+
+    const mediaDevices = navigator.mediaDevices
+    if (!mediaDevices?.addEventListener) return
+
+    const update = () => {
+      void refreshAudioInputs()
+    }
+
+    mediaDevices.addEventListener("devicechange", update)
+    return () => mediaDevices.removeEventListener("devicechange", update)
+  }, [])
+
+  useEffect(() => {
+    if (window.matchMedia("(max-width: 720px)").matches) {
+      setMicMeterVisible(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    voiceMutedRef.current = muted
+    voiceStreamRef.current
+      ?.getAudioTracks()
+      .forEach((track) => {
+        track.enabled = !muted
+      })
+
+    if (muted) {
+      setVoiceWaveform(makeQuietWaveform(36))
+      setVoiceLevel(0)
+    }
+  }, [muted])
+
+  useEffect(() => {
+    return () => {
+      cleanupVoiceResources(false)
+    }
+  }, [])
+
+  function cleanupVoiceMeter() {
+    if (voiceFrameRef.current !== null) {
+      window.cancelAnimationFrame(voiceFrameRef.current)
+      voiceFrameRef.current = null
+    }
+  }
+
+  function cleanupVoiceResources(resetLevel = true) {
+    cleanupVoiceMeter()
+    voiceStreamRef.current?.getTracks().forEach((track) => track.stop())
+    voiceStreamRef.current = null
+    voiceAnalyserRef.current = null
+    if (resetLevel) setVoiceLevel(0)
+
+    if (
+      voiceAudioContextRef.current &&
+      voiceAudioContextRef.current.state !== "closed"
+    ) {
+      voiceAudioContextRef.current.close().catch(() => undefined)
+    }
+    voiceAudioContextRef.current = null
+  }
+
+  function runVoiceMeter() {
+    const analyser = voiceAnalyserRef.current
+    if (!analyser) return
+
+    const samples = new Uint8Array(analyser.fftSize)
+    let lastUpdate = 0
+
+    const tick = (time: number) => {
+      const currentAnalyser = voiceAnalyserRef.current
+      if (!currentAnalyser) return
+
+      if (time - lastUpdate > 55) {
+        if (voiceMutedRef.current) {
+          setVoiceWaveform(makeQuietWaveform(36))
+        } else {
+          currentAnalyser.getByteTimeDomainData(samples)
+
+          let sum = 0
+          for (const sample of samples) {
+            const centered = (sample - 128) / 128
+            sum += centered * centered
+          }
+
+          const rms = Math.sqrt(sum / samples.length)
+          const level = clampLevel(0.08 + rms * 5.2)
+          setVoiceLevel(level)
+          setVoiceWaveform((current) => [...current.slice(1), level])
+        }
+
+        lastUpdate = time
+      }
+
+      voiceFrameRef.current = window.requestAnimationFrame(tick)
+    }
+
+    voiceFrameRef.current = window.requestAnimationFrame(tick)
+  }
+
+  async function refreshAudioInputs() {
+    if (!navigator.mediaDevices?.enumerateDevices) return
+
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices()
+      const inputs = devices.filter((device) => device.kind === "audioinput")
+      setAudioInputs(inputs)
+      setSelectedInputId((current) => current || inputs[0]?.deviceId || "")
+    } catch {
+      // Device labels may be unavailable until permission is granted.
+    }
+  }
+
+  async function joinVoice(deviceId = selectedInputId) {
+    if (!navigator.mediaDevices?.getUserMedia || typeof AudioContext === "undefined") {
+      setVoiceError("Voice chat is not available in this browser.")
+      return
+    }
+
+    setVoiceError(null)
+
+    try {
+      const audio: MediaTrackConstraints = {
+        autoGainControl: true,
+        echoCancellation: true,
+        noiseSuppression: true,
+      }
+
+      if (deviceId) {
+        audio.deviceId = { exact: deviceId }
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio,
+      })
+      const audioContext = new AudioContext()
+      const analyser = audioContext.createAnalyser()
+      const source = audioContext.createMediaStreamSource(stream)
+
+      analyser.fftSize = 512
+      source.connect(analyser)
+
+      cleanupVoiceResources()
+      voiceStreamRef.current = stream
+      voiceAudioContextRef.current = audioContext
+      voiceAnalyserRef.current = analyser
+      voiceMutedRef.current = false
+      setMuted(false)
+      setConnected(true)
+      setSelectedInputId(stream.getAudioTracks()[0]?.getSettings().deviceId || deviceId)
+      setVoiceWaveform(makeQuietWaveform(36))
+      void refreshAudioInputs()
+      runVoiceMeter()
+    } catch (error) {
+      console.warn("Voice chat failed", error)
+      cleanupVoiceResources()
+      setConnected(false)
+      setVoiceError(
+        isMicrophonePermissionError(error)
+          ? "Microphone permission is needed for voice chat."
+          : "Could not start voice chat."
+      )
+    }
+  }
+
+  function leaveVoice() {
+    cleanupVoiceResources()
+    setConnected(false)
+    setMuted(false)
+    setDeviceMenuOpen(false)
+    setVoiceWaveform(makeQuietWaveform(36))
+  }
+
+  function changeInputDevice(deviceId: string) {
+    setSelectedInputId(deviceId)
+    setDeviceMenuOpen(false)
+    if (connected) {
+      void joinVoice(deviceId)
+    }
+  }
+
+  function toggleDeviceMenu() {
+    setDeviceMenuOpen((current) => !current)
+    void refreshAudioInputs()
+  }
+
+  function closeVoiceStage() {
+    leaveVoice()
+    onClose()
+  }
+
+  return (
+    <motion.section
+      animate={{ opacity: 1 }}
+      aria-label="Voice chat"
+      className="voice-stage"
+      exit={{ opacity: 0 }}
+      initial={reduceMotion ? false : { opacity: 0 }}
+      transition={{ duration: 0.18 }}
+    >
+      <div className="voice-stage-top">
+        <div className="voice-stage-title">
+          <PhoneCall weight="duotone" />
+          <div>
+            <strong>Voice chat</strong>
+            <span>Main Chat</span>
+          </div>
+        </div>
+        <motion.div
+          className={cn("voice-stage-copy", "voice-stage-status", connected && "connected")}
+          layout
+          transition={{ duration: 0.22, ease: [0.2, 0.8, 0.2, 1] }}
+        >
+          <strong>{connected ? "Connected" : "Join voice"}</strong>
+          <span>
+            {connected ? (muted ? "Muted" : isSpeaking ? "Speaking now" : "Listening") : "Not connected"}
+          </span>
+        </motion.div>
+        <Button
+          aria-label="Close voice chat"
+          className="voice-stage-close"
+          data-tooltip="Close voice chat"
+          size="icon-sm"
+          type="button"
+          variant="ghost"
+          onClick={closeVoiceStage}
+        >
+          <X data-icon="inline-start" />
+        </Button>
+      </div>
+
+      <div className={cn("voice-stage-content", connected && "connected")}>
+        {voiceError ? (
+          <p className="voice-stage-error" role="status">
+            {voiceError}
+          </p>
+        ) : null}
+
+        <div className="voice-participant-grid" aria-label="Voice participants">
+          {participants.map((participant) => (
+            <VoiceParticipantCard
+              key={participant.id}
+              participant={participant}
+              speaking={participant.isSelf && isSpeaking}
+            />
+          ))}
+        </div>
+      </div>
+
+      <div className="voice-bottom-dock">
+        <AnimatePresence initial={false} mode="popLayout">
+          {micMeterVisible ? (
+            <motion.div
+              animate={{
+                opacity: 1,
+                y: 0,
+                height: "auto",
+                minHeight: 52,
+                paddingBottom: 8,
+                paddingTop: 8,
+                scale: 1,
+              }}
+              className={cn("voice-mic-test", isSpeaking && "live")}
+              exit={{
+                opacity: 0,
+                y: 8,
+                height: 0,
+                minHeight: 0,
+                paddingBottom: 0,
+                paddingTop: 0,
+                scale: 0.98,
+              }}
+              initial={
+                reduceMotion
+                  ? false
+                  : {
+                      opacity: 0,
+                      y: 8,
+                      height: 0,
+                      minHeight: 0,
+                      paddingBottom: 0,
+                      paddingTop: 0,
+                      scale: 0.98,
+                    }
+              }
+              key="mic-meter"
+              transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
+            >
+              <span className="voice-mic-test-icon">
+                {muted ? <MicrophoneSlash weight="duotone" /> : <Microphone weight="duotone" />}
+              </span>
+              <AudioWaveform
+                bars={voiceWaveform}
+                barCount={36}
+                className="voice-stage-waveform"
+              />
+              <small>{micMeterLabel}</small>
+              <button
+                aria-label="Hide input meter"
+                className="voice-meter-toggle"
+                data-tooltip="Hide input meter"
+                type="button"
+                onClick={() => setMicMeterVisible(false)}
+              >
+                <CaretUp weight="bold" />
+              </button>
+            </motion.div>
+          ) : (
+            <motion.button
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              className="voice-meter-reveal"
+              data-tooltip="Show input meter"
+              exit={{ opacity: 0, y: 6, scale: 0.96 }}
+              initial={reduceMotion ? false : { opacity: 0, y: 6, scale: 0.96 }}
+              key="mic-meter-reveal"
+              transition={{ duration: 0.16, ease: [0.2, 0.8, 0.2, 1] }}
+              type="button"
+              onClick={() => setMicMeterVisible(true)}
+            >
+              {muted ? <MicrophoneSlash weight="duotone" /> : <Microphone weight="duotone" />}
+              <span>{micMeterLabel}</span>
+              <CaretUp className="voice-meter-reveal-caret" weight="bold" />
+            </motion.button>
+          )}
+        </AnimatePresence>
+
+        <div className="voice-stage-controls">
+          <div className="voice-device-control">
+            {connected ? (
+              <Button
+                className={cn("voice-control-button mic", muted && "active")}
+                data-tooltip={muted ? "Unmute" : "Mute"}
+                size="icon-lg"
+                type="button"
+                variant="ghost"
+                onClick={() => setMuted((current) => !current)}
+              >
+                {muted ? (
+                  <MicrophoneSlash data-icon="inline-start" weight="duotone" />
+                ) : (
+                  <Microphone data-icon="inline-start" weight="duotone" />
+                )}
+              </Button>
+            ) : (
+              <Button
+                className="voice-control-button mic"
+                data-tooltip="Microphone"
+                size="icon-lg"
+                type="button"
+                variant="ghost"
+                onClick={toggleDeviceMenu}
+              >
+                <Microphone data-icon="inline-start" weight="duotone" />
+              </Button>
+            )}
+            <button
+              aria-expanded={deviceMenuOpen}
+              aria-label="Choose microphone"
+              className={cn("voice-device-arrow", deviceMenuOpen && "active")}
+              data-tooltip="Choose microphone"
+              type="button"
+              onClick={toggleDeviceMenu}
+            >
+              <CaretUp weight="bold" />
+            </button>
+
+            <AnimatePresence>
+              {deviceMenuOpen ? (
+                <motion.div
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  className="voice-device-menu"
+                  exit={{ opacity: 0, y: 8, scale: 0.98 }}
+                  initial={reduceMotion ? false : { opacity: 0, y: 8, scale: 0.98 }}
+                  transition={{ duration: 0.16, ease: [0.2, 0.8, 0.2, 1] }}
+                >
+                  <div className="voice-device-menu-head">
+                    <strong>Input device</strong>
+                    <span>{selectedInputLabel}</span>
+                  </div>
+
+                  <div className="voice-device-options">
+                    {audioInputs.length > 0 ? (
+                      audioInputs.map((device, index) => {
+                        const active = device.deviceId === selectedInputId
+                        return (
+                          <button
+                            className={cn("voice-device-option", active && "active")}
+                            key={device.deviceId || index}
+                            type="button"
+                            onClick={() => changeInputDevice(device.deviceId)}
+                          >
+                            <span>{device.label || `Microphone ${index + 1}`}</span>
+                            {active ? <Check weight="bold" /> : null}
+                          </button>
+                        )
+                      })
+                    ) : (
+                      <button
+                        className="voice-device-option active"
+                        type="button"
+                        onClick={() => changeInputDevice("")}
+                      >
+                        <span>Default microphone</span>
+                        <Check weight="bold" />
+                      </button>
+                    )}
+                  </div>
+
+                  <div className={cn("voice-device-level", isSpeaking && "live")}>
+                    <div>
+                      <strong>Input level</strong>
+                      <span>{connected ? (muted ? "Muted" : "Live") : "Join to test"}</span>
+                    </div>
+                    <AudioWaveform
+                      bars={voiceWaveform}
+                      barCount={28}
+                      className="voice-device-waveform"
+                    />
+                  </div>
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
+          </div>
+
+          {connected ? (
+            <Button
+              className="voice-control-button leave"
+              data-tooltip="Leave voice"
+              size="icon-lg"
+              type="button"
+              variant="ghost"
+              onClick={leaveVoice}
+            >
+              <PhoneDisconnect data-icon="inline-start" weight="duotone" />
+            </Button>
+          ) : (
+            <Button
+              className="voice-join-button"
+              type="button"
+              onClick={() => void joinVoice()}
+            >
+              <PhoneCall data-icon="inline-start" weight="duotone" />
+              Join voice
+            </Button>
+          )}
+        </div>
+      </div>
+    </motion.section>
+  )
+}
+
+function VoiceParticipantCard({
+  participant,
+  speaking,
+}: {
+  participant: VoiceParticipant
+  speaking: boolean
+}) {
+  return (
+    <div
+      aria-label={`${participant.isSelf ? "You" : participant.name}${speaking ? ", speaking" : ", in chat"}`}
+      className={cn("voice-participant-card", speaking && "speaking")}
+      data-tooltip={`${participant.isSelf ? "You" : participant.name}${speaking ? " is speaking" : ""}`}
+    >
+      <div className="voice-participant-avatar">
+        <ChatAvatar name={participant.name} size="lg" src={participant.avatar} />
+        <span className="voice-speaking-indicator" />
+      </div>
+    </div>
+  )
+}
+
+function SpamBanNotice({
+  reason,
+  remainingMs,
+  source,
+}: {
+  reason?: string
+  remainingMs: number
+  source?: SpamGuardState["banSource"]
+}) {
+  const adminBlocked = source === "admin"
+
   return (
     <motion.div
       animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -1683,28 +3060,61 @@ function SpamBanNotice({ remainingMs }: { remainingMs: number }) {
     >
       <div className="spam-ban-title">
         <LockKey weight="bold" />
-        <strong>Sechat paused this chat.</strong>
+        <strong>{adminBlocked ? "Admin paused your chat." : "Sechat paused this chat."}</strong>
       </div>
       <p>
-        Sending is temporarily disabled because the spam filter was triggered
-        multiple times. You can continue in{" "}
-        <span>{formatRemainingTime(remainingMs)}</span>.
+        {adminBlocked
+          ? reason || "Sending is disabled by an admin."
+          : "Sending is temporarily disabled because the spam filter was triggered multiple times."}{" "}
+        {adminBlocked && remainingMs > 365 * 24 * 60 * 60 * 1000 ? (
+          <span>An admin must restore access.</span>
+        ) : (
+          <>
+            You can continue in <span>{formatRemainingTime(remainingMs)}</span>.
+          </>
+        )}
       </p>
+    </motion.div>
+  )
+}
+
+function ComposerStatusNotice({ message }: { message: string }) {
+  return (
+    <motion.div
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      aria-live="polite"
+      className="spam-ban-card composer-status-card"
+      initial={{ opacity: 0, y: 8, scale: 0.98 }}
+      role="status"
+      transition={{ duration: 0.16 }}
+    >
+      <div className="spam-ban-title">
+        <LockKey weight="bold" />
+        <strong>{message}</strong>
+      </div>
     </motion.div>
   )
 }
 
 function TopLeftDock({
   activePanel,
+  adminStatus,
+  adminUnlocked,
+  moderationLog,
+  moderationUsers,
   notificationIcon: NotificationIcon,
   notifications,
   permission,
   profile,
   trustedSites,
   unread,
+  voiceChatOpen,
   onAvatarFile,
+  onAdminUnlockedChange,
   onBrowserToggle,
+  onClearUserModeration,
   onClose,
+  onModerateUser,
   onPanelChange,
   onProfileChange,
   onRemoveTrustedSite,
@@ -1713,17 +3123,29 @@ function TopLeftDock({
   onUiSoundKindChange,
   onUiSoundPreview,
   onUiSoundToggle,
+  onVoiceToggle,
 }: {
   activePanel: Panel
+  adminStatus: string | null
+  adminUnlocked: boolean
+  moderationLog: SpamModerationLogEntry[]
+  moderationUsers: ModerationUser[]
   notificationIcon: typeof Bell
   notifications: NotificationSettings
   permission: string
   profile: Profile
   trustedSites: string[]
   unread: number
+  voiceChatOpen: boolean
   onAvatarFile: (file: File | undefined) => void
+  onAdminUnlockedChange: (unlocked: boolean) => void
   onBrowserToggle: (enabled: boolean) => void
+  onClearUserModeration: (user: ModerationUser) => void | Promise<void>
   onClose: () => void
+  onModerateUser: (
+    user: ModerationUser,
+    action: UserModerationState["action"]
+  ) => void | Promise<void>
   onPanelChange: (panel: Exclude<Panel, null>) => void
   onProfileChange: (profile: Profile) => void
   onRemoveTrustedSite: (site: string) => void
@@ -1732,13 +3154,71 @@ function TopLeftDock({
   onUiSoundKindChange: (kind: UiSoundKind) => void
   onUiSoundPreview: () => void
   onUiSoundToggle: (enabled: boolean) => void
+  onVoiceToggle: () => void
 }) {
   const reduceMotion = useReducedMotion()
   const [menuOpen, setMenuOpen] = useState(false)
+  const [adminOpen, setAdminOpen] = useState(false)
+  const [adminUnlockOpen, setAdminUnlockOpen] = useState(false)
+  const [adminPasswordDraft, setAdminPasswordDraft] = useState("")
+  const [adminError, setAdminError] = useState<string | null>(null)
+  const adminPassword = configuredAdminPassword()
 
   function openPanel(panel: Exclude<Panel, null>) {
     setMenuOpen(false)
+    setAdminOpen(false)
+    setAdminUnlockOpen(false)
     onPanelChange(panel)
+  }
+
+  function toggleAdminUnlock() {
+    setMenuOpen(false)
+    setAdminOpen(false)
+    onClose()
+    setAdminUnlockOpen((current) => !current)
+    setAdminError(null)
+  }
+
+  function toggleAdminPanel() {
+    setMenuOpen(false)
+    setAdminUnlockOpen(false)
+    onClose()
+    setAdminOpen((current) => !current)
+  }
+
+  function toggleVoiceChat() {
+    setMenuOpen(false)
+    setAdminOpen(false)
+    setAdminUnlockOpen(false)
+    onClose()
+    onVoiceToggle()
+  }
+
+  function unlockAdmin() {
+    if (!adminPassword) {
+      setAdminError("WEB_PASSWORD is not configured.")
+      return
+    }
+
+    if (adminPasswordDraft === adminPassword) {
+      onAdminUnlockedChange(true)
+      writeAdminUnlocked(true)
+      setAdminPasswordDraft("")
+      setAdminError(null)
+      setAdminUnlockOpen(false)
+      return
+    }
+
+    setAdminError("Wrong password.")
+  }
+
+  function lockAdmin() {
+    onAdminUnlockedChange(false)
+    writeAdminUnlocked(false)
+    setAdminPasswordDraft("")
+    setAdminError(null)
+    setAdminOpen(false)
+    setAdminUnlockOpen(false)
   }
 
   const enabledSoundKinds = Object.values(notifications.soundKinds).filter(Boolean)
@@ -1749,17 +3229,87 @@ function TopLeftDock({
 
   return (
     <div className="top-chrome">
-      <div className="room-info-pill" aria-label="Current chat">
-        <strong>Main Chat</strong>
+      <div className="room-dock">
+        <button
+          aria-expanded={adminUnlockOpen}
+          aria-label="Unlock admin"
+          className={cn("room-info-pill", adminUnlockOpen && "active")}
+          data-tooltip={adminUnlocked ? "Admin unlocked" : "Unlock admin"}
+          type="button"
+          onClick={toggleAdminUnlock}
+        >
+          <strong>Main Chat</strong>
+        </button>
+
+        <AnimatePresence>
+          {adminUnlockOpen ? (
+            <motion.section
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              className="admin-panel admin-unlock-panel"
+              exit={{ opacity: 0, y: -8, scale: 0.98 }}
+              initial={reduceMotion ? false : { opacity: 0, y: -8, scale: 0.98 }}
+              transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
+            >
+              <AdminGatePanel
+                adminError={adminError}
+                isConfigured={adminPassword.length > 0}
+                isUnlocked={adminUnlocked}
+                passwordDraft={adminPasswordDraft}
+                onClose={() => setAdminUnlockOpen(false)}
+                onLock={lockAdmin}
+                onOpenAdmin={toggleAdminPanel}
+                onPasswordDraftChange={(value) => {
+                  setAdminPasswordDraft(value)
+                  setAdminError(null)
+                }}
+                onUnlock={unlockAdmin}
+              />
+            </motion.section>
+          ) : null}
+        </AnimatePresence>
       </div>
 
       <div className="dock">
         <div className="dock-buttons" aria-label="Chat controls">
+          {adminUnlocked ? (
+            <Button
+              aria-expanded={adminOpen}
+              aria-label="Admin panel"
+              className={cn("dock-button", adminOpen && "active")}
+              data-tooltip="Admin panel"
+              size="icon"
+              type="button"
+              variant="ghost"
+              onClick={toggleAdminPanel}
+            >
+              <span className="icon-motion">
+                <ShieldCheck data-icon="inline-start" weight="duotone" />
+              </span>
+            </Button>
+          ) : null}
+          <Button
+            aria-expanded={voiceChatOpen}
+            aria-label={voiceChatOpen ? "Close voice chat" : "Open voice chat"}
+            className={cn("dock-button", voiceChatOpen && "active")}
+            data-tooltip={voiceChatOpen ? "Close voice chat" : "Voice chat"}
+            size="icon"
+            type="button"
+            variant="ghost"
+            onClick={toggleVoiceChat}
+          >
+            <span className="icon-motion">
+              {voiceChatOpen ? (
+                <PhoneDisconnect data-icon="inline-start" weight="duotone" />
+              ) : (
+                <PhoneCall data-icon="inline-start" weight="duotone" />
+              )}
+            </span>
+          </Button>
           <Button
             aria-label="Notifications"
             className={cn("dock-button", activePanel === "notifications" && "active")}
+            data-tooltip="Notifications"
             size="icon"
-            title="Notifications"
             type="button"
             variant="ghost"
             onClick={() => openPanel("notifications")}
@@ -1773,12 +3323,14 @@ function TopLeftDock({
             aria-expanded={menuOpen}
             aria-label="More options"
             className={cn("dock-button", menuOpen && "active")}
+            data-tooltip="More options"
             size="icon"
-            title="More options"
             type="button"
             variant="ghost"
             onClick={() => {
               setMenuOpen((current) => !current)
+              setAdminOpen(false)
+              setAdminUnlockOpen(false)
               if (activePanel) onClose()
             }}
           >
@@ -1787,6 +3339,28 @@ function TopLeftDock({
             </span>
           </Button>
         </div>
+
+        <AnimatePresence>
+          {adminOpen && adminUnlocked ? (
+            <motion.section
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              className="admin-panel dock-admin-panel"
+              exit={{ opacity: 0, y: -8, scale: 0.98 }}
+              initial={reduceMotion ? false : { opacity: 0, y: -8, scale: 0.98 }}
+              transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
+            >
+              <AdminPanel
+                adminStatus={adminStatus}
+                moderationLog={moderationLog}
+                moderationUsers={moderationUsers}
+                onClose={() => setAdminOpen(false)}
+                onClearUserModeration={onClearUserModeration}
+                onLock={lockAdmin}
+                onModerateUser={onModerateUser}
+              />
+            </motion.section>
+          ) : null}
+        </AnimatePresence>
 
         <AnimatePresence>
           {menuOpen ? (
@@ -1849,7 +3423,14 @@ function TopLeftDock({
               transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
               >
               <div className="panel-head">
-                <div>
+                <div className="panel-title-with-icon">
+                  {activePanel === "profile" ? (
+                    <PencilSimple weight="duotone" />
+                  ) : activePanel === "trusted" ? (
+                    <ShieldCheck weight="duotone" />
+                  ) : (
+                    <NotificationIcon weight="duotone" />
+                  )}
                   <strong>
                     {activePanel === "profile"
                       ? "Your profile"
@@ -1860,8 +3441,8 @@ function TopLeftDock({
                 </div>
                 <Button
                   aria-label="Close panel"
+                  data-tooltip="Close panel"
                   size="icon-sm"
-                  title="Close panel"
                   type="button"
                   variant="ghost"
                   onClick={onClose}
@@ -1897,6 +3478,269 @@ function TopLeftDock({
           ) : null}
         </AnimatePresence>
       </div>
+    </div>
+  )
+}
+
+function AdminGatePanel({
+  adminError,
+  isConfigured,
+  isUnlocked,
+  passwordDraft,
+  onClose,
+  onLock,
+  onOpenAdmin,
+  onPasswordDraftChange,
+  onUnlock,
+}: {
+  adminError: string | null
+  isConfigured: boolean
+  isUnlocked: boolean
+  passwordDraft: string
+  onClose: () => void
+  onLock: () => void
+  onOpenAdmin: () => void
+  onPasswordDraftChange: (value: string) => void
+  onUnlock: () => void
+}) {
+  function submitAdminUnlock(event: ReactFormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    onUnlock()
+  }
+
+  return (
+    <div className="admin-panel-inner">
+      <div className="panel-head">
+        <div className="panel-title-with-icon admin-panel-title">
+          <LockKey weight="duotone" />
+          <strong>{isUnlocked ? "Admin unlocked" : "Admin unlock"}</strong>
+        </div>
+        <Button
+          aria-label="Close unlock"
+          data-tooltip="Close"
+          size="icon-sm"
+          type="button"
+          variant="ghost"
+          onClick={onClose}
+        >
+          <X data-icon="inline-start" />
+        </Button>
+      </div>
+
+      {!isConfigured ? (
+        <div className="admin-panel-copy">
+          <strong>WEB_PASSWORD is missing.</strong>
+          <span>Add it in Vercel or your local env, then rebuild the app.</span>
+        </div>
+      ) : isUnlocked ? (
+        <>
+          <div className="admin-panel-copy">
+            <strong>Admin is unlocked.</strong>
+            <span>Use the shield button beside notifications to open the admin panel.</span>
+          </div>
+          <div className="admin-panel-actions">
+            <Button size="sm" type="button" variant="default" onClick={onOpenAdmin}>
+              <ShieldCheck data-icon="inline-start" weight="duotone" />
+              Open
+            </Button>
+            <Button size="sm" type="button" variant="outline" onClick={onLock}>
+              <LockKey data-icon="inline-start" weight="duotone" />
+              Lock
+            </Button>
+          </div>
+        </>
+      ) : (
+        <form className="admin-panel-form" onSubmit={submitAdminUnlock}>
+          <div className="admin-panel-copy">
+            <strong>Enter WEB_PASSWORD.</strong>
+            <span>Moderation logs are hidden until this session is unlocked.</span>
+          </div>
+          <Input
+            autoComplete="current-password"
+            autoFocus
+            placeholder="WEB_PASSWORD"
+            type="password"
+            value={passwordDraft}
+            onChange={(event) => onPasswordDraftChange(event.target.value)}
+          />
+          {adminError ? <p className="admin-panel-error">{adminError}</p> : null}
+          <Button size="sm" type="submit" variant="default">
+            Unlock
+          </Button>
+        </form>
+      )}
+    </div>
+  )
+}
+
+function AdminPanel({
+  adminStatus,
+  moderationLog,
+  moderationUsers,
+  onClose,
+  onClearUserModeration,
+  onLock,
+  onModerateUser,
+}: {
+  adminStatus: string | null
+  moderationLog: SpamModerationLogEntry[]
+  moderationUsers: ModerationUser[]
+  onClose: () => void
+  onClearUserModeration: (user: ModerationUser) => void | Promise<void>
+  onLock: () => void
+  onModerateUser: (
+    user: ModerationUser,
+    action: UserModerationState["action"]
+  ) => void | Promise<void>
+}) {
+  return (
+    <div className="admin-panel-inner">
+      <div className="panel-head">
+        <div className="panel-title-with-icon admin-panel-title">
+          <ShieldCheck weight="duotone" />
+          <strong>Admin panel</strong>
+        </div>
+        <Button
+          aria-label="Close admin panel"
+          data-tooltip="Close"
+          size="icon-sm"
+          type="button"
+          variant="ghost"
+          onClick={onClose}
+        >
+          <X data-icon="inline-start" />
+        </Button>
+      </div>
+
+      <div className="admin-stat-row">
+        <span>
+          <ShieldCheck weight="duotone" />
+          Moderation actions
+        </span>
+        <strong>{moderationLog.length}</strong>
+      </div>
+
+      {adminStatus ? <p className="admin-panel-status">{adminStatus}</p> : null}
+
+      <AdminUserModeration
+        users={moderationUsers}
+        onClearUserModeration={onClearUserModeration}
+        onModerateUser={onModerateUser}
+      />
+
+      <ModerationLogView moderationLog={moderationLog} />
+
+      <div className="admin-panel-actions">
+        <Button size="sm" type="button" variant="outline" onClick={onLock}>
+          <LockKey data-icon="inline-start" weight="duotone" />
+          Lock
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function AdminUserModeration({
+  users,
+  onClearUserModeration,
+  onModerateUser,
+}: {
+  users: ModerationUser[]
+  onClearUserModeration: (user: ModerationUser) => void | Promise<void>
+  onModerateUser: (
+    user: ModerationUser,
+    action: UserModerationState["action"]
+  ) => void | Promise<void>
+}) {
+  return (
+    <div className="admin-user-panel">
+      <span className="setting-label">
+        <Prohibit weight="duotone" />
+        People
+      </span>
+      {users.length > 0 ? (
+        <div className="admin-user-list">
+          {users.slice(0, 10).map((user) => (
+            <div className="admin-user-row" key={user.id}>
+              <ChatAvatar name={user.name} size="sm" src={user.avatar} />
+              <span>
+                <strong>{user.isSelf ? `${user.name} (you)` : user.name}</strong>
+                <small>
+                  {user.messageCount} message{user.messageCount === 1 ? "" : "s"} ·{" "}
+                  {formatTime(user.lastSeenAt)}
+                </small>
+              </span>
+              <div className="admin-user-actions">
+                <Button
+                  data-tooltip="Timeout for 15 minutes"
+                  disabled={user.isSelf}
+                  size="icon-sm"
+                  type="button"
+                  variant="ghost"
+                  onClick={() => void onModerateUser(user, "timeout")}
+                >
+                  <Clock data-icon="inline-start" weight="duotone" />
+                </Button>
+                <Button
+                  data-tooltip="Ban"
+                  disabled={user.isSelf}
+                  size="icon-sm"
+                  type="button"
+                  variant="ghost"
+                  onClick={() => void onModerateUser(user, "ban")}
+                >
+                  <Prohibit data-icon="inline-start" weight="duotone" />
+                </Button>
+                <Button
+                  data-tooltip="Clear timeout or ban"
+                  disabled={user.isSelf}
+                  size="icon-sm"
+                  type="button"
+                  variant="ghost"
+                  onClick={() => void onClearUserModeration(user)}
+                >
+                  <ShieldCheck data-icon="inline-start" weight="duotone" />
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="moderation-empty">No people to moderate yet.</p>
+      )}
+    </div>
+  )
+}
+
+function ModerationLogView({
+  moderationLog,
+}: {
+  moderationLog: SpamModerationLogEntry[]
+}) {
+  return (
+    <div className="moderation-log-panel">
+      <span className="setting-label">
+        <ShieldCheck weight="duotone" />
+        Moderation log
+      </span>
+      {moderationLog.length > 0 ? (
+        <div className="moderation-log-list">
+          {moderationLog.slice(0, 8).map((entry) => (
+            <div className="moderation-log-entry" key={entry.id}>
+              <strong>{moderationActionLabel(entry.action)}</strong>
+              <span>{entry.reason}</span>
+              <small>
+                {formatTime(entry.at)}
+                {entry.strikes > 0
+                  ? ` - strike ${entry.strikes}/${SPAM_BAN_TRIGGER_COUNT}`
+                  : ""}
+              </small>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="moderation-empty">No spam actions yet.</p>
+      )}
     </div>
   )
 }
@@ -1945,7 +3789,7 @@ function ProfilePanel({
           <button
             aria-label="Remove profile picture"
             className="profile-avatar-remove"
-            title="Remove profile picture"
+            data-tooltip="Remove profile picture"
             type="button"
             onClick={() => onProfileChange({ ...profile, avatar: "" })}
           >
@@ -2224,8 +4068,8 @@ function TrustedSitesPanel({
           trustedSites.map((site) => (
             <Badge
               className="trusted-site-badge"
+              data-tooltip={site}
               key={site}
-              title={site}
               variant="outline"
             >
               <TrustedSiteIcon site={site} />
@@ -2314,7 +4158,10 @@ function ExternalLinkDialog({
       onClose={onCancel}
     >
         <div className="link-dialog-copy">
-          <strong id="external-link-title">Open external link?</strong>
+          <strong className="link-dialog-title" id="external-link-title">
+            <GlobeSimple weight="duotone" />
+            Open external link?
+          </strong>
           <span>{displayUrl}</span>
         </div>
         <Label className="trust-site-check" htmlFor="trust-site">
@@ -2421,6 +4268,13 @@ function isAudioAttachment(attachment: MessageAttachment) {
   return attachment.mimeType.toLowerCase().startsWith("audio/")
 }
 
+function isGifAttachment(attachment: MessageAttachment) {
+  return (
+    attachment.mimeType.toLowerCase().split(";")[0] === "image/gif" ||
+    /\.gif$/i.test(attachment.name)
+  )
+}
+
 function getMessageDownloads(message: ChatMessage): DownloadItem[] {
   const downloads: DownloadItem[] = []
 
@@ -2464,15 +4318,20 @@ function MessageAttachments({ attachments }: { attachments?: MessageAttachment[]
     <div className="message-attachments">
       {attachments.map((attachment) => {
         if (attachment.kind === "image") {
+          const isGif = isGifAttachment(attachment)
+
           return (
-            <div className="message-image-attachment" key={attachment.id}>
+            <div
+              className={cn("message-image-attachment", isGif && "gif-attachment")}
+              key={attachment.id}
+            >
               <a href={attachment.dataUrl} rel="noreferrer" target="_blank">
                 <img alt={attachment.name} src={attachment.dataUrl} />
               </a>
               <button
                 aria-label={`Download ${attachment.name}`}
                 className="attachment-download-button"
-                title={`Download ${attachment.name}`}
+                data-tooltip={`Download ${attachment.name}`}
                 type="button"
                 onClick={() => downloadAttachment(attachment)}
               >
@@ -2511,7 +4370,7 @@ function MessageAttachments({ attachments }: { attachments?: MessageAttachment[]
             <button
               aria-label={`Download ${attachment.name}`}
               className="attachment-download-button inline"
-              title={`Download ${attachment.name}`}
+              data-tooltip={`Download ${attachment.name}`}
               type="button"
               onClick={() => downloadAttachment(attachment)}
             >
@@ -2571,9 +4430,9 @@ function RecordingComposer({
           (isReady || isDiscarding) && "discard-ready",
           isDiscarding && "discarding"
         )}
+        data-tooltip={isReady ? "Discard audio message" : "Stop recording"}
         disabled={isProcessing || isDiscarding}
         size="icon-lg"
-        title={isReady ? "Discard audio message" : "Stop recording"}
         type="button"
         variant="ghost"
         onClick={isReady ? onDiscard : onStop}
@@ -2587,9 +4446,9 @@ function RecordingComposer({
       <Button
         aria-label="Send audio message"
         className="voice-send-button"
+        data-tooltip="Send audio message"
         disabled={isProcessing}
         size="icon-lg"
-        title="Send audio message"
         type="button"
         onClick={onSend}
       >
@@ -2600,18 +4459,24 @@ function RecordingComposer({
 }
 
 function MessageBlock({
+  adminUnlocked,
   authorId,
   group,
   mobileReplyGesture,
   onExternalLink,
+  onDeleteMessage,
+  onReact,
   onReply,
   profile,
   quoteFor,
 }: {
+  adminUnlocked: boolean
   authorId: string
   group: MessageGroup
   mobileReplyGesture: boolean
   onExternalLink: (url: string, displayUrl: string) => void
+  onDeleteMessage: (message: ChatMessage) => void | Promise<void>
+  onReact: (messageId: string, emoji: string) => void
   onReply: (messageId: string) => void
   profile: Profile
   quoteFor: (message: ChatMessage) => ChatMessage | undefined
@@ -2644,6 +4509,7 @@ function MessageBlock({
           {group.messages.map((message, index) => (
             <MessageBubble
               key={message.id}
+              adminUnlocked={adminUnlocked}
               authorId={authorId}
               compact={index > 0}
               displayName={displayName}
@@ -2651,7 +4517,9 @@ function MessageBlock({
               message={message}
               profile={profile}
               quote={quoteFor(message)}
+              onDelete={() => void onDeleteMessage(message)}
               onExternalLink={onExternalLink}
+              onReact={onReact}
               onReply={() => onReply(message.id)}
             />
           ))}
@@ -2662,30 +4530,37 @@ function MessageBlock({
 }
 
 function MessageBubble({
+  adminUnlocked,
   authorId,
   compact,
   displayName,
   mobileReplyGesture,
   message,
+  onDelete,
   onExternalLink,
+  onReact,
   onReply,
   profile,
   quote,
 }: {
+  adminUnlocked: boolean
   authorId: string
   compact: boolean
   displayName: string
   mobileReplyGesture: boolean
   message: ChatMessage
+  onDelete: () => void
   onExternalLink: (url: string, displayUrl: string) => void
+  onReact: (messageId: string, emoji: string) => void
   onReply: () => void
   profile: Profile
   quote?: ChatMessage
 }) {
   const [actionMenuOpen, setActionMenuOpen] = useState(false)
   const [actionFeedback, setActionFeedback] = useState<
-    "reply" | "copy" | "download" | null
+    "reply" | "copy" | "download" | "reaction" | "delete" | null
   >(null)
+  const [reactionMenuOpen, setReactionMenuOpen] = useState(false)
   const [swipeIntent, setSwipeIntent] = useState<"reply" | "copy" | null>(null)
   const [swipeProgress, setSwipeProgress] = useState(0)
   const bubbleLineRef = useRef<HTMLDivElement | null>(null)
@@ -2693,13 +4568,19 @@ function MessageBubble({
   const actionFeedbackTimeoutRef = useRef<number | null>(null)
   const longPressStartRef = useRef<{ x: number; y: number } | null>(null)
   const blockNextClickRef = useRef(false)
+  const isPending = message.sendStatus === "sending"
   const hasAttachments = Boolean(message.attachments?.length)
   const hasText = message.body.trim().length > 0
+  const hasPendingMedia =
+    message.messageType === "audio" || Boolean(message.attachments?.length)
   const showTextBubble =
-    message.messageType === "audio" || Boolean(quote) || hasText
+    isPending || message.messageType === "audio" || Boolean(quote) || hasText
   const downloads = getMessageDownloads(message)
-  const canDownload = downloads.length > 0
-  const canCopy = message.messageType !== "audio"
+  const canDownload = !isPending && downloads.length > 0
+  const canCopy = !isPending && message.messageType !== "audio" && hasText
+  const canDelete = adminUnlocked && !isPending
+  const canReply = !isPending
+  const canReact = !isPending
 
   useEffect(() => {
     return () => {
@@ -2709,7 +4590,7 @@ function MessageBubble({
   }, [])
 
   useEffect(() => {
-    if (!actionMenuOpen) return
+    if (!actionMenuOpen && !reactionMenuOpen) return
 
     function closeFromOutside(event: globalThis.PointerEvent) {
       if (
@@ -2720,13 +4601,14 @@ function MessageBubble({
       }
 
       setActionMenuOpen(false)
+      setReactionMenuOpen(false)
     }
 
     document.addEventListener("pointerdown", closeFromOutside, true)
     return () => {
       document.removeEventListener("pointerdown", closeFromOutside, true)
     }
-  }, [actionMenuOpen])
+  }, [actionMenuOpen, reactionMenuOpen])
 
   function clearLongPressTimer() {
     if (longPressTimeoutRef.current !== null) {
@@ -2742,7 +4624,9 @@ function MessageBubble({
     }
   }
 
-  function triggerActionFeedback(action: "reply" | "copy" | "download") {
+  function triggerActionFeedback(
+    action: "reply" | "copy" | "download" | "reaction" | "delete"
+  ) {
     clearActionFeedbackTimer()
     setActionFeedback(action)
     navigator.vibrate?.(8)
@@ -2753,13 +4637,23 @@ function MessageBubble({
   }
 
   function replyMessage() {
+    if (!canReply) return
     triggerActionFeedback("reply")
     onReply()
   }
 
   function copyMessage() {
+    if (!canCopy) return
     triggerActionFeedback("copy")
     navigator.clipboard?.writeText(messagePreview(message)).catch(() => undefined)
+  }
+
+  function reactToMessage(emoji: string) {
+    if (!canReact) return
+    triggerActionFeedback("reaction")
+    onReact(message.id, emoji)
+    setActionMenuOpen(false)
+    setReactionMenuOpen(false)
   }
 
   function copyAndCloseMenu() {
@@ -2778,9 +4672,18 @@ function MessageBubble({
     setActionMenuOpen(false)
   }
 
+  function deleteAndCloseMenu() {
+    if (!canDelete) return
+    triggerActionFeedback("delete")
+    onDelete()
+    setActionMenuOpen(false)
+    setReactionMenuOpen(false)
+  }
+
   function openActionMenu() {
     setSwipeIntent(null)
     setSwipeProgress(0)
+    setReactionMenuOpen(false)
     setActionMenuOpen(true)
     navigator.vibrate?.(12)
   }
@@ -2795,6 +4698,7 @@ function MessageBubble({
   function handleLongPressStart(event: ReactPointerEvent<HTMLDivElement>) {
     if (
       !mobileReplyGesture ||
+      isPending ||
       event.pointerType === "mouse" ||
       shouldIgnoreLongPress(event.target)
     ) {
@@ -2828,7 +4732,10 @@ function MessageBubble({
     if (!blockNextClickRef.current) return
 
     const target = event.target
-    if (target instanceof Element && target.closest(".message-action-menu")) {
+    if (
+      target instanceof Element &&
+      target.closest(".message-action-menu, .reaction-popover")
+    ) {
       return
     }
 
@@ -2838,7 +4745,7 @@ function MessageBubble({
   }
 
   function handleContextMenu(event: ReactMouseEvent<HTMLDivElement>) {
-    if (!mobileReplyGesture || shouldIgnoreLongPress(event.target)) return
+    if (isPending || !mobileReplyGesture || shouldIgnoreLongPress(event.target)) return
 
     event.preventDefault()
     openActionMenu()
@@ -2850,7 +4757,7 @@ function MessageBubble({
     const progress = Math.min(1, Math.abs(offsetX) / 46)
     setSwipeProgress(progress)
 
-    if (offsetX > 10) {
+    if (canReply && offsetX > 10) {
       setSwipeIntent("reply")
       return
     }
@@ -2866,6 +4773,7 @@ function MessageBubble({
   function handleDragStart() {
     clearLongPressTimer()
     setActionMenuOpen(false)
+    setReactionMenuOpen(false)
   }
 
   function handleDrag(
@@ -2881,9 +4789,9 @@ function MessageBubble({
   ) {
     setSwipeIntent(null)
     setSwipeProgress(0)
-    if (!mobileReplyGesture) return
+    if (!mobileReplyGesture || isPending) return
 
-    if (info.offset.x > 46 || info.velocity.x > 620) {
+    if (canReply && (info.offset.x > 46 || info.velocity.x > 620)) {
       replyMessage()
       return
     }
@@ -2899,10 +4807,11 @@ function MessageBubble({
       className={cn(
         "bubble-line",
         message.messageType === "audio" && "audio-bubble",
+        isPending && "pending-bubble-line",
         mobileReplyGesture && "swipe-reply",
         compact && "compact"
       )}
-      drag={mobileReplyGesture ? "x" : false}
+      drag={mobileReplyGesture && !isPending ? "x" : false}
       dragConstraints={{ left: -58, right: 58 }}
       dragElastic={0.12}
       dragMomentum={false}
@@ -2944,34 +4853,64 @@ function MessageBubble({
             initial={{ opacity: 0, y: 4, scale: 0.96 }}
             transition={{ duration: 0.14 }}
           >
-            <button type="button" onClick={replyAndCloseMenu}>
-              <ArrowBendUpLeft weight="bold" />
-              Reply
-            </button>
+            {canReact ? (
+              <div className="message-menu-reactions">
+                {REACTION_OPTIONS.map((emoji) => (
+                  <ReactionActionButton
+                    active={hasReaction(message.reactions, emoji, authorId)}
+                    emoji={emoji}
+                    key={emoji}
+                    onClick={() => reactToMessage(emoji)}
+                  />
+                ))}
+              </div>
+            ) : null}
+            {canReply ? (
+              <button data-tooltip="Reply" type="button" onClick={replyAndCloseMenu}>
+                <ArrowBendUpLeft weight="bold" />
+                Reply
+              </button>
+            ) : null}
             {canCopy ? (
-              <button type="button" onClick={copyAndCloseMenu}>
+              <button data-tooltip="Copy message" type="button" onClick={copyAndCloseMenu}>
                 <CopySimple weight="bold" />
                 Copy
               </button>
             ) : null}
             {canDownload ? (
-              <button type="button" onClick={downloadMessage}>
+              <button data-tooltip="Download" type="button" onClick={downloadMessage}>
                 <DownloadSimple weight="bold" />
                 Download
+              </button>
+            ) : null}
+            {canDelete ? (
+              <button
+                className="danger-menu-action"
+                data-tooltip="Delete message"
+                type="button"
+                onClick={deleteAndCloseMenu}
+              >
+                <Trash weight="bold" />
+                Delete
               </button>
             ) : null}
           </motion.div>
         ) : null}
       </AnimatePresence>
       <div className="bubble-stack">
-        {message.messageType !== "audio" && hasAttachments ? (
+        {message.messageType !== "audio" && hasAttachments && !isPending ? (
           <MessageAttachments attachments={message.attachments} />
         ) : null}
 
         {showTextBubble ? (
           <div className="bubble">
             <div className="bubble-inner">
-              {quote ? (
+              {isPending ? (
+                <PendingMessageSkeleton
+                  hasMedia={hasPendingMedia}
+                  progress={message.uploadProgress ?? 0}
+                />
+              ) : quote ? (
                 <button className="quote-button" type="button">
                   <strong>
                     {quote.authorId === authorId ? profile.name : quote.authorName}
@@ -2979,9 +4918,9 @@ function MessageBubble({
                   <span>{messagePreview(quote)}</span>
                 </button>
               ) : null}
-              {message.messageType === "audio" && message.audioUrl ? (
+              {!isPending && message.messageType === "audio" && message.audioUrl ? (
                 <AudioMessage message={message} />
-              ) : hasText ? (
+              ) : !isPending && hasText ? (
                 <p className="rich-text">
                   {renderRichText(message.body, profile.name, onExternalLink)}
                 </p>
@@ -2989,27 +4928,83 @@ function MessageBubble({
             </div>
           </div>
         ) : null}
+        {!isPending ? (
+          <MessageReactionStrip
+            authorId={authorId}
+            message={message}
+            onReact={reactToMessage}
+          />
+        ) : null}
       </div>
       <div className="message-actions">
-        <Tooltip
-          content={`Reply to ${displayName}`}
-          side="top"
-          tooltipClassName="chat-tooltip"
-        >
-          <button
-            aria-label={`Reply to ${displayName}`}
-            className={cn(
-              "message-action reply-action",
-              actionFeedback === "reply" && "is-confirming"
-            )}
-            type="button"
-            onClick={replyMessage}
+        {canReact ? (
+          <div className={cn("message-reaction-actions", reactionMenuOpen && "menu-open")}>
+            <Tooltip
+              content="React"
+              side="top"
+              tooltipClassName="chat-tooltip"
+            >
+              <button
+                aria-expanded={reactionMenuOpen}
+                aria-label="Open reactions"
+                className={cn(
+                  "message-action react-action",
+                  actionFeedback === "reaction" && "is-confirming"
+                )}
+                type="button"
+                onClick={() => {
+                  setActionMenuOpen(false)
+                  setReactionMenuOpen((open) => !open)
+                }}
+              >
+                <span className="icon-motion">
+                  <Smiley weight="bold" />
+                </span>
+              </button>
+            </Tooltip>
+            <AnimatePresence>
+              {reactionMenuOpen ? (
+                <motion.div
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  className="reaction-popover"
+                  exit={{ opacity: 0, y: 4, scale: 0.96 }}
+                  initial={{ opacity: 0, y: 4, scale: 0.96 }}
+                  transition={{ duration: 0.14 }}
+                >
+                  {REACTION_OPTIONS.map((emoji) => (
+                    <ReactionActionButton
+                      active={hasReaction(message.reactions, emoji, authorId)}
+                      emoji={emoji}
+                      key={emoji}
+                      onClick={() => reactToMessage(emoji)}
+                    />
+                  ))}
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
+          </div>
+        ) : null}
+        {canReply ? (
+          <Tooltip
+            content={`Reply to ${displayName}`}
+            side="top"
+            tooltipClassName="chat-tooltip"
           >
-            <span className="icon-motion">
-              <ArrowBendUpLeft weight="bold" />
-            </span>
-          </button>
-        </Tooltip>
+            <button
+              aria-label={`Reply to ${displayName}`}
+              className={cn(
+                "message-action reply-action",
+                actionFeedback === "reply" && "is-confirming"
+              )}
+              type="button"
+              onClick={replyMessage}
+            >
+              <span className="icon-motion">
+                <ArrowBendUpLeft weight="bold" />
+              </span>
+            </button>
+          </Tooltip>
+        ) : null}
         {canCopy ? (
           <Tooltip
             content="Copy message"
@@ -3052,8 +5047,155 @@ function MessageBubble({
             </button>
           </Tooltip>
         ) : null}
+        {canDelete ? (
+          <Tooltip
+            content="Delete message"
+            side="top"
+            tooltipClassName="chat-tooltip"
+          >
+            <button
+              aria-label="Delete message"
+              className={cn(
+                "message-action delete-action",
+                actionFeedback === "delete" && "is-confirming"
+              )}
+              type="button"
+              onClick={deleteAndCloseMenu}
+            >
+              <span className="icon-motion">
+                <Trash weight="bold" />
+              </span>
+            </button>
+          </Tooltip>
+        ) : null}
       </div>
     </motion.div>
+  )
+}
+
+function PendingMessageSkeleton({
+  hasMedia,
+  progress,
+}: {
+  hasMedia: boolean
+  progress: number
+}) {
+  const safeProgress = Math.max(0, Math.min(1, progress))
+  const percentage = Math.round(safeProgress * 100)
+
+  return (
+    <div
+      aria-label={`Sending message ${percentage}%`}
+      aria-live="polite"
+      className={cn("pending-message-skeleton", hasMedia && "has-media")}
+      role="status"
+      style={{ "--upload-progress": safeProgress.toFixed(3) } as CSSProperties}
+    >
+      {hasMedia ? <span className="pending-media-block" /> : null}
+      <span className="pending-line wide" />
+      <span className="pending-line short" />
+      <span className="pending-progress-track">
+        <span className="pending-progress-fill" />
+      </span>
+      <small>{percentage > 0 ? `Uploading ${percentage}%` : "Sending..."}</small>
+    </div>
+  )
+}
+
+function ReactionActionButton({
+  active,
+  emoji,
+  onClick,
+}: {
+  active: boolean
+  emoji: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      aria-label={active ? `Remove ${emoji} reaction` : `React with ${emoji}`}
+      aria-pressed={active}
+      className={cn("reaction-option-button", active && "active")}
+      type="button"
+      onClick={onClick}
+    >
+      <ReactionEmoji emoji={emoji} />
+    </button>
+  )
+}
+
+function ReactionEmoji({ emoji }: { emoji: string }) {
+  const source = REACTION_ANIMATED_EMOJIS[emoji]
+  if (!source) {
+    return <span className="reaction-emoji-fallback">{emoji}</span>
+  }
+
+  return (
+    <span className="reaction-emoji-asset">
+      <img
+        alt=""
+        src={source}
+        onError={(event) => {
+          event.currentTarget.style.display = "none"
+          const fallback = event.currentTarget.nextElementSibling
+          if (fallback instanceof HTMLElement) {
+            fallback.hidden = false
+          }
+        }}
+      />
+      <span className="reaction-emoji-fallback" hidden>
+        {emoji}
+      </span>
+    </span>
+  )
+}
+
+function MessageReactionStrip({
+  authorId,
+  message,
+  onReact,
+}: {
+  authorId: string
+  message: ChatMessage
+  onReact: (emoji: string) => void
+}) {
+  const reactions = summarizeReactions(message.reactions)
+  if (reactions.length === 0) return null
+
+  return (
+    <div className="message-reaction-strip" aria-label="Message reactions">
+      {reactions.map((reaction) => {
+        const active = reaction.reactions.some((item) => item.authorId === authorId)
+        const names = reaction.reactions
+          .slice(0, 4)
+          .map((item) => item.authorName)
+          .join(", ")
+
+        return (
+          <Tooltip
+            content={names || "Reaction"}
+            key={reaction.emoji}
+            side="top"
+            tooltipClassName="chat-tooltip"
+          >
+            <button
+              aria-label={`${reaction.count} ${reaction.emoji} reactions`}
+              aria-pressed={active}
+              className={cn(
+                "reaction-chip",
+                active && "active",
+                reaction.count > 1 && "has-count"
+              )}
+              type="button"
+              onClick={() => onReact(reaction.emoji)}
+            >
+              <ReactionEmoji emoji={reaction.emoji} />
+              {reaction.count > 1 ? <strong>{reaction.count}</strong> : null}
+            </button>
+          </Tooltip>
+        )
+      })}
+    </div>
   )
 }
 
@@ -3207,7 +5349,7 @@ function AudioMessagePlayer({
           aria-expanded={volumeMenuOpen}
           aria-label="Adjust volume"
           className="audio-volume-button"
-          title="Adjust volume"
+          data-tooltip="Adjust volume"
           type="button"
           onClick={() => setVolumeMenuOpen((open) => !open)}
         >

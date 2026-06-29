@@ -6,6 +6,11 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function notModerated(roomId) {
+      return !exists(/databases/$(database)/documents/rooms/$(roomId)/moderation/$(request.auth.uid))
+        || get(/databases/$(database)/documents/rooms/$(roomId)/moderation/$(request.auth.uid)).data.bannedUntil <= request.time.toMillis();
+    }
+
     function validMessagePayload() {
       return request.resource.data.keys().hasOnly([
           "authorId",
@@ -54,14 +59,168 @@ service cloud.firestore {
         && request.resource.data.waveform.size() <= 80;
     }
 
+    function validReactionPayload() {
+      return request.resource.data.keys().hasOnly([
+          "authorId",
+          "authorName",
+          "clientCreatedAt",
+          "createdAt",
+          "emoji",
+          "messageId"
+        ])
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.authorName is string
+        && request.resource.data.authorName.size() > 0
+        && request.resource.data.authorName.size() <= 80
+        && request.resource.data.clientCreatedAt is number
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.emoji is string
+        && request.resource.data.emoji.size() > 0
+        && request.resource.data.emoji.size() <= 8
+        && request.resource.data.messageId is string
+        && request.resource.data.messageId.size() > 0
+        && request.resource.data.messageId.size() <= 160;
+    }
+
+    function validModerationPayload() {
+      return request.resource.data.keys().hasOnly([
+          "action",
+          "authorId",
+          "authorName",
+          "bannedUntil",
+          "clientCreatedAt",
+          "createdAt",
+          "moderatorId",
+          "moderatorName",
+          "reason"
+        ])
+        && request.resource.data.action is string
+        && request.resource.data.action in ["timeout", "ban"]
+        && request.resource.data.authorId is string
+        && request.resource.data.authorId.size() > 0
+        && request.resource.data.authorId.size() <= 160
+        && request.resource.data.authorName is string
+        && request.resource.data.authorName.size() > 0
+        && request.resource.data.authorName.size() <= 80
+        && request.resource.data.bannedUntil is number
+        && request.resource.data.bannedUntil > request.time.toMillis()
+        && request.resource.data.clientCreatedAt is number
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.moderatorId == request.auth.uid
+        && request.resource.data.moderatorName is string
+        && request.resource.data.moderatorName.size() > 0
+        && request.resource.data.moderatorName.size() <= 80
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() > 0
+        && request.resource.data.reason.size() <= 280;
+    }
+
+    function validFileContentType() {
+      return request.resource.data.mimeType.matches('image/(avif|gif|jpeg|png|webp)')
+        || request.resource.data.mimeType.matches('audio/.*')
+        || request.resource.data.mimeType in [
+          'application/pdf',
+          'application/zip',
+          'application/x-zip-compressed',
+          'text/markdown',
+          'text/plain'
+        ];
+    }
+
+    function validFilePayload() {
+      return request.resource.data.keys().hasOnly([
+          "authorId",
+          "chunkCount",
+          "clientCreatedAt",
+          "createdAt",
+          "kind",
+          "mimeType",
+          "name",
+          "size",
+          "type"
+        ])
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.chunkCount is number
+        && request.resource.data.chunkCount > 0
+        && request.resource.data.chunkCount <= 80
+        && request.resource.data.clientCreatedAt is number
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.kind is string
+        && request.resource.data.kind in ["audio", "file", "image"]
+        && request.resource.data.mimeType is string
+        && request.resource.data.mimeType.size() > 0
+        && request.resource.data.mimeType.size() <= 120
+        && validFileContentType()
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 180
+        && request.resource.data.size is number
+        && request.resource.data.size > 0
+        && request.resource.data.size <= 8 * 1024 * 1024
+        && request.resource.data.type is string
+        && request.resource.data.type in ["attachments", "audio"];
+    }
+
+    function validFileChunkPayload() {
+      return request.resource.data.keys().hasOnly([
+          "authorId",
+          "clientCreatedAt",
+          "createdAt",
+          "data",
+          "index",
+          "size"
+        ])
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.clientCreatedAt is number
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.data is string
+        && request.resource.data.data.size() > 0
+        && request.resource.data.data.size() <= 240000
+        && request.resource.data.index is number
+        && request.resource.data.index >= 0
+        && request.resource.data.index < 100
+        && request.resource.data.size is number
+        && request.resource.data.size > 0
+        && request.resource.data.size <= 240000;
+    }
+
     match /rooms/{roomId} {
       allow read: if signedIn();
       allow write: if false;
 
       match /messages/{messageId} {
         allow read: if signedIn();
-        allow create: if signedIn() && validMessagePayload();
+        allow create: if signedIn() && notModerated(roomId) && validMessagePayload();
+        allow update: if false;
+        allow delete: if signedIn();
+      }
+
+      match /reactions/{reactionId} {
+        allow read: if signedIn();
+        allow create: if signedIn() && notModerated(roomId) && validReactionPayload();
+        allow update: if signedIn()
+          && resource.data.authorId == request.auth.uid
+          && notModerated(roomId)
+          && validReactionPayload();
+        allow delete: if signedIn();
+      }
+
+      match /moderation/{authorId} {
+        allow read: if signedIn();
+        allow create, update: if signedIn() && validModerationPayload();
+        allow delete: if signedIn();
+      }
+
+      match /files/{fileId} {
+        allow read: if signedIn();
+        allow create: if signedIn() && validFilePayload();
         allow update, delete: if false;
+
+        match /chunks/{chunkId} {
+          allow read: if signedIn();
+          allow create: if signedIn() && validFileChunkPayload();
+          allow update, delete: if false;
+        }
       }
     }
   }
