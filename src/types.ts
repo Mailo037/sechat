@@ -26,6 +26,12 @@ export type NotificationSettings = {
   uiSound: UiSoundKind
 }
 
+export type SpamGuardState = {
+  strikes: number
+  lastTriggeredAt?: number
+  bannedUntil?: number
+}
+
 export type ChatMessage = {
   id: string
   authorId: AuthorId
@@ -47,6 +53,7 @@ export type PersistedChatState = {
   version: number
   profile: Profile
   notifications: NotificationSettings
+  spamGuard: SpamGuardState
   trustedSites: string[]
   messages: ChatMessage[]
 }

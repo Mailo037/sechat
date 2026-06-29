@@ -22,6 +22,7 @@ import {
   File as FileIcon,
   DotsThreeVertical,
   GlobeSimple,
+  LockKey,
   Microphone,
   Pause,
   Paperclip,
@@ -44,6 +45,7 @@ import { Label } from "@/components/ui/label"
 import { Modal } from "@/components/ui/modal"
 import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
+import { Tooltip } from "@/components/ui/tooltip"
 import {
   getNotificationPermission,
   playNotificationSound,
@@ -63,10 +65,12 @@ import { cn } from "@/lib/utils"
 import type {
   ChatMessage,
   MessageAttachment,
+  MessageType,
   NotificationSettings,
   PersistedChatState,
   Profile,
   SoundKind,
+  SpamGuardState,
   UiSoundKind,
 } from "@/types"
 
@@ -92,11 +96,29 @@ type MessageGroup = {
   authorId: string
   messages: ChatMessage[]
 }
+type SpamSendEntry = {
+  at: number
+  fingerprint: string
+  messageType: MessageType
+}
+type SpamCandidate = {
+  attachmentCount?: number
+  body: string
+  messageType: MessageType
+}
 
 const AUDIO_BAR_COUNT = 44
+const MESSAGE_AUDIO_BAR_COUNT = 28
 const MAX_RECORDING_MS = 120000
 const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
 const MAX_ATTACHMENT_COUNT = 6
+const SPAM_FAST_SEND_MS = 950
+const SPAM_BURST_WINDOW_MS = 9000
+const SPAM_BURST_LIMIT = 5
+const SPAM_DUPLICATE_WINDOW_MS = 30000
+const SPAM_STRIKE_RESET_MS = 120000
+const SPAM_BAN_TRIGGER_COUNT = 3
+const SPAM_BAN_MS = 5 * 60 * 1000
 
 const defaultProfile: Profile = {
   name: "You",
@@ -122,6 +144,10 @@ const defaultNotifications: NotificationSettings = {
   soundKinds: { ...defaultSoundKinds },
   uiSoundsEnabled: true,
   uiSound: "soft",
+}
+
+const defaultSpamGuard: SpamGuardState = {
+  strikes: 0,
 }
 
 const CURRENT_DATA_VERSION = 2
@@ -153,6 +179,7 @@ function createInitialState(): PersistedChatState {
     version: CURRENT_DATA_VERSION,
     profile: defaultProfile,
     notifications: defaultNotifications,
+    spamGuard: defaultSpamGuard,
     trustedSites: [],
     messages: [],
   }
@@ -169,6 +196,7 @@ function normalizeStoredState(stored: PersistedChatState | undefined) {
           ? defaultProfile
           : (stored.profile ?? defaultProfile),
       notifications: normalizeNotifications(stored.notifications),
+      spamGuard: normalizeSpamGuard(stored.spamGuard),
       trustedSites: normalizeTrustedSites(stored.trustedSites),
     }
   }
@@ -180,6 +208,7 @@ function normalizeStoredState(stored: PersistedChatState | undefined) {
         ? defaultProfile
         : (stored.profile ?? defaultProfile),
     notifications: normalizeNotifications(stored.notifications),
+    spamGuard: normalizeSpamGuard(stored.spamGuard),
     trustedSites: normalizeTrustedSites(stored.trustedSites),
     messages: stored.messages.filter((message) => !isLegacyMessage(message)),
   }
@@ -233,6 +262,48 @@ function normalizeTrustedSites(value: unknown) {
   )
 }
 
+function normalizeSpamGuard(value: unknown): SpamGuardState {
+  if (!value || typeof value !== "object") return defaultSpamGuard
+
+  const input = value as Partial<SpamGuardState>
+  const now = Date.now()
+  const bannedUntil =
+    typeof input.bannedUntil === "number" && input.bannedUntil > now
+      ? input.bannedUntil
+      : undefined
+  const lastTriggeredAt =
+    typeof input.lastTriggeredAt === "number" ? input.lastTriggeredAt : undefined
+
+  return {
+    strikes:
+      lastTriggeredAt && now - lastTriggeredAt <= SPAM_STRIKE_RESET_MS
+        ? Math.max(0, Math.min(SPAM_BAN_TRIGGER_COUNT, input.strikes ?? 0))
+        : 0,
+    lastTriggeredAt,
+    bannedUntil,
+  }
+}
+
+function spamFingerprint(candidate: SpamCandidate) {
+  const normalizedBody = candidate.body
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim()
+
+  return [
+    candidate.messageType,
+    normalizedBody || "attachment-only",
+    candidate.attachmentCount ?? 0,
+  ].join(":")
+}
+
+function formatRemainingTime(milliseconds: number) {
+  const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`
+}
+
 function getMessageSoundKind(
   message: ChatMessage,
   messages: ChatMessage[],
@@ -283,8 +354,8 @@ function makeId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
 
-function makeQuietWaveform() {
-  return Array.from({ length: AUDIO_BAR_COUNT }, (_, index) => {
+function makeQuietWaveform(count = AUDIO_BAR_COUNT) {
+  return Array.from({ length: count }, (_, index) => {
     const pulse = index % 7 === 0 ? 0.08 : 0.04
     return 0.08 + pulse
   })
@@ -294,12 +365,22 @@ function clampLevel(value: number) {
   return Math.max(0.04, Math.min(1, value))
 }
 
-function compactWaveform(values: number[]) {
-  const source = values.length > 0 ? values : makeQuietWaveform()
+function compactWaveform(values: number[], targetCount = AUDIO_BAR_COUNT) {
+  const source = values.length > 0 ? values : makeQuietWaveform(targetCount)
   const padded =
-    source.length >= AUDIO_BAR_COUNT
-      ? source.slice(-AUDIO_BAR_COUNT)
-      : [...makeQuietWaveform().slice(0, AUDIO_BAR_COUNT - source.length), ...source]
+    source.length > targetCount
+      ? Array.from({ length: targetCount }, (_, index) => {
+          const start = Math.floor((index * source.length) / targetCount)
+          const end = Math.max(
+            start + 1,
+            Math.floor(((index + 1) * source.length) / targetCount)
+          )
+          const bucket = source.slice(start, end)
+          return bucket.reduce((sum, value) => sum + value, 0) / bucket.length
+        })
+      : source.length === targetCount
+        ? source
+        : [...makeQuietWaveform(targetCount).slice(0, targetCount - source.length), ...source]
 
   return padded.map((value) => Number(clampLevel(value).toFixed(3)))
 }
@@ -331,11 +412,14 @@ function fileToDataUrl(file: File) {
 
 async function fileToAttachment(file: File): Promise<MessageAttachment> {
   const dataUrl = await fileToDataUrl(file)
+  const isImageFile =
+    file.type.startsWith("image/") ||
+    /\.(avif|gif|jpe?g|png|webp)$/i.test(file.name)
 
   return {
     id: makeId("attachment"),
     dataUrl,
-    kind: file.type.startsWith("image/") ? "image" : "file",
+    kind: isImageFile ? "image" : "file",
     mimeType: file.type || "application/octet-stream",
     name: file.name || "Attachment",
     size: file.size,
@@ -386,6 +470,9 @@ function App() {
   const [profile, setProfile] = useState<Profile>(defaultProfile)
   const [notifications, setNotifications] =
     useState<NotificationSettings>(defaultNotifications)
+  const [spamGuard, setSpamGuard] = useState<SpamGuardState>(defaultSpamGuard)
+  const [spamWarning, setSpamWarning] = useState<string | null>(null)
+  const [spamNow, setSpamNow] = useState(Date.now())
   const [trustedSites, setTrustedSites] = useState<string[]>([])
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [authorId, setAuthorId] = useState("me")
@@ -421,6 +508,8 @@ function App() {
   const recordingSessionRef = useRef(0)
   const recordingStartedAtRef = useRef<number | null>(null)
   const sendFlightTimeoutRef = useRef<number | null>(null)
+  const sendHistoryRef = useRef<SpamSendEntry[]>([])
+  const spamWarningTimeoutRef = useRef<number | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const scrollRef = useRef<HTMLDivElement | null>(null)
@@ -440,10 +529,11 @@ function App() {
       version: CURRENT_DATA_VERSION,
       profile,
       notifications,
+      spamGuard,
       trustedSites,
       messages,
     }),
-    [profile, notifications, trustedSites, messages]
+    [profile, notifications, spamGuard, trustedSites, messages]
   )
 
   useEffect(() => {
@@ -454,6 +544,7 @@ function App() {
       const next = normalizeStoredState(stored)
       setProfile(next.profile)
       setNotifications(next.notifications)
+      setSpamGuard(next.spamGuard)
       setTrustedSites(next.trustedSites)
       setMessages(next.messages)
       setReady(true)
@@ -468,6 +559,30 @@ function App() {
     if (!ready) return
     saveChatState(stateForStorage)
   }, [ready, stateForStorage])
+
+  useEffect(() => {
+    const bannedUntil = spamGuard.bannedUntil
+    if (!bannedUntil) return
+
+    setSpamNow(Date.now())
+    const interval = window.setInterval(() => {
+      const now = Date.now()
+      setSpamNow(now)
+
+      if (bannedUntil <= now) {
+        setSpamGuard((current) =>
+          current.bannedUntil && current.bannedUntil <= now
+            ? {
+                strikes: 0,
+                lastTriggeredAt: current.lastTriggeredAt,
+              }
+            : current
+        )
+      }
+    }, 1000)
+
+    return () => window.clearInterval(interval)
+  }, [spamGuard.bannedUntil])
 
   useEffect(() => {
     if (!remoteEnabled) return
@@ -592,6 +707,9 @@ function App() {
       if (sendFlightTimeoutRef.current !== null) {
         window.clearTimeout(sendFlightTimeoutRef.current)
       }
+      if (spamWarningTimeoutRef.current !== null) {
+        window.clearTimeout(spamWarningTimeoutRef.current)
+      }
       clearDiscardTimeout()
       cleanupRecordingResources()
     }
@@ -677,10 +795,153 @@ function App() {
     playUiSound(notifications.uiSound, true)
   }
 
+  function clearSpamWarningTimer() {
+    if (spamWarningTimeoutRef.current !== null) {
+      window.clearTimeout(spamWarningTimeoutRef.current)
+      spamWarningTimeoutRef.current = null
+    }
+  }
+
+  function showSpamFilterWarning(message: string) {
+    clearSpamWarningTimer()
+    setSpamWarning(message)
+    spamWarningTimeoutRef.current = window.setTimeout(() => {
+      setSpamWarning(null)
+      spamWarningTimeoutRef.current = null
+    }, 3800)
+  }
+
+  function registerSpamTrigger(reason: string) {
+    const now = Date.now()
+    const activeStrikes =
+      spamGuard.lastTriggeredAt &&
+      now - spamGuard.lastTriggeredAt <= SPAM_STRIKE_RESET_MS
+        ? spamGuard.strikes
+        : 0
+    const nextStrikes = Math.min(
+      SPAM_BAN_TRIGGER_COUNT,
+      activeStrikes + 1
+    )
+    const bannedUntil =
+      nextStrikes >= SPAM_BAN_TRIGGER_COUNT ? now + SPAM_BAN_MS : undefined
+
+    setSpamGuard({
+      strikes: nextStrikes,
+      lastTriggeredAt: now,
+      bannedUntil,
+    })
+    setSpamNow(now)
+
+    if (bannedUntil) {
+      clearSpamWarningTimer()
+      setSpamWarning(null)
+      playConfirmationSound("click")
+      return
+    }
+
+    const remaining = SPAM_BAN_TRIGGER_COUNT - nextStrikes
+    showSpamFilterWarning(
+      `${reason}. ${remaining} more spam trigger${remaining === 1 ? "" : "s"} will pause sending.`
+    )
+    playConfirmationSound("click")
+  }
+
+  function pruneSendHistory(now: number) {
+    sendHistoryRef.current = sendHistoryRef.current.filter(
+      (entry) => now - entry.at <= SPAM_DUPLICATE_WINDOW_MS
+    )
+    return sendHistoryRef.current
+  }
+
+  function isLowEntropyMessage(body: string) {
+    const compact = body.toLowerCase().replace(/\s+/g, "")
+    if (compact.length < 16) return false
+
+    return new Set(compact).size <= 3
+  }
+
+  function spamViolationFor(candidate: SpamCandidate) {
+    const now = Date.now()
+    const history = pruneSendHistory(now)
+    const fingerprint = spamFingerprint(candidate)
+    const lastSend = history.at(-1)
+
+    if (
+      candidate.messageType === "text" &&
+      candidate.body.trim() &&
+      isLowEntropyMessage(candidate.body)
+    ) {
+      return "That message looks like repeated spam"
+    }
+
+    if (lastSend && now - lastSend.at < SPAM_FAST_SEND_MS) {
+      return "You are sending too quickly"
+    }
+
+    const burstCount = history.filter(
+      (entry) => now - entry.at <= SPAM_BURST_WINDOW_MS
+    ).length
+    if (burstCount >= SPAM_BURST_LIMIT - 1) {
+      return "Too many messages in a short time"
+    }
+
+    const duplicateCount = history.filter(
+      (entry) => entry.fingerprint === fingerprint
+    ).length
+    if (
+      candidate.messageType === "text" &&
+      candidate.body.trim() &&
+      duplicateCount > 0
+    ) {
+      return "Repeated messages are blocked"
+    }
+
+    return null
+  }
+
+  function recordAllowedSend(candidate: SpamCandidate) {
+    const now = Date.now()
+    pruneSendHistory(now)
+    sendHistoryRef.current.push({
+      at: now,
+      fingerprint: spamFingerprint(candidate),
+      messageType: candidate.messageType,
+    })
+  }
+
+  function allowOutgoingMessage(candidate: SpamCandidate) {
+    const now = Date.now()
+
+    if (spamGuard.bannedUntil && spamGuard.bannedUntil > now) {
+      setSpamNow(now)
+      return false
+    }
+
+    const violation = spamViolationFor(candidate)
+    if (violation) {
+      registerSpamTrigger(violation)
+      return false
+    }
+
+    recordAllowedSend(candidate)
+    setSpamWarning(null)
+    return true
+  }
+
   async function sendMessage() {
     const body = draft.trim()
     const attachments = attachmentDrafts
     if (!body && attachments.length === 0) return
+
+    if (
+      !allowOutgoingMessage({
+        attachmentCount: attachments.length,
+        body,
+        messageType: "text",
+      })
+    ) {
+      return
+    }
 
     await unlockAudio()
     triggerSendFlight()
@@ -734,6 +995,15 @@ function App() {
   }
 
   async function sendAudioMessage(draftAudio: AudioDraft) {
+    if (
+      !allowOutgoingMessage({
+        body: "Voice message",
+        messageType: "audio",
+      })
+    ) {
+      return false
+    }
+
     await unlockAudio()
     playConfirmationSound()
 
@@ -768,16 +1038,22 @@ function App() {
           waveform: draftAudio.waveform,
         })
         setAuthorId(remoteAuthorId)
-        return
+        return true
       } catch (error) {
         console.warn("Remote audio send failed; keeping message local", error)
       }
     }
 
     setMessages((current) => [...current, sent])
+    return true
   }
 
   async function startRecording() {
+    if (spamGuard.bannedUntil && spamGuard.bannedUntil > Date.now()) {
+      setSpamNow(Date.now())
+      return
+    }
+
     await unlockAudio()
     setRecordingError(null)
 
@@ -868,8 +1144,13 @@ function App() {
       return
     }
 
-    await sendAudioMessage(currentDraft)
-    resetRecording()
+    const sent = await sendAudioMessage(currentDraft)
+    if (sent) {
+      resetRecording()
+      return
+    }
+
+    setRecordingMode("ready")
   }
 
   function discardRecording() {
@@ -1071,6 +1352,11 @@ function App() {
   }
 
   async function handleAttachmentFiles(fileList: FileList | null) {
+    if (spamGuard.bannedUntil && spamGuard.bannedUntil > Date.now()) {
+      setSpamNow(Date.now())
+      return
+    }
+
     const files = Array.from(fileList ?? [])
     if (files.length === 0) return
 
@@ -1135,7 +1421,10 @@ function App() {
   finishRecordingRef.current = finishRecording
   const hasDraft = draft.trim().length > 0 || attachmentDrafts.length > 0
   const showSendAction = hasDraft || sendFlightId !== null
-  const composerError = recordingError ?? attachmentError
+  const spamBannedUntil = spamGuard.bannedUntil ?? 0
+  const isSpamBanned = spamBannedUntil > spamNow
+  const spamRemainingMs = Math.max(0, spamBannedUntil - spamNow)
+  const composerError = recordingError ?? attachmentError ?? spamWarning
 
   return (
     <main className="chat-app">
@@ -1190,174 +1479,180 @@ function App() {
             className={cn("composer", recordingMode !== "idle" && "recording-active")}
             onSubmit={(event) => {
               event.preventDefault()
-              if (recordingMode !== "idle") return
+              if (recordingMode !== "idle" || isSpamBanned) return
               sendMessage()
             }}
           >
-            <input
-              hidden
-              multiple
-              ref={fileInputRef}
-              aria-label="Attachment files"
-              type="file"
-              onChange={(event) => {
-                void handleAttachmentFiles(event.currentTarget.files)
-                event.currentTarget.value = ""
-              }}
-            />
-
-            {composerError ? (
-              <p className="recording-error" role="status">
-                {composerError}
-              </p>
-            ) : null}
-
-            <AnimatePresence initial={false}>
-              {recordingMode === "idle" && attachmentDrafts.length > 0 ? (
-                <motion.div
-                  animate={{ opacity: 1, y: 0 }}
-                  className="attachment-draft-list composer-attachment-shelf"
-                  exit={{ opacity: 0, y: 6, scale: 0.98 }}
-                  initial={reduceMotion ? false : { opacity: 0, y: 8, scale: 0.98 }}
-                  transition={{ duration: 0.16 }}
-                >
-                  {attachmentDrafts.map((attachment) => (
-                    <AttachmentPreview
-                      attachment={attachment}
-                      key={attachment.id}
-                      onRemove={() => removeAttachmentDraft(attachment.id)}
-                    />
-                  ))}
-                </motion.div>
-              ) : null}
-            </AnimatePresence>
-
-            <AnimatePresence mode="wait" initial={false}>
-              {recordingMode === "idle" ? (
-                <motion.div
-                  animate={{ opacity: 1, y: 0 }}
-                  className={cn(
-                    "composer-row",
-                    composerHasMultipleLines && "multiline"
-                  )}
-                  exit={{ opacity: 0, y: 8 }}
-                  initial={reduceMotion ? false : { opacity: 0, y: 8 }}
-                  key="text-composer"
-                  transition={{ duration: 0.16 }}
-                >
-                  <Button
-                    aria-label="Add attachment"
-                    className="composer-plus-button"
-                    size="icon-lg"
-                    title="Add attachment"
-                    type="button"
-                    variant="ghost"
-                    onClick={() => fileInputRef.current?.click()}
-                  >
-                    <Paperclip data-icon="inline-start" />
-                  </Button>
-
-                  <div
-                    className={cn(
-                      "composer-input-shell",
-                      replyTo && "stacked",
-                      composerHasMultipleLines && "multiline"
-                    )}
-                  >
-                    <AnimatePresence initial={false}>
-                      {replyTo ? (
-                        <motion.div
-                          animate={{ opacity: 1, y: 0, scale: 1 }}
-                          className="composer-reply-preview"
-                          exit={{ opacity: 0, y: -6, scale: 0.98 }}
-                          initial={
-                            reduceMotion
-                              ? false
-                              : { opacity: 0, y: 6, scale: 0.98 }
-                          }
-                          transition={{ duration: 0.18 }}
-                        >
-                          <div className="composer-reply-copy">
-                            <strong>
-                              {replyTo.authorId === authorId
-                                ? profile.name
-                                : replyTo.authorName}
-                            </strong>
-                            <span>{messagePreview(replyTo)}</span>
-                          </div>
-                          <Button
-                            aria-label="Cancel reply"
-                            size="icon-sm"
-                            title="Cancel reply"
-                            type="button"
-                            variant="ghost"
-                            onClick={() => setReplyToId(undefined)}
-                          >
-                            <X data-icon="inline-start" />
-                          </Button>
-                        </motion.div>
-                      ) : null}
-                    </AnimatePresence>
-
-                    <div className="composer-input-row">
-                      <Textarea
-                        ref={textareaRef}
-                        aria-label="Message"
-                        className="composer-textarea"
-                        placeholder="Nachricht schreiben"
-                        rows={1}
-                        value={draft}
-                        onChange={(event) => setDraft(event.target.value)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter" && !event.shiftKey) {
-                            event.preventDefault()
-                            sendMessage()
-                          }
-                        }}
-                      />
-                      <Button
-                        aria-label={showSendAction ? "Send message" : "Record audio message"}
-                        className={cn(
-                          "composer-pill-action",
-                          showSendAction && "send-ready"
-                        )}
-                        size="icon"
-                        title={showSendAction ? "Send message" : "Record audio message"}
-                        type={hasDraft ? "submit" : "button"}
-                        variant="ghost"
-                        onClick={hasDraft || sendFlightId ? undefined : startRecording}
-                      >
-                        <span
-                          className={cn(
-                            "icon-motion",
-                            sendFlightId && "send-flight-icon"
-                          )}
-                          key={showSendAction ? `send-${sendFlightId ?? "ready"}` : "record"}
-                        >
-                          {showSendAction ? (
-                            <ArrowUp data-icon="inline-start" weight="bold" />
-                          ) : (
-                            <Microphone data-icon="inline-start" />
-                          )}
-                        </span>
-                      </Button>
-                    </div>
-                  </div>
-                </motion.div>
-              ) : (
-                <RecordingComposer
-                  bars={audioDraft?.waveform ?? audioWaveform}
-                  durationMs={audioDraft?.durationMs ?? recordingElapsedMs}
-                  isDiscarding={recordingMode === "discarding"}
-                  isProcessing={recordingMode === "processing"}
-                  isReady={recordingMode === "ready"}
-                  reduceMotion={Boolean(reduceMotion)}
-                  onDiscard={discardRecording}
-                  onSend={sendRecording}
-                  onStop={finishRecording}
+            {isSpamBanned ? (
+              <SpamBanNotice remainingMs={spamRemainingMs} />
+            ) : (
+              <>
+                <input
+                  hidden
+                  multiple
+                  ref={fileInputRef}
+                  aria-label="Attachment files"
+                  type="file"
+                  onChange={(event) => {
+                    void handleAttachmentFiles(event.currentTarget.files)
+                    event.currentTarget.value = ""
+                  }}
                 />
-              )}
-            </AnimatePresence>
+
+                {composerError ? (
+                  <p className="recording-error" role="status">
+                    {composerError}
+                  </p>
+                ) : null}
+
+                <AnimatePresence initial={false}>
+                  {recordingMode === "idle" && attachmentDrafts.length > 0 ? (
+                    <motion.div
+                      animate={{ opacity: 1, y: 0 }}
+                      className="attachment-draft-list composer-attachment-shelf"
+                      exit={{ opacity: 0, y: 6, scale: 0.98 }}
+                      initial={reduceMotion ? false : { opacity: 0, y: 8, scale: 0.98 }}
+                      transition={{ duration: 0.16 }}
+                    >
+                      {attachmentDrafts.map((attachment) => (
+                        <AttachmentPreview
+                          attachment={attachment}
+                          key={attachment.id}
+                          onRemove={() => removeAttachmentDraft(attachment.id)}
+                        />
+                      ))}
+                    </motion.div>
+                  ) : null}
+                </AnimatePresence>
+
+                <AnimatePresence mode="wait" initial={false}>
+                  {recordingMode === "idle" ? (
+                    <motion.div
+                      animate={{ opacity: 1, y: 0 }}
+                      className={cn(
+                        "composer-row",
+                        composerHasMultipleLines && "multiline"
+                      )}
+                      exit={{ opacity: 0, y: 8 }}
+                      initial={reduceMotion ? false : { opacity: 0, y: 8 }}
+                      key="text-composer"
+                      transition={{ duration: 0.16 }}
+                    >
+                      <Button
+                        aria-label="Add attachment"
+                        className="composer-plus-button"
+                        size="icon-lg"
+                        title="Add attachment"
+                        type="button"
+                        variant="ghost"
+                        onClick={() => fileInputRef.current?.click()}
+                      >
+                        <Paperclip data-icon="inline-start" />
+                      </Button>
+
+                      <div
+                        className={cn(
+                          "composer-input-shell",
+                          replyTo && "stacked",
+                          composerHasMultipleLines && "multiline"
+                        )}
+                      >
+                        <AnimatePresence initial={false}>
+                          {replyTo ? (
+                            <motion.div
+                              animate={{ opacity: 1, y: 0, scale: 1 }}
+                              className="composer-reply-preview"
+                              exit={{ opacity: 0, y: -6, scale: 0.98 }}
+                              initial={
+                                reduceMotion
+                                  ? false
+                                  : { opacity: 0, y: 6, scale: 0.98 }
+                              }
+                              transition={{ duration: 0.18 }}
+                            >
+                              <div className="composer-reply-copy">
+                                <strong>
+                                  {replyTo.authorId === authorId
+                                    ? profile.name
+                                    : replyTo.authorName}
+                                </strong>
+                                <span>{messagePreview(replyTo)}</span>
+                              </div>
+                              <Button
+                                aria-label="Cancel reply"
+                                size="icon-sm"
+                                title="Cancel reply"
+                                type="button"
+                                variant="ghost"
+                                onClick={() => setReplyToId(undefined)}
+                              >
+                                <X data-icon="inline-start" />
+                              </Button>
+                            </motion.div>
+                          ) : null}
+                        </AnimatePresence>
+
+                        <div className="composer-input-row">
+                          <Textarea
+                            ref={textareaRef}
+                            aria-label="Message"
+                            className="composer-textarea"
+                            placeholder="Nachricht schreiben"
+                            rows={1}
+                            value={draft}
+                            onChange={(event) => setDraft(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" && !event.shiftKey) {
+                                event.preventDefault()
+                                sendMessage()
+                              }
+                            }}
+                          />
+                          <Button
+                            aria-label={showSendAction ? "Send message" : "Record audio message"}
+                            className={cn(
+                              "composer-pill-action",
+                              showSendAction && "send-ready"
+                            )}
+                            size="icon"
+                            title={showSendAction ? "Send message" : "Record audio message"}
+                            type={hasDraft ? "submit" : "button"}
+                            variant="ghost"
+                            onClick={hasDraft || sendFlightId ? undefined : startRecording}
+                          >
+                            <span
+                              className={cn(
+                                "icon-motion",
+                                sendFlightId && "send-flight-icon"
+                              )}
+                              key={showSendAction ? `send-${sendFlightId ?? "ready"}` : "record"}
+                            >
+                              {showSendAction ? (
+                                <ArrowUp data-icon="inline-start" weight="bold" />
+                              ) : (
+                                <Microphone data-icon="inline-start" />
+                              )}
+                            </span>
+                          </Button>
+                        </div>
+                      </div>
+                    </motion.div>
+                  ) : (
+                    <RecordingComposer
+                      bars={audioDraft?.waveform ?? audioWaveform}
+                      durationMs={audioDraft?.durationMs ?? recordingElapsedMs}
+                      isDiscarding={recordingMode === "discarding"}
+                      isProcessing={recordingMode === "processing"}
+                      isReady={recordingMode === "ready"}
+                      reduceMotion={Boolean(reduceMotion)}
+                      onDiscard={discardRecording}
+                      onSend={sendRecording}
+                      onStop={finishRecording}
+                    />
+                  )}
+                </AnimatePresence>
+              </>
+            )}
           </form>
         </section>
 
@@ -1373,6 +1668,29 @@ function App() {
         </AnimatePresence>
       </div>
     </main>
+  )
+}
+
+function SpamBanNotice({ remainingMs }: { remainingMs: number }) {
+  return (
+    <motion.div
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      aria-live="polite"
+      className="spam-ban-card"
+      initial={{ opacity: 0, y: 10, scale: 0.98 }}
+      role="status"
+      transition={{ duration: 0.18 }}
+    >
+      <div className="spam-ban-title">
+        <LockKey weight="bold" />
+        <strong>Sechat paused this chat.</strong>
+      </div>
+      <p>
+        Sending is temporarily disabled because the spam filter was triggered
+        multiple times. You can continue in{" "}
+        <span>{formatRemainingTime(remainingMs)}</span>.
+      </p>
+    </motion.div>
   )
 }
 
@@ -2365,8 +2683,14 @@ function MessageBubble({
   quote?: ChatMessage
 }) {
   const [actionMenuOpen, setActionMenuOpen] = useState(false)
+  const [actionFeedback, setActionFeedback] = useState<
+    "reply" | "copy" | "download" | null
+  >(null)
+  const [swipeIntent, setSwipeIntent] = useState<"reply" | "copy" | null>(null)
+  const [swipeProgress, setSwipeProgress] = useState(0)
   const bubbleLineRef = useRef<HTMLDivElement | null>(null)
   const longPressTimeoutRef = useRef<number | null>(null)
+  const actionFeedbackTimeoutRef = useRef<number | null>(null)
   const longPressStartRef = useRef<{ x: number; y: number } | null>(null)
   const blockNextClickRef = useRef(false)
   const hasAttachments = Boolean(message.attachments?.length)
@@ -2378,7 +2702,10 @@ function MessageBubble({
   const canCopy = message.messageType !== "audio"
 
   useEffect(() => {
-    return () => clearLongPressTimer()
+    return () => {
+      clearLongPressTimer()
+      clearActionFeedbackTimer()
+    }
   }, [])
 
   useEffect(() => {
@@ -2408,7 +2735,30 @@ function MessageBubble({
     }
   }
 
+  function clearActionFeedbackTimer() {
+    if (actionFeedbackTimeoutRef.current !== null) {
+      window.clearTimeout(actionFeedbackTimeoutRef.current)
+      actionFeedbackTimeoutRef.current = null
+    }
+  }
+
+  function triggerActionFeedback(action: "reply" | "copy" | "download") {
+    clearActionFeedbackTimer()
+    setActionFeedback(action)
+    navigator.vibrate?.(8)
+    actionFeedbackTimeoutRef.current = window.setTimeout(() => {
+      setActionFeedback(null)
+      actionFeedbackTimeoutRef.current = null
+    }, 680)
+  }
+
+  function replyMessage() {
+    triggerActionFeedback("reply")
+    onReply()
+  }
+
   function copyMessage() {
+    triggerActionFeedback("copy")
     navigator.clipboard?.writeText(messagePreview(message)).catch(() => undefined)
   }
 
@@ -2418,13 +2768,21 @@ function MessageBubble({
   }
 
   function replyAndCloseMenu() {
-    onReply()
+    replyMessage()
     setActionMenuOpen(false)
   }
 
   function downloadMessage() {
+    triggerActionFeedback("download")
     downloadItems(downloads)
     setActionMenuOpen(false)
+  }
+
+  function openActionMenu() {
+    setSwipeIntent(null)
+    setSwipeProgress(0)
+    setActionMenuOpen(true)
+    navigator.vibrate?.(12)
   }
 
   function blockSyntheticClick() {
@@ -2446,9 +2804,9 @@ function MessageBubble({
     clearLongPressTimer()
     longPressStartRef.current = { x: event.clientX, y: event.clientY }
     longPressTimeoutRef.current = window.setTimeout(() => {
-      setActionMenuOpen(true)
+      openActionMenu()
       blockSyntheticClick()
-    }, 460)
+    }, 360)
   }
 
   function handleLongPressMove(event: ReactPointerEvent<HTMLDivElement>) {
@@ -2456,7 +2814,7 @@ function MessageBubble({
     if (!start) return
 
     const distance = Math.hypot(event.clientX - start.x, event.clientY - start.y)
-    if (distance > 10) {
+    if (distance > 24) {
       clearLongPressTimer()
     }
   }
@@ -2483,17 +2841,50 @@ function MessageBubble({
     if (!mobileReplyGesture || shouldIgnoreLongPress(event.target)) return
 
     event.preventDefault()
-    setActionMenuOpen(true)
+    openActionMenu()
+  }
+
+  function updateSwipeHint(offsetX: number) {
+    if (!mobileReplyGesture) return
+
+    const progress = Math.min(1, Math.abs(offsetX) / 46)
+    setSwipeProgress(progress)
+
+    if (offsetX > 10) {
+      setSwipeIntent("reply")
+      return
+    }
+
+    if (canCopy && offsetX < -10) {
+      setSwipeIntent("copy")
+      return
+    }
+
+    setSwipeIntent(null)
+  }
+
+  function handleDragStart() {
+    clearLongPressTimer()
+    setActionMenuOpen(false)
+  }
+
+  function handleDrag(
+    _event: MouseEvent | TouchEvent | PointerEvent,
+    info: { offset: { x: number } }
+  ) {
+    updateSwipeHint(info.offset.x)
   }
 
   function handleDragEnd(
     _event: MouseEvent | TouchEvent | PointerEvent,
     info: { offset: { x: number }; velocity: { x: number } }
   ) {
+    setSwipeIntent(null)
+    setSwipeProgress(0)
     if (!mobileReplyGesture) return
 
     if (info.offset.x > 46 || info.velocity.x > 620) {
-      onReply()
+      replyMessage()
       return
     }
 
@@ -2520,12 +2911,30 @@ function MessageBubble({
       whileDrag={mobileReplyGesture ? { scale: 0.99 } : undefined}
       onClickCapture={handleClickCapture}
       onContextMenu={handleContextMenu}
+      onDrag={handleDrag}
       onDragEnd={handleDragEnd}
+      onDragStart={handleDragStart}
       onPointerCancel={handleLongPressEnd}
       onPointerDown={handleLongPressStart}
       onPointerMove={handleLongPressMove}
       onPointerUp={handleLongPressEnd}
     >
+      <div
+        aria-hidden="true"
+        className="swipe-action-hints"
+        style={{ "--swipe-progress": swipeProgress.toFixed(3) } as CSSProperties}
+      >
+        <span className={cn("swipe-action-hint reply", swipeIntent === "reply" && "active")}>
+          <ArrowBendUpLeft weight="bold" />
+          Reply
+        </span>
+        {canCopy ? (
+          <span className={cn("swipe-action-hint copy", swipeIntent === "copy" && "active")}>
+            <CopySimple weight="bold" />
+            Copy
+          </span>
+        ) : null}
+      </div>
       <AnimatePresence>
         {actionMenuOpen ? (
           <motion.div
@@ -2582,42 +2991,66 @@ function MessageBubble({
         ) : null}
       </div>
       <div className="message-actions">
-        <button
-          aria-label={`Reply to ${displayName}`}
-          className="message-action reply-action"
-          title={`Reply to ${displayName}`}
-          type="button"
-          onClick={onReply}
+        <Tooltip
+          content={`Reply to ${displayName}`}
+          side="top"
+          tooltipClassName="chat-tooltip"
         >
-          <span className="icon-motion">
-            <ArrowBendUpLeft weight="bold" />
-          </span>
-        </button>
-        {canCopy ? (
           <button
-            aria-label="Copy message"
-            className="message-action copy-action"
-            title="Copy message"
+            aria-label={`Reply to ${displayName}`}
+            className={cn(
+              "message-action reply-action",
+              actionFeedback === "reply" && "is-confirming"
+            )}
             type="button"
-            onClick={copyMessage}
+            onClick={replyMessage}
           >
             <span className="icon-motion">
-              <CopySimple weight="bold" />
+              <ArrowBendUpLeft weight="bold" />
             </span>
           </button>
+        </Tooltip>
+        {canCopy ? (
+          <Tooltip
+            content="Copy message"
+            side="top"
+            tooltipClassName="chat-tooltip"
+          >
+            <button
+              aria-label="Copy message"
+              className={cn(
+                "message-action copy-action",
+                actionFeedback === "copy" && "is-confirming"
+              )}
+              type="button"
+              onClick={copyMessage}
+            >
+              <span className="icon-motion">
+                <CopySimple weight="bold" />
+              </span>
+            </button>
+          </Tooltip>
         ) : null}
         {canDownload ? (
-          <button
-            aria-label="Download message media"
-            className="message-action download-action"
-            title="Download message media"
-            type="button"
-            onClick={downloadMessage}
+          <Tooltip
+            content="Download"
+            side="top"
+            tooltipClassName="chat-tooltip"
           >
-            <span className="icon-motion">
-              <DownloadSimple weight="bold" />
-            </span>
-          </button>
+            <button
+              aria-label="Download message media"
+              className={cn(
+                "message-action download-action",
+                actionFeedback === "download" && "is-confirming"
+              )}
+              type="button"
+              onClick={downloadMessage}
+            >
+              <span className="icon-motion">
+                <DownloadSimple weight="bold" />
+              </span>
+            </button>
+          </Tooltip>
         ) : null}
       </div>
     </motion.div>
@@ -2651,9 +3084,11 @@ function AudioMessagePlayer({
   const [playing, setPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [durationSeconds, setDurationSeconds] = useState(durationMs / 1000)
+  const [volume, setVolume] = useState(1)
+  const [volumeMenuOpen, setVolumeMenuOpen] = useState(false)
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const progressFrameRef = useRef<number | null>(null)
-  const bars = compactWaveform(waveform)
+  const bars = compactWaveform(waveform, MESSAGE_AUDIO_BAR_COUNT)
   const progress =
     durationSeconds > 0 ? Math.min(1, currentTime / durationSeconds) : 0
 
@@ -2690,6 +3125,12 @@ function AudioMessagePlayer({
     }
   }, [playing])
 
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.volume = volume
+    }
+  }, [volume])
+
   function togglePlayback() {
     const audio = audioRef.current
     if (!audio) return
@@ -2721,6 +3162,10 @@ function AudioMessagePlayer({
     }
   }
 
+  function updateVolume(nextVolume: number) {
+    setVolume(Math.max(0, Math.min(1, nextVolume)))
+  }
+
   return (
     <div className={cn("audio-message", playing && "playing")}>
       <audio
@@ -2749,6 +3194,7 @@ function AudioMessagePlayer({
         interactive
         ariaLabel={ariaLabel}
         bars={bars}
+        barCount={MESSAGE_AUDIO_BAR_COUNT}
         className="message-waveform"
         progress={progress}
         onSeek={seekAudio}
@@ -2756,12 +3202,53 @@ function AudioMessagePlayer({
       <span className="audio-duration">
         {formatDuration((currentTime > 0 ? currentTime : durationSeconds) * 1000)}
       </span>
+      <div className="audio-volume-menu">
+        <button
+          aria-expanded={volumeMenuOpen}
+          aria-label="Adjust volume"
+          className="audio-volume-button"
+          title="Adjust volume"
+          type="button"
+          onClick={() => setVolumeMenuOpen((open) => !open)}
+        >
+          {volume <= 0.02 ? (
+            <SpeakerSlash weight="bold" />
+          ) : (
+            <SpeakerHigh weight="bold" />
+          )}
+        </button>
+        <AnimatePresence>
+          {volumeMenuOpen ? (
+            <motion.label
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              className="audio-volume-popover"
+              exit={{ opacity: 0, y: 4, scale: 0.96 }}
+              initial={{ opacity: 0, y: 4, scale: 0.96 }}
+              transition={{ duration: 0.14 }}
+            >
+              <span>Volume</span>
+              <input
+                aria-label="Volume"
+                max="1"
+                min="0"
+                step="0.05"
+                type="range"
+                value={volume}
+                onChange={(event) =>
+                  updateVolume(Number(event.currentTarget.value))
+                }
+              />
+            </motion.label>
+          ) : null}
+        </AnimatePresence>
+      </div>
     </div>
   )
 }
 
 function AudioWaveform({
   ariaLabel,
+  barCount = AUDIO_BAR_COUNT,
   bars,
   className,
   interactive = false,
@@ -2769,13 +3256,14 @@ function AudioWaveform({
   onSeek,
 }: {
   ariaLabel?: string
+  barCount?: number
   bars: number[]
   className?: string
   interactive?: boolean
   progress?: number
   onSeek?: (progress: number) => void
 }) {
-  const compactBars = compactWaveform(bars)
+  const compactBars = compactWaveform(bars, barCount)
   const safeProgress = Math.max(0, Math.min(1, progress))
   const playedBarPosition = safeProgress * compactBars.length
 
