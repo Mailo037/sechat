@@ -1,0 +1,68 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function validMessagePayload() {
+      return request.resource.data.keys().hasOnly([
+          "authorId",
+          "authorName",
+          "audioDurationMs",
+          "audioMimeType",
+          "audioUrl",
+          "attachments",
+          "avatar",
+          "body",
+          "clientCreatedAt",
+          "createdAt",
+          "messageType",
+          "replyToId",
+          "soundKind",
+          "waveform"
+        ])
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.authorName is string
+        && request.resource.data.authorName.size() > 0
+        && request.resource.data.authorName.size() <= 80
+        && request.resource.data.body is string
+        && request.resource.data.body.size() <= 4000
+        && request.resource.data.messageType is string
+        && request.resource.data.messageType in ["text", "audio"]
+        && request.resource.data.attachments is list
+        && request.resource.data.attachments.size() <= 6
+        && (
+          request.resource.data.body.size() > 0
+          || request.resource.data.attachments.size() > 0
+          || request.resource.data.messageType == "audio"
+        )
+        && request.resource.data.audioUrl is string
+        && request.resource.data.audioUrl.size() <= 800000
+        && request.resource.data.audioMimeType is string
+        && request.resource.data.audioMimeType.size() <= 80
+        && request.resource.data.audioDurationMs is number
+        && request.resource.data.audioDurationMs >= 0
+        && request.resource.data.audioDurationMs <= 120000
+        && request.resource.data.clientCreatedAt is number
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.avatar is string
+        && request.resource.data.replyToId is string
+        && request.resource.data.soundKind is string
+        && request.resource.data.waveform is list
+        && request.resource.data.waveform.size() <= 80;
+    }
+
+    match /rooms/{roomId} {
+      allow read: if signedIn();
+      allow write: if false;
+
+      match /messages/{messageId} {
+        allow read: if signedIn();
+        allow create: if signedIn() && validMessagePayload();
+        allow update, delete: if false;
+      }
+    }
+  }
+}
