@@ -1,4 +1,12 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react"
 import { AnimatePresence, motion, useReducedMotion } from "motion/react"
 import {
   ArrowBendUpLeft,
@@ -10,6 +18,7 @@ import {
   BellSlash,
   Camera,
   CopySimple,
+  DownloadSimple,
   File as FileIcon,
   DotsThreeVertical,
   GlobeSimple,
@@ -73,6 +82,10 @@ type AudioDraft = {
   mimeType: string
   durationMs: number
   waveform: number[]
+}
+type DownloadItem = {
+  filename: string
+  url: string
 }
 type MessageGroup = {
   id: string
@@ -2040,37 +2053,155 @@ function AttachmentPreview({
   )
 }
 
+function sanitizeFileName(name: string) {
+  const withoutControlChars = Array.from(name.trim(), (character) =>
+    character.charCodeAt(0) < 32 ? "-" : character
+  ).join("")
+  const safeName = withoutControlChars.replace(/[<>:"/\\|?*]/g, "-")
+  return safeName || "download"
+}
+
+function extensionFromMime(mimeType?: string) {
+  if (!mimeType) return "webm"
+
+  const cleanMime = mimeType.split(";")[0]?.trim().toLowerCase()
+  const knownExtensions: Record<string, string> = {
+    "audio/aac": "aac",
+    "audio/mp4": "m4a",
+    "audio/mpeg": "mp3",
+    "audio/ogg": "ogg",
+    "audio/wav": "wav",
+    "audio/webm": "webm",
+    "image/gif": "gif",
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+  }
+
+  return (
+    knownExtensions[cleanMime] ??
+    cleanMime.split("/")[1]?.replace("+xml", "") ??
+    "file"
+  )
+}
+
+function downloadUrl(url: string, filename: string) {
+  const anchor = document.createElement("a")
+  anchor.href = url
+  anchor.download = sanitizeFileName(filename)
+  anchor.rel = "noreferrer"
+  document.body.append(anchor)
+  anchor.click()
+  anchor.remove()
+}
+
+function downloadAttachment(attachment: MessageAttachment) {
+  downloadUrl(attachment.dataUrl, attachment.name)
+}
+
+function isAudioAttachment(attachment: MessageAttachment) {
+  return attachment.mimeType.toLowerCase().startsWith("audio/")
+}
+
+function getMessageDownloads(message: ChatMessage): DownloadItem[] {
+  const downloads: DownloadItem[] = []
+
+  if (message.messageType === "audio" && message.audioUrl) {
+    const createdAt = Number.isFinite(message.createdAt)
+      ? new Date(message.createdAt).toISOString().replace(/[:.]/g, "-")
+      : "audio"
+    downloads.push({
+      filename: `voice-message-${createdAt}.${extensionFromMime(message.audioMimeType)}`,
+      url: message.audioUrl,
+    })
+  }
+
+  message.attachments?.forEach((attachment) => {
+    downloads.push({
+      filename: attachment.name,
+      url: attachment.dataUrl,
+    })
+  })
+
+  return downloads
+}
+
+function downloadItems(items: DownloadItem[]) {
+  items.forEach((item) => downloadUrl(item.url, item.filename))
+}
+
+function shouldIgnoreLongPress(target: EventTarget | null) {
+  return (
+    target instanceof Element &&
+    Boolean(
+      target.closest("button, input, textarea, select, [data-ignore-long-press]")
+    )
+  )
+}
+
 function MessageAttachments({ attachments }: { attachments?: MessageAttachment[] }) {
   if (!attachments?.length) return null
 
   return (
     <div className="message-attachments">
-      {attachments.map((attachment) =>
-        attachment.kind === "image" ? (
-          <a
-            className="message-image-attachment"
-            href={attachment.dataUrl}
-            key={attachment.id}
-            rel="noreferrer"
-            target="_blank"
-          >
-            <img alt={attachment.name} src={attachment.dataUrl} />
-          </a>
-        ) : (
-          <a
-            className="message-file-attachment"
-            download={attachment.name}
-            href={attachment.dataUrl}
-            key={attachment.id}
-          >
-            <FileIcon weight="duotone" />
-            <span>
-              <strong>{attachment.name}</strong>
-              <small>{formatFileSize(attachment.size)}</small>
-            </span>
-          </a>
+      {attachments.map((attachment) => {
+        if (attachment.kind === "image") {
+          return (
+            <div className="message-image-attachment" key={attachment.id}>
+              <a href={attachment.dataUrl} rel="noreferrer" target="_blank">
+                <img alt={attachment.name} src={attachment.dataUrl} />
+              </a>
+              <button
+                aria-label={`Download ${attachment.name}`}
+                className="attachment-download-button"
+                title={`Download ${attachment.name}`}
+                type="button"
+                onClick={() => downloadAttachment(attachment)}
+              >
+                <DownloadSimple weight="bold" />
+              </button>
+            </div>
+          )
+        }
+
+        if (isAudioAttachment(attachment)) {
+          return (
+            <div className="message-audio-attachment bubble" key={attachment.id}>
+              <div className="bubble-inner">
+                <AudioMessagePlayer
+                  ariaLabel={`${attachment.name} progress`}
+                  source={attachment.dataUrl}
+                />
+              </div>
+            </div>
+          )
+        }
+
+        return (
+          <div className="message-file-attachment" key={attachment.id}>
+            <a
+              className="message-file-link"
+              download={attachment.name}
+              href={attachment.dataUrl}
+            >
+              <FileIcon weight="duotone" />
+              <span>
+                <strong>{attachment.name}</strong>
+                <small>{formatFileSize(attachment.size)}</small>
+              </span>
+            </a>
+            <button
+              aria-label={`Download ${attachment.name}`}
+              className="attachment-download-button inline"
+              title={`Download ${attachment.name}`}
+              type="button"
+              onClick={() => downloadAttachment(attachment)}
+            >
+              <DownloadSimple weight="bold" />
+            </button>
+          </div>
         )
-      )}
+      })}
     </div>
   )
 }
@@ -2233,13 +2364,126 @@ function MessageBubble({
   profile: Profile
   quote?: ChatMessage
 }) {
+  const [actionMenuOpen, setActionMenuOpen] = useState(false)
+  const bubbleLineRef = useRef<HTMLDivElement | null>(null)
+  const longPressTimeoutRef = useRef<number | null>(null)
+  const longPressStartRef = useRef<{ x: number; y: number } | null>(null)
+  const blockNextClickRef = useRef(false)
   const hasAttachments = Boolean(message.attachments?.length)
   const hasText = message.body.trim().length > 0
   const showTextBubble =
     message.messageType === "audio" || Boolean(quote) || hasText
+  const downloads = getMessageDownloads(message)
+  const canDownload = downloads.length > 0
+  const canCopy = message.messageType !== "audio"
+
+  useEffect(() => {
+    return () => clearLongPressTimer()
+  }, [])
+
+  useEffect(() => {
+    if (!actionMenuOpen) return
+
+    function closeFromOutside(event: globalThis.PointerEvent) {
+      if (
+        event.target instanceof Node &&
+        bubbleLineRef.current?.contains(event.target)
+      ) {
+        return
+      }
+
+      setActionMenuOpen(false)
+    }
+
+    document.addEventListener("pointerdown", closeFromOutside, true)
+    return () => {
+      document.removeEventListener("pointerdown", closeFromOutside, true)
+    }
+  }, [actionMenuOpen])
+
+  function clearLongPressTimer() {
+    if (longPressTimeoutRef.current !== null) {
+      window.clearTimeout(longPressTimeoutRef.current)
+      longPressTimeoutRef.current = null
+    }
+  }
 
   function copyMessage() {
     navigator.clipboard?.writeText(messagePreview(message)).catch(() => undefined)
+  }
+
+  function copyAndCloseMenu() {
+    copyMessage()
+    setActionMenuOpen(false)
+  }
+
+  function replyAndCloseMenu() {
+    onReply()
+    setActionMenuOpen(false)
+  }
+
+  function downloadMessage() {
+    downloadItems(downloads)
+    setActionMenuOpen(false)
+  }
+
+  function blockSyntheticClick() {
+    blockNextClickRef.current = true
+    window.setTimeout(() => {
+      blockNextClickRef.current = false
+    }, 450)
+  }
+
+  function handleLongPressStart(event: ReactPointerEvent<HTMLDivElement>) {
+    if (
+      !mobileReplyGesture ||
+      event.pointerType === "mouse" ||
+      shouldIgnoreLongPress(event.target)
+    ) {
+      return
+    }
+
+    clearLongPressTimer()
+    longPressStartRef.current = { x: event.clientX, y: event.clientY }
+    longPressTimeoutRef.current = window.setTimeout(() => {
+      setActionMenuOpen(true)
+      blockSyntheticClick()
+    }, 460)
+  }
+
+  function handleLongPressMove(event: ReactPointerEvent<HTMLDivElement>) {
+    const start = longPressStartRef.current
+    if (!start) return
+
+    const distance = Math.hypot(event.clientX - start.x, event.clientY - start.y)
+    if (distance > 10) {
+      clearLongPressTimer()
+    }
+  }
+
+  function handleLongPressEnd() {
+    clearLongPressTimer()
+    longPressStartRef.current = null
+  }
+
+  function handleClickCapture(event: ReactMouseEvent<HTMLDivElement>) {
+    if (!blockNextClickRef.current) return
+
+    const target = event.target
+    if (target instanceof Element && target.closest(".message-action-menu")) {
+      return
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+    blockNextClickRef.current = false
+  }
+
+  function handleContextMenu(event: ReactMouseEvent<HTMLDivElement>) {
+    if (!mobileReplyGesture || shouldIgnoreLongPress(event.target)) return
+
+    event.preventDefault()
+    setActionMenuOpen(true)
   }
 
   function handleDragEnd(
@@ -2253,13 +2497,14 @@ function MessageBubble({
       return
     }
 
-    if (info.offset.x < -46 || info.velocity.x < -620) {
+    if (canCopy && (info.offset.x < -46 || info.velocity.x < -620)) {
       copyMessage()
     }
   }
 
   return (
     <motion.div
+      ref={bubbleLineRef}
       className={cn(
         "bubble-line",
         message.messageType === "audio" && "audio-bubble",
@@ -2273,8 +2518,42 @@ function MessageBubble({
       dragSnapToOrigin={mobileReplyGesture}
       dragTransition={{ bounceDamping: 30, bounceStiffness: 520 }}
       whileDrag={mobileReplyGesture ? { scale: 0.99 } : undefined}
+      onClickCapture={handleClickCapture}
+      onContextMenu={handleContextMenu}
       onDragEnd={handleDragEnd}
+      onPointerCancel={handleLongPressEnd}
+      onPointerDown={handleLongPressStart}
+      onPointerMove={handleLongPressMove}
+      onPointerUp={handleLongPressEnd}
     >
+      <AnimatePresence>
+        {actionMenuOpen ? (
+          <motion.div
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            className="message-action-menu"
+            exit={{ opacity: 0, y: 4, scale: 0.96 }}
+            initial={{ opacity: 0, y: 4, scale: 0.96 }}
+            transition={{ duration: 0.14 }}
+          >
+            <button type="button" onClick={replyAndCloseMenu}>
+              <ArrowBendUpLeft weight="bold" />
+              Reply
+            </button>
+            {canCopy ? (
+              <button type="button" onClick={copyAndCloseMenu}>
+                <CopySimple weight="bold" />
+                Copy
+              </button>
+            ) : null}
+            {canDownload ? (
+              <button type="button" onClick={downloadMessage}>
+                <DownloadSimple weight="bold" />
+                Download
+              </button>
+            ) : null}
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
       <div className="bubble-stack">
         {message.messageType !== "audio" && hasAttachments ? (
           <MessageAttachments attachments={message.attachments} />
@@ -2305,7 +2584,7 @@ function MessageBubble({
       <div className="message-actions">
         <button
           aria-label={`Reply to ${displayName}`}
-          className="message-action"
+          className="message-action reply-action"
           title={`Reply to ${displayName}`}
           type="button"
           onClick={onReply}
@@ -2314,31 +2593,67 @@ function MessageBubble({
             <ArrowBendUpLeft weight="bold" />
           </span>
         </button>
-        <button
-          aria-label="Copy message"
-          className="message-action"
-          title="Copy message"
-          type="button"
-          onClick={copyMessage}
-        >
-          <span className="icon-motion">
-            <CopySimple weight="bold" />
-          </span>
-        </button>
+        {canCopy ? (
+          <button
+            aria-label="Copy message"
+            className="message-action copy-action"
+            title="Copy message"
+            type="button"
+            onClick={copyMessage}
+          >
+            <span className="icon-motion">
+              <CopySimple weight="bold" />
+            </span>
+          </button>
+        ) : null}
+        {canDownload ? (
+          <button
+            aria-label="Download message media"
+            className="message-action download-action"
+            title="Download message media"
+            type="button"
+            onClick={downloadMessage}
+          >
+            <span className="icon-motion">
+              <DownloadSimple weight="bold" />
+            </span>
+          </button>
+        ) : null}
       </div>
     </motion.div>
   )
 }
 
 function AudioMessage({ message }: { message: ChatMessage }) {
+  if (!message.audioUrl) return null
+
+  return (
+    <AudioMessagePlayer
+      ariaLabel="Voice message progress"
+      durationMs={message.audioDurationMs}
+      source={message.audioUrl}
+      waveform={message.waveform}
+    />
+  )
+}
+
+function AudioMessagePlayer({
+  ariaLabel,
+  durationMs = 0,
+  source,
+  waveform = [],
+}: {
+  ariaLabel: string
+  durationMs?: number
+  source: string
+  waveform?: number[]
+}) {
   const [playing, setPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
-  const [durationSeconds, setDurationSeconds] = useState(
-    (message.audioDurationMs ?? 0) / 1000
-  )
+  const [durationSeconds, setDurationSeconds] = useState(durationMs / 1000)
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const progressFrameRef = useRef<number | null>(null)
-  const bars = compactWaveform(message.waveform ?? [])
+  const bars = compactWaveform(waveform)
   const progress =
     durationSeconds > 0 ? Math.min(1, currentTime / durationSeconds) : 0
 
@@ -2411,7 +2726,7 @@ function AudioMessage({ message }: { message: ChatMessage }) {
       <audio
         ref={audioRef}
         preload="metadata"
-        src={message.audioUrl}
+        src={source}
         onDurationChange={updateAudioProgress}
         onEnded={() => {
           setPlaying(false)
@@ -2432,7 +2747,7 @@ function AudioMessage({ message }: { message: ChatMessage }) {
       </button>
       <AudioWaveform
         interactive
-        ariaLabel="Voice message progress"
+        ariaLabel={ariaLabel}
         bars={bars}
         className="message-waveform"
         progress={progress}

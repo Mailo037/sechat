@@ -140,6 +140,7 @@ body,
 }
 
 .bubble-line {
+  position: relative;
   display: flex;
   min-width: 0;
   max-width: min(72%, 610px);
@@ -153,6 +154,8 @@ body,
 
 .bubble-line.swipe-reply {
   touch-action: pan-y;
+  -webkit-user-select: none;
+  user-select: none;
   will-change: transform;
 }
 
@@ -253,6 +256,7 @@ body,
 }
 
 .message-image-attachment {
+  position: relative;
   display: block;
   overflow: hidden;
   width: 100%;
@@ -261,6 +265,12 @@ body,
   border-radius: 13px;
   background: #202022;
   box-shadow: 0 10px 22px rgba(0, 0, 0, 0.18);
+}
+
+.message-image-attachment a {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 .message-image-attachment img {
@@ -272,7 +282,7 @@ body,
 
 .message-file-attachment {
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) 28px;
   align-items: center;
   min-width: min(250px, 68vw);
   gap: 8px;
@@ -285,7 +295,17 @@ body,
   text-decoration: none;
 }
 
-.message-file-attachment svg {
+.message-file-link {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.message-file-link > svg {
   width: 22px;
   height: 22px;
   justify-self: center;
@@ -312,6 +332,46 @@ body,
 .message-file-attachment small {
   color: #a1a1aa;
   font-size: 0.68rem;
+}
+
+.message-attachments .attachment-download-button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid rgba(212, 212, 216, 0.32);
+  border-radius: 999px;
+  background: rgba(24, 24, 27, 0.84);
+  color: #f4f4f5;
+  cursor: pointer;
+  padding: 0;
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    transform 150ms ease;
+}
+
+.message-image-attachment .attachment-download-button {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.message-file-attachment .attachment-download-button.inline {
+  position: static;
+}
+
+.message-attachments .attachment-download-button:hover {
+  border-color: rgba(244, 244, 245, 0.62);
+  background: rgba(39, 39, 42, 0.96);
+  transform: translateY(-1px);
+}
+
+.message-attachments .attachment-download-button svg {
+  width: 15px;
+  height: 15px;
 }
 
 .external-link {
@@ -377,7 +437,64 @@ body,
   gap: 5px;
 }
 
+.message-action-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 55;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px;
+  border: 1px solid rgba(82, 82, 91, 0.74);
+  border-radius: 999px;
+  background: rgba(24, 24, 27, 0.96);
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.42);
+  transform-origin: bottom left;
+  backdrop-filter: blur(18px) saturate(112%);
+  -webkit-backdrop-filter: blur(18px) saturate(112%);
+}
+
+.message-row.own .message-action-menu {
+  right: 0;
+  left: auto;
+  transform-origin: bottom right;
+}
+
+.message-action-menu button {
+  display: inline-flex;
+  height: 32px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: #f4f4f5;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 720;
+  white-space: nowrap;
+  transition:
+    background 150ms ease,
+    color 150ms ease,
+    transform 150ms ease;
+}
+
+.message-action-menu button:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--accent-blue-strong);
+  transform: translateY(-1px);
+}
+
+.message-action-menu svg {
+  width: 15px;
+  height: 15px;
+}
+
 .message-action {
+  position: relative;
   display: inline-grid;
   width: 30px;
   height: 30px;
@@ -388,12 +505,23 @@ body,
   color: var(--muted);
   cursor: pointer;
   opacity: 0;
+  overflow: hidden;
   transform: translateY(2px) scale(0.92);
   transition:
     opacity 160ms ease,
     transform 180ms cubic-bezier(0.2, 0.9, 0.22, 1),
     color 160ms ease,
     border-color 160ms ease;
+}
+
+.message-action::after {
+  position: absolute;
+  inset: 7px;
+  border-radius: inherit;
+  background: rgba(244, 244, 245, 0.16);
+  content: "";
+  opacity: 0;
+  transform: scale(0.2);
 }
 
 .bubble-line:focus-within .message-action,
@@ -405,6 +533,14 @@ body,
 .message-action:hover {
   border-color: rgba(212, 212, 216, 0.46);
   color: var(--accent-blue-strong);
+}
+
+.message-action:hover::after {
+  animation: action-ripple 520ms ease-out;
+}
+
+.message-action:active {
+  transform: translateY(1px) scale(0.94);
 }
 
 .message-action svg {
@@ -1870,6 +2006,18 @@ body,
   animation: icon-pop 460ms cubic-bezier(0.17, 0.8, 0.25, 1);
 }
 
+.message-action.reply-action:hover .icon-motion {
+  animation: reply-swoop 500ms cubic-bezier(0.17, 0.8, 0.25, 1);
+}
+
+.message-action.copy-action:hover .icon-motion {
+  animation: copy-stack 520ms cubic-bezier(0.17, 0.8, 0.25, 1);
+}
+
+.message-action.download-action:hover .icon-motion {
+  animation: download-drop 520ms cubic-bezier(0.17, 0.8, 0.25, 1);
+}
+
 @keyframes send-arrow-flight {
   0% {
     opacity: 1;
@@ -1894,6 +2042,59 @@ body,
   }
   100% {
     transform: translateY(0) rotate(0deg) scale(1);
+  }
+}
+
+@keyframes reply-swoop {
+  0% {
+    transform: translateX(0) rotate(0deg) scale(1);
+  }
+  42% {
+    transform: translateX(-4px) translateY(-2px) rotate(-14deg) scale(1.08);
+  }
+  100% {
+    transform: translateX(0) rotate(0deg) scale(1);
+  }
+}
+
+@keyframes copy-stack {
+  0% {
+    transform: translate(0, 0) scale(1);
+  }
+  36% {
+    transform: translate(2px, -2px) scale(1.08);
+  }
+  68% {
+    transform: translate(-1px, 1px) scale(0.98);
+  }
+  100% {
+    transform: translate(0, 0) scale(1);
+  }
+}
+
+@keyframes download-drop {
+  0% {
+    transform: translateY(-1px) scale(1);
+  }
+  45% {
+    transform: translateY(4px) scale(1.08);
+  }
+  72% {
+    transform: translateY(0) scale(0.94);
+  }
+  100% {
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes action-ripple {
+  0% {
+    opacity: 0.5;
+    transform: scale(0.2);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.9);
   }
 }
 
@@ -2099,7 +2300,11 @@ body,
   .composer-plus-button:hover,
   .composer-pill-action:hover .icon-motion:not(.send-flight-icon),
   .dock-button:hover .icon-motion,
-  .message-action:hover .icon-motion {
+  .message-action:hover .icon-motion,
+  .message-action.reply-action:hover .icon-motion,
+  .message-action.copy-action:hover .icon-motion,
+  .message-action.download-action:hover .icon-motion,
+  .message-action:hover::after {
     animation: none;
   }
 
