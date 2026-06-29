@@ -56,6 +56,14 @@ const uiSoundMap: Record<UiSoundKind, Array<[number, number, number, OscillatorT
     [300, 0, 0.035, "sine"],
     [860, 0.028, 0.07, "triangle"],
   ],
+  mute: [
+    [620, 0, 0.04, "triangle"],
+    [330, 0.045, 0.08, "sine"],
+  ],
+  deafen: [
+    [460, 0, 0.05, "sawtooth"],
+    [240, 0.055, 0.1, "sine"],
+  ],
 }
 
 export function playNotificationSound(kind: SoundKind, enabled: boolean) {
@@ -99,8 +107,8 @@ export function playUiSound(kind: UiSoundKind, enabled: boolean) {
     const now = context.currentTime
     const master = context.createGain()
     master.gain.setValueAtTime(0.0001, now)
-    master.gain.exponentialRampToValueAtTime(0.038, now + 0.008)
-    master.gain.exponentialRampToValueAtTime(0.0001, now + 0.24)
+    master.gain.exponentialRampToValueAtTime(0.074, now + 0.008)
+    master.gain.exponentialRampToValueAtTime(0.0001, now + 0.34)
     master.connect(context.destination)
 
     uiSoundMap[kind].forEach(([frequency, offset, duration, type]) => {
@@ -112,7 +120,7 @@ export function playUiSound(kind: UiSoundKind, enabled: boolean) {
       oscillator.type = type
       oscillator.frequency.setValueAtTime(frequency, start)
       gain.gain.setValueAtTime(0.0001, start)
-      gain.gain.exponentialRampToValueAtTime(0.42, start + 0.006)
+      gain.gain.exponentialRampToValueAtTime(0.58, start + 0.006)
       gain.gain.exponentialRampToValueAtTime(0.0001, end)
       oscillator.connect(gain)
       gain.connect(master)
@@ -147,11 +155,24 @@ export function showBrowserNotification(message: ChatMessage, enabled: boolean) 
 
   try {
     new Notification(title, {
-      body: message.body,
+      body: browserNotificationBody(message),
+      icon: "/android-chrome-192x192.png",
       silent: true,
       tag: message.id,
     })
   } catch {
     // Some browsers restrict notifications by context.
   }
+}
+
+function browserNotificationBody(message: ChatMessage) {
+  if (message.body.trim()) return message.body
+  if (message.messageType === "audio") return "Voice message"
+
+  const firstAttachment = message.attachments?.[0]
+  if (!firstAttachment) return "New message"
+
+  if (firstAttachment.kind === "image") return firstAttachment.name || "Photo"
+  if (firstAttachment.kind === "video") return firstAttachment.name || "Video"
+  return firstAttachment.name || "File"
 }

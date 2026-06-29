@@ -282,6 +282,11 @@ const uiSoundOptions: Array<{ kind: UiSoundKind; label: string }> = [
   { kind: "pop", label: "Pop" },
 ]
 
+const uiCuePreviewOptions: Array<{ kind: UiSoundKind; label: string }> = [
+  { kind: "mute", label: "Mute" },
+  { kind: "deafen", label: "Deafen" },
+]
+
 const defaultNotifications: NotificationSettings = {
   browserEnabled: false,
   soundsEnabled: true,
@@ -953,6 +958,11 @@ function useMediaQuery(query: string) {
   return matches
 }
 
+function shouldShowBrowserNotification() {
+  if (typeof document === "undefined") return false
+  return document.hidden || !document.hasFocus()
+}
+
 function App() {
   const reduceMotion = useReducedMotion()
   const [ready, setReady] = useState(false)
@@ -1470,11 +1480,15 @@ function App() {
       const kind = getMessageSoundKind(message, messages, authorId, profile.name)
       const soundEnabled =
         notifications.soundsEnabled && notifications.soundKinds[kind]
+      const browserEnabled =
+        notifications.browserEnabled &&
+        notifications.soundKinds[kind] &&
+        shouldShowBrowserNotification()
 
       playNotificationSound(kind, soundEnabled)
       showBrowserNotification(
         { ...message, soundKind: kind },
-        notifications.browserEnabled
+        browserEnabled
       )
     })
   }, [authorId, messages, notifications, profile.name, ready])
@@ -1605,6 +1619,15 @@ function App() {
   function previewUiSound() {
     unlockAudio()
     playUiSound(notifications.uiSound, true)
+  }
+
+  function previewUiCue(kind: UiSoundKind) {
+    unlockAudio()
+    playUiSound(kind, true)
+  }
+
+  function playVoiceUiCue(kind: UiSoundKind) {
+    playUiSound(kind, notifications.uiSoundsEnabled)
   }
 
   function clearSpamWarningTimer() {
@@ -2889,6 +2912,7 @@ function App() {
               remoteEnabled={remoteEnabled}
               usernameKey={usernameClaim?.key ?? profileUsernameKey}
               onClose={closeVoiceChat}
+              onUiCue={playVoiceUiCue}
             />
           ) : null}
         </AnimatePresence>
@@ -2969,6 +2993,7 @@ function App() {
           onSoundKindToggle={updateSoundKind}
           onSoundToggle={updateSound}
           onUiSoundKindChange={updateUiSoundKind}
+          onUiCuePreview={previewUiCue}
           onUiSoundPreview={previewUiSound}
           onUiSoundToggle={updateUiSoundToggle}
           onGoogleSignIn={signInWithGoogle}
@@ -3300,6 +3325,7 @@ function VoiceChatStage({
   remoteEnabled,
   usernameKey,
   onClose,
+  onUiCue,
 }: {
   adminUnlocked: boolean
   authorId: string
@@ -3308,6 +3334,7 @@ function VoiceChatStage({
   remoteEnabled: boolean
   usernameKey: string
   onClose: () => void
+  onUiCue: (kind: UiSoundKind) => void
 }) {
   const [connected, setConnected] = useState(false)
   const [muted, setMuted] = useState(false)
@@ -4125,6 +4152,7 @@ function VoiceChatStage({
   }
 
   function toggleVoiceParticipantMute(peerId: string) {
+    onUiCue("mute")
     setMutedVoicePeers((current) => {
       const next = new Set(current)
       if (next.has(peerId)) {
@@ -4134,6 +4162,16 @@ function VoiceChatStage({
       }
       return next
     })
+  }
+
+  function toggleSelfMute() {
+    onUiCue("mute")
+    setMuted((current) => !current)
+  }
+
+  function toggleSelfDeafen() {
+    onUiCue("deafen")
+    setDeafened((current) => !current)
   }
 
   function removeMutedVoicePeer(peerId: string) {
@@ -4337,11 +4375,11 @@ function VoiceChatStage({
             {connected ? (
               <Button
                 className={cn("voice-control-button mic", muted && "active")}
-                data-tooltip={muted ? "Unmute" : "Mute"}
+                data-tooltip={muted ? "Unmute microphone" : "Mute microphone"}
                 size="icon-lg"
                 type="button"
                 variant="ghost"
-                onClick={() => setMuted((current) => !current)}
+                onClick={toggleSelfMute}
               >
                 {muted ? (
                   <MicrophoneSlash data-icon="inline-start" weight="duotone" />
@@ -4352,7 +4390,7 @@ function VoiceChatStage({
             ) : (
               <Button
                 className="voice-control-button mic"
-                data-tooltip="Microphone"
+                data-tooltip="Input and output devices"
                 size="icon-lg"
                 type="button"
                 variant="ghost"
@@ -4363,9 +4401,9 @@ function VoiceChatStage({
             )}
             <button
               aria-expanded={deviceMenuOpen}
-              aria-label="Choose microphone"
+              aria-label="Choose input and output device"
               className={cn("voice-device-arrow", deviceMenuOpen && "active")}
-              data-tooltip="Choose microphone"
+              data-tooltip="Input and output"
               type="button"
               onClick={toggleDeviceMenu}
             >
@@ -4381,6 +4419,10 @@ function VoiceChatStage({
                   initial={reduceMotion ? false : { opacity: 0, y: 8, scale: 0.98 }}
                   transition={{ duration: 0.16, ease: [0.2, 0.8, 0.2, 1] }}
                 >
+                  <div className="voice-device-menu-title">
+                    <strong>Voice devices</strong>
+                    <span>Choose microphone and speaker output.</span>
+                  </div>
                   <div className="voice-device-menu-head">
                     <strong>Input device</strong>
                     <span>{selectedInputLabel}</span>
@@ -4451,7 +4493,7 @@ function VoiceChatStage({
                     aria-pressed={deafened}
                     className={cn("voice-device-option deafen-option", deafened && "active")}
                     type="button"
-                    onClick={() => setDeafened((current) => !current)}
+                    onClick={toggleSelfDeafen}
                   >
                     <span>{deafened ? "Undeafen" : "Deafen"}</span>
                     {deafened ? <SpeakerSlash weight="bold" /> : <SpeakerHigh weight="bold" />}
@@ -4481,7 +4523,7 @@ function VoiceChatStage({
                 size="icon-lg"
                 type="button"
                 variant="ghost"
-                onClick={() => setDeafened((current) => !current)}
+                onClick={toggleSelfDeafen}
               >
                 {deafened ? (
                   <SpeakerSlash data-icon="inline-start" weight="duotone" />
@@ -4907,6 +4949,7 @@ function TopLeftDock({
   onSoundKindToggle,
   onSoundToggle,
   onUiSoundKindChange,
+  onUiCuePreview,
   onUiSoundPreview,
   onUiSoundToggle,
   onGoogleSignIn,
@@ -4950,6 +4993,7 @@ function TopLeftDock({
   onSoundKindToggle: (kind: SoundKind, enabled: boolean) => void
   onSoundToggle: (enabled: boolean) => void
   onUiSoundKindChange: (kind: UiSoundKind) => void
+  onUiCuePreview: (kind: UiSoundKind) => void
   onUiSoundPreview: () => void
   onUiSoundToggle: (enabled: boolean) => void
   onGoogleSignIn: () => void | Promise<void>
@@ -5282,6 +5326,7 @@ function TopLeftDock({
                   onSoundKindToggle={onSoundKindToggle}
                   onSoundToggle={onSoundToggle}
                   onUiSoundKindChange={onUiSoundKindChange}
+                  onUiCuePreview={onUiCuePreview}
                   onUiSoundPreview={onUiSoundPreview}
                   onUiSoundToggle={onUiSoundToggle}
                 />
@@ -5791,6 +5836,7 @@ function NotificationsPanel({
   onSoundKindToggle,
   onSoundToggle,
   onUiSoundKindChange,
+  onUiCuePreview,
   onUiSoundPreview,
   onUiSoundToggle,
 }: {
@@ -5800,10 +5846,13 @@ function NotificationsPanel({
   onSoundKindToggle: (kind: SoundKind, enabled: boolean) => void
   onSoundToggle: (enabled: boolean) => void
   onUiSoundKindChange: (kind: UiSoundKind) => void
+  onUiCuePreview: (kind: UiSoundKind) => void
   onUiSoundPreview: () => void
   onUiSoundToggle: (enabled: boolean) => void
 }) {
   const reduceMotion = useReducedMotion()
+  const showAlertCategories =
+    notifications.soundsEnabled || notifications.browserEnabled
   const permissionText =
     permission === "granted"
       ? "Permission granted."
@@ -5821,7 +5870,7 @@ function NotificationsPanel({
             <Bell weight="duotone" />
             Browser notifications
           </span>
-          <p>{permissionText}</p>
+          <p>{permissionText} Uses the same categories below when this tab is not active.</p>
         </div>
         <Switch
           aria-label="Toggle browser notifications"
@@ -5851,10 +5900,10 @@ function NotificationsPanel({
       </div>
 
       <AnimatePresence initial={false}>
-        {notifications.soundsEnabled ? (
+        {showAlertCategories ? (
           <motion.div
             animate={{ height: "auto", opacity: 1, x: 0 }}
-            aria-label="Sound categories"
+            aria-label="Alert categories"
             className="sound-kind-list"
             exit={{
               borderWidth: 0,
@@ -5879,6 +5928,10 @@ function NotificationsPanel({
             key="sound-kind-list"
             transition={{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }}
           >
+            <div className="sound-kind-head">
+              <strong>Alert categories</strong>
+              <span>Filters sound and Chrome popups</span>
+            </div>
             <div className="sound-kind-row">
               <span className="setting-label">
                 <Bell weight="duotone" />
@@ -5964,11 +6017,10 @@ function NotificationsPanel({
             transition={{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }}
           >
             <div className="ui-sound-picker-head">
-              <span>Confirmation tone</span>
-              <Button size="sm" type="button" variant="ghost" onClick={onUiSoundPreview}>
-                <Play data-icon="inline-start" weight="fill" />
-                Test
-              </Button>
+              <div>
+                <span>Confirmation tone</span>
+                <small>General button feedback is louder now.</small>
+              </div>
             </div>
             <div className="ui-sound-options">
               {uiSoundOptions.map((option) => (
@@ -5984,6 +6036,24 @@ function NotificationsPanel({
                 >
                   {option.label}
                 </button>
+              ))}
+            </div>
+            <div className="ui-cue-preview-row">
+              <Button size="sm" type="button" variant="ghost" onClick={onUiSoundPreview}>
+                <Play data-icon="inline-start" weight="fill" />
+                General
+              </Button>
+              {uiCuePreviewOptions.map((option) => (
+                <Button
+                  key={option.kind}
+                  size="sm"
+                  type="button"
+                  variant="ghost"
+                  onClick={() => onUiCuePreview(option.kind)}
+                >
+                  <Play data-icon="inline-start" weight="fill" />
+                  {option.label}
+                </Button>
               ))}
             </div>
           </motion.div>

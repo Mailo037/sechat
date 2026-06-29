@@ -698,6 +698,24 @@ body,
   background: rgba(161, 161, 170, 0.72);
 }
 
+.voice-device-menu-title {
+  display: grid;
+  gap: 2px;
+  padding: 1px 1px 3px;
+}
+
+.voice-device-menu-title strong {
+  color: #f4f4f5;
+  font-size: 0.86rem;
+  font-weight: 800;
+}
+
+.voice-device-menu-title span {
+  color: #a1a1aa;
+  font-size: 0.7rem;
+  line-height: 1.28;
+}
+
 .voice-device-menu-head {
   display: grid;
   gap: 3px;
@@ -3629,6 +3647,10 @@ body,
   border-radius: 12px;
 }
 
+.profile-auth-card .button {
+  min-width: 86px;
+}
+
 .field-stack {
   display: grid;
   gap: 5px;
@@ -3673,9 +3695,9 @@ body,
 }
 
 .profile-avatar-state.has-photo {
-  grid-template-columns: 34px minmax(0, 1fr);
+  grid-template-columns: 38px minmax(0, 1fr) 24px;
   min-height: 52px;
-  padding: 8px 34px 8px 8px;
+  padding: 8px;
 }
 
 .profile-avatar-state > svg,
@@ -3692,10 +3714,10 @@ body,
 }
 
 .profile-photo-thumb {
-  width: 34px;
-  height: 34px;
+  width: 38px;
+  height: 38px;
   overflow: hidden;
-  border-radius: 10px;
+  border-radius: 12px;
   background: #111113;
 }
 
@@ -3737,16 +3759,13 @@ body,
 }
 
 .profile-avatar-remove {
-  position: absolute;
-  top: 6px;
-  right: 6px;
   display: grid;
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   place-items: center;
-  border: 0;
+  border: 1px solid rgba(82, 82, 91, 0.5);
   border-radius: 999px;
-  background: transparent;
+  background: rgba(17, 17, 19, 0.64);
   color: #a1a1aa;
   cursor: pointer;
   padding: 0;
@@ -3771,13 +3790,13 @@ body,
 }
 
 .profile-actions {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
   gap: 8px;
 }
 
 .file-button {
   display: inline-flex;
+  width: 100%;
   height: 34px;
   align-items: center;
   justify-content: center;
@@ -3888,12 +3907,30 @@ body,
 
 .sound-kind-list {
   display: grid;
-  gap: 6px;
+  gap: 8px;
   overflow: hidden;
   padding: 7px;
   border: 1px solid rgba(82, 82, 91, 0.5);
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.035);
+}
+
+.sound-kind-head {
+  display: grid;
+  gap: 2px;
+  padding: 0 1px 2px;
+}
+
+.sound-kind-head strong {
+  color: #f4f4f5;
+  font-size: 0.74rem;
+  font-weight: 760;
+}
+
+.sound-kind-head span {
+  color: #a1a1aa;
+  font-size: 0.66rem;
+  line-height: 1.25;
 }
 
 .sound-kind-row {
@@ -3936,14 +3973,24 @@ body,
   font-weight: 700;
 }
 
-.ui-sound-picker-head button {
+.ui-sound-picker-head small {
+  display: block;
+  margin-top: 2px;
+  color: #a1a1aa;
+  font-size: 0.66rem;
+  line-height: 1.25;
+}
+
+.ui-sound-picker-head button,
+.ui-cue-preview-row button {
   height: 28px;
   padding: 0 9px;
   color: #f4f4f5;
   font-size: 0.72rem;
 }
 
-.ui-sound-picker-head button svg {
+.ui-sound-picker-head button svg,
+.ui-cue-preview-row button svg {
   width: 12px;
   height: 12px;
 }
@@ -3985,6 +4032,19 @@ body,
 
 .ui-sound-option:active {
   transform: translateY(1px);
+}
+
+.ui-cue-preview-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.ui-cue-preview-row button {
+  justify-content: center;
+  min-width: 0;
+  border-color: rgba(82, 82, 91, 0.58);
+  background: rgba(17, 17, 19, 0.62);
 }
 
 .trusted-sites-panel {

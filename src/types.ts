@@ -1,7 +1,7 @@
 export type AuthorId = string
 
 export type SoundKind = "message" | "reply" | "ping"
-export type UiSoundKind = "soft" | "click" | "done" | "pop"
+export type UiSoundKind = "soft" | "click" | "done" | "pop" | "mute" | "deafen"
 export type MessageType = "text" | "audio"
 
 export type MessageAttachment = {
