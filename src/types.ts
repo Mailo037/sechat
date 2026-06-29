@@ -18,6 +18,12 @@ export type Profile = {
   avatar: string
 }
 
+export type UsernameClaim = {
+  authorId: string
+  key: string
+  name: string
+}
+
 export type NotificationSettings = {
   browserEnabled: boolean
   soundsEnabled: boolean
@@ -55,6 +61,27 @@ export type ModerationUser = {
   name: string
 }
 
+export type VoiceParticipantState = {
+  avatar?: string
+  id: string
+  joinedAt: number
+  lastSeenAt: number
+  name: string
+  speaking?: boolean
+}
+
+export type VoiceSignalType = "offer" | "answer" | "candidate"
+
+export type VoiceSignal = {
+  candidate?: RTCIceCandidateInit
+  clientCreatedAt: number
+  from: string
+  id: string
+  sdp?: RTCSessionDescriptionInit
+  to: string
+  type: VoiceSignalType
+}
+
 export type UserModerationState = {
   action: "ban" | "timeout"
   at: number
@@ -75,6 +102,7 @@ export type ChatMessage = {
   id: string
   authorId: AuthorId
   authorName: string
+  usernameKey?: string
   avatar?: string
   body: string
   createdAt: number
@@ -94,6 +122,7 @@ export type ChatMessage = {
 export type PersistedChatState = {
   version: number
   profile: Profile
+  usernameClaim?: UsernameClaim | null
   notifications: NotificationSettings
   spamGuard: SpamGuardState
   trustedSites: string[]

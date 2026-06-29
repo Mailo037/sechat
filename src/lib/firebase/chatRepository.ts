@@ -8,6 +8,7 @@ import {
   onSnapshot,
   orderBy,
   query,
+  runTransaction,
   serverTimestamp,
   setDoc,
   where,
@@ -24,6 +25,10 @@ import type {
   MessageType,
   SoundKind,
   UserModerationState,
+  UsernameClaim,
+  VoiceParticipantState,
+  VoiceSignal,
+  VoiceSignalType,
 } from "@/types"
 import {
   ensureAnonymousUser,
@@ -37,6 +42,7 @@ type SendRemoteMessageInput = {
   authorName: string
   avatar?: string
   body: string
+  usernameKey: string
   messageType?: MessageType
   replyToId?: string
   soundKind?: SoundKind
@@ -50,6 +56,13 @@ type SendRemoteMessageInput = {
 
 type RemoteReaction = MessageReaction & {
   messageId: string
+}
+
+export class UsernameTakenError extends Error {
+  constructor() {
+    super("Username is already taken")
+    this.name = "UsernameTakenError"
+  }
 }
 
 const MAX_REMOTE_UPLOAD_BYTES = 8 * 1024 * 1024
@@ -77,6 +90,66 @@ export function remoteChatAvailable() {
 export async function prepareRemoteChat() {
   const user = await ensureAnonymousUser()
   return user?.uid ?? null
+}
+
+export async function claimRemoteUsername(
+  displayName: string,
+  previousKey?: string | null
+): Promise<UsernameClaim> {
+  const current = getFirebaseServices()
+  const user = await ensureAnonymousUser()
+  if (!current || !user) {
+    throw new Error("Firebase is not configured")
+  }
+
+  const name = cleanUsernameDisplayName(displayName)
+  const key = usernameKeyFromDisplayName(name)
+  if (!/^[A-Za-z0-9 _-]+$/.test(name) || !isValidUsernameKey(key)) {
+    throw new Error("Username must be 3-24 characters.")
+  }
+
+  const roomId = getFirebaseRoomId()
+  const usernameRef = doc(current.db, "rooms", roomId, "usernames", key)
+  const oldUsernameRef =
+    previousKey && previousKey !== key
+      ? doc(current.db, "rooms", roomId, "usernames", previousKey)
+      : null
+
+  await runTransaction(current.db, async (transaction) => {
+    const existing = await transaction.get(usernameRef)
+    const oldUsername = oldUsernameRef
+      ? await transaction.get(oldUsernameRef)
+      : null
+    if (existing.exists() && existing.data().authorId !== user.uid) {
+      throw new UsernameTakenError()
+    }
+
+    transaction.set(
+      usernameRef,
+      {
+        authorId: user.uid,
+        clientUpdatedAt: Date.now(),
+        displayName: name,
+        updatedAt: serverTimestamp(),
+        usernameKey: key,
+      },
+      { merge: true }
+    )
+
+    if (
+      oldUsernameRef &&
+      oldUsername?.exists() &&
+      oldUsername.data().authorId === user.uid
+    ) {
+      transaction.delete(oldUsernameRef)
+    }
+  })
+
+  return {
+    authorId: user.uid,
+    key,
+    name,
+  }
 }
 
 export function listenToRemoteMessages(
@@ -149,6 +222,7 @@ export async function sendRemoteMessage(input: SendRemoteMessageInput) {
   const messagesRef = collection(current.db, "rooms", roomId, "messages")
   const body = input.body.trim()
   const messageType = input.messageType ?? "text"
+  const usernameKey = input.usernameKey.trim()
 
   const attachments = input.attachments ?? []
 
@@ -194,6 +268,7 @@ export async function sendRemoteMessage(input: SendRemoteMessageInput) {
     messageType,
     replyToId: input.replyToId ?? "",
     soundKind: input.soundKind ?? "",
+    usernameKey,
     waveform,
   })
 
@@ -205,11 +280,13 @@ export async function sendRemoteReaction({
   authorName,
   emoji,
   messageId,
+  usernameKey,
 }: {
   active: boolean
   authorName: string
   emoji: string
   messageId: string
+  usernameKey: string
 }) {
   const current = getFirebaseServices()
   const user = await ensureAnonymousUser()
@@ -238,6 +315,7 @@ export async function sendRemoteReaction({
     createdAt: serverTimestamp(),
     emoji,
     messageId,
+    usernameKey: usernameKey.trim(),
   })
 
   return user.uid
@@ -322,6 +400,147 @@ export async function deleteRemoteMessage(messageId: string) {
   ])
 }
 
+export function listenToRemoteVoiceParticipants(
+  onParticipants: (participants: VoiceParticipantState[]) => void,
+  onError: (error: Error) => void
+): Unsubscribe | null {
+  const current = getFirebaseServices()
+  if (!current) return null
+
+  const roomId = getFirebaseRoomId()
+  return onSnapshot(
+    collection(current.db, "rooms", roomId, "voiceParticipants"),
+    (snapshot) => {
+      const now = Date.now()
+      const participants = snapshot.docs
+        .map(toVoiceParticipant)
+        .filter((participant): participant is VoiceParticipantState => {
+          return Boolean(participant && now - participant.lastSeenAt <= 15000)
+        })
+        .sort((a, b) => a.joinedAt - b.joinedAt)
+
+      onParticipants(participants)
+    },
+    (error) => onError(error)
+  )
+}
+
+export async function setRemoteVoicePresence(input: {
+  avatar?: string
+  joinedAt: number
+  name: string
+  speaking: boolean
+  usernameKey: string
+}) {
+  const current = getFirebaseServices()
+  const user = await ensureAnonymousUser()
+  if (!current || !user) {
+    throw new Error("Firebase is not configured")
+  }
+
+  const now = Date.now()
+  const roomId = getFirebaseRoomId()
+  await setDoc(
+    doc(current.db, "rooms", roomId, "voiceParticipants", user.uid),
+    {
+      authorId: user.uid,
+      avatar: input.avatar ?? "",
+      clientUpdatedAt: now,
+      joinedAt: input.joinedAt,
+      lastSeenAt: now,
+      name: input.name.trim() || "User",
+      speaking: input.speaking,
+      updatedAt: serverTimestamp(),
+      usernameKey: input.usernameKey.trim(),
+    },
+    { merge: true }
+  )
+
+  return user.uid
+}
+
+export async function removeRemoteVoicePresence() {
+  const current = getFirebaseServices()
+  const user = await ensureAnonymousUser()
+  if (!current || !user) return
+
+  const roomId = getFirebaseRoomId()
+  await deleteDoc(doc(current.db, "rooms", roomId, "voiceParticipants", user.uid))
+}
+
+export function listenToRemoteVoiceSignals(
+  authorId: string,
+  onSignals: (signals: VoiceSignal[]) => void,
+  onError: (error: Error) => void
+): Unsubscribe | null {
+  const current = getFirebaseServices()
+  if (!current || !authorId) return null
+
+  const roomId = getFirebaseRoomId()
+  const signalsQuery = query(
+    collection(current.db, "rooms", roomId, "voiceSignals"),
+    where("to", "==", authorId),
+    limit(100)
+  )
+
+  return onSnapshot(
+    signalsQuery,
+    (snapshot) => {
+      onSignals(
+        snapshot.docs
+          .map(toVoiceSignal)
+          .filter((signal): signal is VoiceSignal => Boolean(signal))
+      )
+    },
+    (error) => onError(error)
+  )
+}
+
+export async function sendRemoteVoiceSignal(input: {
+  candidate?: RTCIceCandidateInit
+  from: string
+  sdp?: RTCSessionDescriptionInit
+  to: string
+  type: VoiceSignalType
+}) {
+  const current = getFirebaseServices()
+  const user = await ensureAnonymousUser()
+  if (!current || !user) {
+    throw new Error("Firebase is not configured")
+  }
+
+  const roomId = getFirebaseRoomId()
+  await addDoc(collection(current.db, "rooms", roomId, "voiceSignals"), {
+    candidate: input.candidate ?? null,
+    clientCreatedAt: Date.now(),
+    createdAt: serverTimestamp(),
+    from: user.uid,
+    sdp: input.sdp ?? null,
+    to: input.to,
+    type: input.type,
+  })
+}
+
+export async function deleteRemoteVoiceSignalsForUser(authorId: string) {
+  const current = getFirebaseServices()
+  await ensureAnonymousUser()
+  if (!current || !authorId) return
+
+  const roomId = getFirebaseRoomId()
+  const signalsRef = collection(current.db, "rooms", roomId, "voiceSignals")
+  const [incoming, outgoing] = await Promise.all([
+    getDocs(query(signalsRef, where("to", "==", authorId), limit(100))),
+    getDocs(query(signalsRef, where("from", "==", authorId), limit(100))),
+  ])
+  const deletions = new Map<string, Promise<void>>()
+
+  for (const signal of [...incoming.docs, ...outgoing.docs]) {
+    deletions.set(signal.id, deleteDoc(signal.ref))
+  }
+
+  await Promise.all(deletions.values())
+}
+
 function sanitizeAttachment(attachment: MessageAttachment): MessageAttachment | null {
   if (
     typeof attachment.id !== "string" ||
@@ -342,6 +561,24 @@ function sanitizeAttachment(attachment: MessageAttachment): MessageAttachment | 
     name: attachment.name,
     size: attachment.size,
   }
+}
+
+function cleanUsernameDisplayName(displayName: string) {
+  return displayName.trim().replace(/\s+/g, " ").slice(0, 40)
+}
+
+function usernameKeyFromDisplayName(displayName: string) {
+  return displayName
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9_-]+/g, "")
+    .replace(/^[-_]+|[-_]+$/g, "")
+    .slice(0, 24)
+}
+
+function isValidUsernameKey(key: string) {
+  return /^[a-z0-9][a-z0-9_-]{2,23}$/.test(key)
 }
 
 function isAllowedRemoteAttachment(attachment: MessageAttachment) {
@@ -684,6 +921,7 @@ function toChatMessage(snapshot: QueryDocumentSnapshot<DocumentData>): ChatMessa
     id: snapshot.id,
     authorId: typeof data.authorId === "string" ? data.authorId : "",
     authorName: typeof data.authorName === "string" ? data.authorName : "User",
+    usernameKey: typeof data.usernameKey === "string" ? data.usernameKey : undefined,
     avatar: typeof data.avatar === "string" ? data.avatar : "",
     body: typeof data.body === "string" ? data.body : "",
     createdAt,
@@ -726,6 +964,62 @@ function toRemoteReaction(
     authorName: data.authorName,
     emoji: data.emoji,
     messageId: data.messageId,
+  }
+}
+
+function toVoiceParticipant(
+  snapshot: QueryDocumentSnapshot<DocumentData>
+): VoiceParticipantState | null {
+  const data = snapshot.data()
+  const id = typeof data.authorId === "string" ? data.authorId : snapshot.id
+  const lastSeenAt =
+    typeof data.lastSeenAt === "number"
+      ? data.lastSeenAt
+      : typeof data.clientUpdatedAt === "number"
+        ? data.clientUpdatedAt
+        : typeof data.updatedAt?.toMillis === "function"
+          ? data.updatedAt.toMillis()
+          : 0
+
+  if (!id || !lastSeenAt) return null
+
+  return {
+    avatar: typeof data.avatar === "string" ? data.avatar : "",
+    id,
+    joinedAt: typeof data.joinedAt === "number" ? data.joinedAt : lastSeenAt,
+    lastSeenAt,
+    name: typeof data.name === "string" && data.name.trim() ? data.name : "User",
+    speaking: data.speaking === true,
+  }
+}
+
+function toVoiceSignal(
+  snapshot: QueryDocumentSnapshot<DocumentData>
+): VoiceSignal | null {
+  const data = snapshot.data()
+  if (
+    typeof data.from !== "string" ||
+    typeof data.to !== "string" ||
+    (data.type !== "offer" && data.type !== "answer" && data.type !== "candidate")
+  ) {
+    return null
+  }
+
+  return {
+    candidate:
+      data.candidate && typeof data.candidate === "object"
+        ? (data.candidate as RTCIceCandidateInit)
+        : undefined,
+    clientCreatedAt:
+      typeof data.clientCreatedAt === "number" ? data.clientCreatedAt : Date.now(),
+    from: data.from,
+    id: snapshot.id,
+    sdp:
+      data.sdp && typeof data.sdp === "object"
+        ? (data.sdp as RTCSessionDescriptionInit)
+        : undefined,
+    to: data.to,
+    type: data.type,
   }
 }
 

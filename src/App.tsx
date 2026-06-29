@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type DragEvent as ReactDragEvent,
   type FormEvent as ReactFormEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
@@ -64,14 +65,27 @@ import {
   unlockAudio,
 } from "@/lib/notificationAudio"
 import {
+  listenToFirebaseAuth,
+  signInWithGoogleAccount,
+  signOutToAnonymousUser,
+  type FirebaseAuthUser,
+} from "@/lib/firebase/client"
+import {
+  claimRemoteUsername,
   clearRemoteUserModeration,
   deleteRemoteMessage,
+  deleteRemoteVoiceSignalsForUser,
   listenToRemoteMessages,
   listenToRemoteModeration,
+  listenToRemoteVoiceParticipants,
+  listenToRemoteVoiceSignals,
   prepareRemoteChat,
+  removeRemoteVoicePresence,
   remoteChatAvailable,
   sendRemoteMessage,
   sendRemoteReaction,
+  sendRemoteVoiceSignal,
+  setRemoteVoicePresence,
   setRemoteUserModeration,
 } from "@/lib/firebase/chatRepository"
 import { loadChatState, saveChatState } from "@/lib/storage"
@@ -90,6 +104,9 @@ import type {
   SpamGuardState,
   UiSoundKind,
   UserModerationState,
+  UsernameClaim,
+  VoiceParticipantState,
+  VoiceSignal,
 } from "@/types"
 
 type Panel = "profile" | "notifications" | "trusted" | null
@@ -139,10 +156,14 @@ type VoiceParticipant = {
   id: string
   isSelf: boolean
   name: string
+  speaking?: boolean
 }
 
 const AUDIO_BAR_COUNT = 44
 const MESSAGE_AUDIO_BAR_COUNT = 28
+const VOICE_RTC_CONFIG: RTCConfiguration = {
+  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+}
 const MAX_RECORDING_MS = 120000
 const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
 const MAX_ATTACHMENT_COUNT = 6
@@ -202,6 +223,8 @@ const ADMIN_TIMEOUT_MS = 15 * 60 * 1000
 const ADMIN_BAN_MS = 100 * 365 * 24 * 60 * 60 * 1000
 const ADMIN_SESSION_KEY = "sechat-admin-unlocked"
 const SPAM_GUARD_CACHE_KEY = "sechat-spam-guard"
+const USERNAME_MIN_LENGTH = 3
+const USERNAME_MAX_KEY_LENGTH = 24
 
 const defaultProfile: Profile = {
   name: "You",
@@ -311,6 +334,7 @@ function createInitialState(): PersistedChatState {
   return {
     version: CURRENT_DATA_VERSION,
     profile: defaultProfile,
+    usernameClaim: null,
     notifications: defaultNotifications,
     spamGuard: defaultSpamGuard,
     trustedSites: [],
@@ -328,6 +352,7 @@ function normalizeStoredState(stored: PersistedChatState | undefined) {
         stored.profile?.name === LEGACY_DEFAULT_NAME
           ? defaultProfile
           : (stored.profile ?? defaultProfile),
+      usernameClaim: normalizeUsernameClaim(stored.usernameClaim),
       notifications: normalizeNotifications(stored.notifications),
       spamGuard: normalizeSpamGuard(stored.spamGuard),
       trustedSites: normalizeTrustedSites(stored.trustedSites),
@@ -340,6 +365,7 @@ function normalizeStoredState(stored: PersistedChatState | undefined) {
       stored.profile?.name === LEGACY_DEFAULT_NAME
         ? defaultProfile
         : (stored.profile ?? defaultProfile),
+    usernameClaim: normalizeUsernameClaim(stored.usernameClaim),
     notifications: normalizeNotifications(stored.notifications),
     spamGuard: normalizeSpamGuard(stored.spamGuard),
     trustedSites: normalizeTrustedSites(stored.trustedSites),
@@ -393,6 +419,57 @@ function normalizeTrustedSites(value: unknown) {
         .filter(Boolean)
     )
   )
+}
+
+function cleanUsernameDisplayName(value: string) {
+  return value.trim().replace(/\s+/g, " ").slice(0, 40)
+}
+
+function usernameKeyFromName(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9_-]+/g, "")
+    .replace(/^[-_]+|[-_]+$/g, "")
+    .slice(0, USERNAME_MAX_KEY_LENGTH)
+}
+
+function usernameValidationError(value: string) {
+  const cleanName = cleanUsernameDisplayName(value)
+  const key = usernameKeyFromName(cleanName)
+
+  if (!cleanName) return "Choose a username to continue."
+  if (!/^[A-Za-z0-9 _-]+$/.test(cleanName)) {
+    return "Use letters, numbers, dashes, or underscores."
+  }
+  if (key.length < USERNAME_MIN_LENGTH) {
+    return `Use at least ${USERNAME_MIN_LENGTH} letters or numbers.`
+  }
+  if (!/^[a-z0-9][a-z0-9_-]{2,23}$/.test(key)) {
+    return "Use letters, numbers, dashes, or underscores."
+  }
+  return null
+}
+
+function normalizeUsernameClaim(value: unknown): UsernameClaim | null {
+  if (!value || typeof value !== "object") return null
+  const claim = value as Partial<UsernameClaim>
+  if (
+    typeof claim.authorId !== "string" ||
+    typeof claim.key !== "string" ||
+    typeof claim.name !== "string" ||
+    usernameValidationError(claim.name) ||
+    usernameKeyFromName(claim.name) !== claim.key
+  ) {
+    return null
+  }
+
+  return {
+    authorId: claim.authorId,
+    key: claim.key,
+    name: cleanUsernameDisplayName(claim.name),
+  }
 }
 
 function normalizeSpamGuard(value: unknown): SpamGuardState {
@@ -670,6 +747,16 @@ function clampNumber(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value))
 }
 
+function toSessionDescriptionInit(
+  description: RTCSessionDescription | null,
+  fallback: RTCSessionDescriptionInit
+): RTCSessionDescriptionInit {
+  return {
+    sdp: description?.sdp ?? fallback.sdp ?? "",
+    type: description?.type ?? fallback.type,
+  }
+}
+
 function compactWaveform(values: number[], targetCount = AUDIO_BAR_COUNT) {
   const source = values.length > 0 ? values : makeQuietWaveform(targetCount)
   const padded =
@@ -773,6 +860,13 @@ function App() {
   const reduceMotion = useReducedMotion()
   const [ready, setReady] = useState(false)
   const [profile, setProfile] = useState<Profile>(defaultProfile)
+  const [usernameClaim, setUsernameClaim] = useState<UsernameClaim | null>(null)
+  const [usernameDraft, setUsernameDraft] = useState("")
+  const [usernameError, setUsernameError] = useState<string | null>(null)
+  const [usernameBusy, setUsernameBusy] = useState(false)
+  const [authUser, setAuthUser] = useState<FirebaseAuthUser | null>(null)
+  const [authBusy, setAuthBusy] = useState(false)
+  const [authError, setAuthError] = useState<string | null>(null)
   const [notifications, setNotifications] =
     useState<NotificationSettings>(defaultNotifications)
   const [spamGuard, setSpamGuard] = useState<SpamGuardState>(readCachedSpamGuard)
@@ -784,6 +878,7 @@ function App() {
   const [authorId, setAuthorId] = useState("me")
   const [draft, setDraft] = useState("")
   const [attachmentDrafts, setAttachmentDrafts] = useState<MessageAttachment[]>([])
+  const [attachmentDropActive, setAttachmentDropActive] = useState(false)
   const [attachmentError, setAttachmentError] = useState<string | null>(null)
   const [composerHasMultipleLines, setComposerHasMultipleLines] = useState(false)
   const [sendFlightId, setSendFlightId] = useState<number | null>(null)
@@ -830,6 +925,15 @@ function App() {
   const cleanupRan = useRef(false)
   const remoteEnabled = remoteChatAvailable()
   const mobileReplyGesture = useMediaQuery("(max-width: 720px)")
+  const profileUsernameKey = usernameKeyFromName(profile.name)
+  const remoteIdentityReady = !remoteEnabled || authorId !== "me"
+  const hasUniqueUsername =
+    remoteIdentityReady &&
+    Boolean(usernameClaim) &&
+    usernameClaim?.key === profileUsernameKey &&
+    usernameClaim?.name === cleanUsernameDisplayName(profile.name) &&
+    (!remoteEnabled || usernameClaim?.authorId === authorId)
+  const shouldShowOnboarding = ready && remoteIdentityReady && !hasUniqueUsername
 
   const replyTo = useMemo(
     () => messages.find((message) => message.id === replyToId),
@@ -844,31 +948,6 @@ function App() {
     () => groupMessages(displayedMessages),
     [displayedMessages]
   )
-  const voiceParticipants = useMemo(() => {
-    const participants = new Map<string, VoiceParticipant>()
-    participants.set(authorId, {
-      avatar: profile.avatar,
-      id: authorId,
-      isSelf: true,
-      name: profile.name,
-    })
-
-    for (const message of displayedMessages) {
-      const isSelf = message.authorId === authorId
-      const existing = participants.get(message.authorId)
-      const nextName = isSelf ? profile.name : message.authorName
-      const nextAvatar = isSelf ? profile.avatar : message.avatar
-
-      participants.set(message.authorId, {
-        avatar: nextAvatar || existing?.avatar || "",
-        id: message.authorId,
-        isSelf,
-        name: nextName || existing?.name || "Unknown",
-      })
-    }
-
-    return Array.from(participants.values()).slice(0, 12)
-  }, [authorId, displayedMessages, profile.avatar, profile.name])
 
   const moderationUsers = useMemo<ModerationUser[]>(() => {
     const users = new Map<string, ModerationUser>()
@@ -893,12 +972,13 @@ function App() {
     () => ({
       version: CURRENT_DATA_VERSION,
       profile,
+      usernameClaim,
       notifications,
       spamGuard,
       trustedSites,
       messages,
     }),
-    [profile, notifications, spamGuard, trustedSites, messages]
+    [profile, usernameClaim, notifications, spamGuard, trustedSites, messages]
   )
 
   useEffect(() => {
@@ -910,6 +990,10 @@ function App() {
       const cachedSpamGuard = readCachedSpamGuard()
       const nextSpamGuard = mergeSpamGuardStates(next.spamGuard, cachedSpamGuard)
       setProfile(next.profile)
+      setUsernameClaim(next.usernameClaim ?? null)
+      setUsernameDraft(
+        next.profile.name === defaultProfile.name ? "" : next.profile.name
+      )
       setNotifications(next.notifications)
       setSpamGuard(nextSpamGuard)
       writeCachedSpamGuard(nextSpamGuard)
@@ -960,33 +1044,25 @@ function App() {
   useEffect(() => {
     if (!remoteEnabled) return
 
-    let unsubscribeMessages: (() => void) | null = null
-    let unsubscribeModeration: (() => void) | null = null
-    let cancelled = false
+    const unsubscribe = listenToFirebaseAuth((user) => {
+      setAuthUser(user)
+      if (user) {
+        setAuthorId(user.uid)
+      }
+    })
 
+    return () => unsubscribe?.()
+  }, [remoteEnabled])
+
+  useEffect(() => {
+    if (!remoteEnabled) return
+
+    let cancelled = false
     prepareRemoteChat()
       .then((remoteAuthorId) => {
-        if (cancelled || !remoteAuthorId) return
-        setAuthorId(remoteAuthorId)
-
-        unsubscribeMessages = listenToRemoteMessages(
-          (nextMessages) => {
-            setMessages(nextMessages)
-          },
-          (error) => {
-            console.warn("Remote chat listener failed", error)
-          }
-        )
-        unsubscribeModeration = listenToRemoteModeration(
-          remoteAuthorId,
-          (moderation) => {
-            setRemoteModerationReady(true)
-            setActiveModeration(moderation)
-          },
-          (error) => {
-            console.warn("Remote moderation listener failed", error)
-          }
-        )
+        if (!cancelled && remoteAuthorId) {
+          setAuthorId(remoteAuthorId)
+        }
       })
       .catch((error) => {
         console.warn("Remote chat setup failed", error)
@@ -994,16 +1070,73 @@ function App() {
 
     return () => {
       cancelled = true
-      unsubscribeMessages?.()
-      unsubscribeModeration?.()
     }
   }, [remoteEnabled])
+
+  useEffect(() => {
+    if (!remoteEnabled) return
+
+    const unsubscribeMessages = listenToRemoteMessages(
+      (nextMessages) => {
+        setMessages(nextMessages)
+      },
+      (error) => {
+        console.warn("Remote chat listener failed", error)
+      }
+    )
+
+    return () => unsubscribeMessages?.()
+  }, [remoteEnabled])
+
+  useEffect(() => {
+    if (!remoteEnabled || authorId === "me") return
+
+    setRemoteModerationReady(false)
+    const unsubscribeModeration = listenToRemoteModeration(
+      authorId,
+      (moderation) => {
+        setRemoteModerationReady(true)
+        setActiveModeration(moderation)
+      },
+      (error) => {
+        console.warn("Remote moderation listener failed", error)
+      }
+    )
+
+    return () => unsubscribeModeration?.()
+  }, [authorId, remoteEnabled])
 
   useEffect(() => {
     if (!remoteEnabled) {
       setRemoteModerationReady(true)
     }
   }, [remoteEnabled])
+
+  useEffect(() => {
+    if (!authUser || authUser.isAnonymous) return
+
+    const suggestedName =
+      cleanUsernameDisplayName(authUser.displayName) ||
+      cleanUsernameDisplayName(authUser.email.split("@")[0] ?? "")
+
+    if (!usernameClaim && !usernameDraft.trim() && suggestedName) {
+      setUsernameDraft(suggestedName)
+    }
+
+    if (authUser.photoURL && !profile.avatar.trim()) {
+      setProfile((current) => ({
+        ...current,
+        avatar: current.avatar.trim() ? current.avatar : authUser.photoURL,
+      }))
+    }
+  }, [authUser, profile.avatar, usernameClaim, usernameDraft])
+
+  useEffect(() => {
+    if (!ready || !remoteEnabled || authorId === "me" || !usernameClaim) return
+    if (usernameClaim.authorId !== authorId) {
+      setUsernameClaim(null)
+    }
+  }, [authorId, ready, remoteEnabled, usernameClaim])
 
   useEffect(() => {
     const now = Date.now()
@@ -1360,6 +1493,11 @@ function App() {
       return false
     }
 
+    if (!hasUniqueUsername) {
+      setUsernameError("Choose a unique username before chatting.")
+      return false
+    }
+
     if (spamGuard.bannedUntil && spamGuard.bannedUntil > now) {
       setSpamNow(now)
       return false
@@ -1381,6 +1519,7 @@ function App() {
       id: makeId("pending"),
       authorId,
       authorName: profile.name,
+      usernameKey: usernameClaim?.key,
       avatar: profile.avatar,
       body: input.body,
       createdAt: Date.now(),
@@ -1546,7 +1685,129 @@ function App() {
     }
   }
 
+  async function claimUsername(inputName = usernameDraft) {
+    const cleanName = cleanUsernameDisplayName(inputName)
+    const validationError = usernameValidationError(cleanName)
+    if (validationError) {
+      setUsernameError(validationError)
+      return false
+    }
+
+    if (!remoteIdentityReady) {
+      setUsernameError("Connecting before reserving your username...")
+      return false
+    }
+
+    setUsernameBusy(true)
+    setUsernameError(null)
+
+    try {
+      const nextClaim = remoteEnabled
+        ? await claimRemoteUsername(cleanName, usernameClaim?.key)
+        : {
+            authorId,
+            key: usernameKeyFromName(cleanName),
+            name: cleanName,
+          }
+
+      setUsernameClaim(nextClaim)
+      setAuthorId(nextClaim.authorId)
+      setProfile((current) => ({
+        ...current,
+        name: nextClaim.name,
+      }))
+      setUsernameDraft(nextClaim.name)
+      playConfirmationSound("done")
+      return true
+    } catch (error) {
+      console.warn("Username claim failed", error)
+      const nextMessage =
+        error instanceof Error && error.name === "UsernameTakenError"
+          ? "That username is already taken."
+          : "Could not reserve that username."
+      setUsernameError(nextMessage)
+      return false
+    } finally {
+      setUsernameBusy(false)
+    }
+  }
+
+  async function signInWithGoogle() {
+    if (!remoteEnabled) {
+      setAuthError("Google login needs Firebase remote chat.")
+      return
+    }
+
+    setAuthBusy(true)
+    setAuthError(null)
+    setUsernameError(null)
+
+    try {
+      const user = await signInWithGoogleAccount()
+      setAuthUser(user)
+      setAuthorId(user.uid)
+
+      const claimBelongsToUser = usernameClaim?.authorId === user.uid
+      if (usernameClaim && !claimBelongsToUser) {
+        setUsernameClaim(null)
+      }
+
+      const suggestedName =
+        cleanUsernameDisplayName(user.displayName) ||
+        cleanUsernameDisplayName(user.email.split("@")[0] ?? "")
+      if (!claimBelongsToUser && suggestedName) {
+        setUsernameDraft(suggestedName)
+      }
+
+      if (user.photoURL) {
+        setProfile((current) => ({
+          ...current,
+          avatar: current.avatar.trim() ? current.avatar : user.photoURL,
+        }))
+      }
+
+      playConfirmationSound("done")
+    } catch (error) {
+      console.warn("Google sign-in failed", error)
+      setAuthError("Google login was not completed.")
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  async function signOutGoogle() {
+    if (!remoteEnabled) return
+
+    setAuthBusy(true)
+    setAuthError(null)
+
+    try {
+      const user = await signOutToAnonymousUser()
+      setAuthUser(user)
+      setAuthorId(user?.uid ?? "me")
+      setUsernameClaim(null)
+      playConfirmationSound("soft")
+    } catch (error) {
+      console.warn("Google sign-out failed", error)
+      setAuthError("Could not sign out.")
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  function updateUsernameDraft(value: string) {
+    setUsernameDraft(value)
+    if (usernameError) {
+      setUsernameError(null)
+    }
+  }
+
   async function toggleReaction(messageId: string, emoji: string) {
+    if (!hasUniqueUsername) {
+      setUsernameError("Choose a unique username before reacting.")
+      return
+    }
+
     if (messageId.startsWith("pending")) return
 
     const message = messages.find((item) => item.id === messageId)
@@ -1573,6 +1834,7 @@ function App() {
         authorName: profile.name,
         emoji,
         messageId,
+        usernameKey: usernameClaim?.key ?? profileUsernameKey,
       })
       setAuthorId(remoteAuthorId)
     } catch (error) {
@@ -1613,6 +1875,7 @@ function App() {
       id: makeId("me"),
       authorId,
       authorName: profile.name,
+      usernameKey: usernameClaim?.key ?? profileUsernameKey,
       avatar: profile.avatar,
       body,
       createdAt: Date.now(),
@@ -1643,6 +1906,7 @@ function App() {
           onUploadProgress: (progress) =>
             updatePendingProgress(pendingMessage.id, progress),
           replyToId,
+          usernameKey: usernameClaim?.key ?? profileUsernameKey,
         })
         setAuthorId(remoteAuthorId)
         updatePendingProgress(pendingMessage.id, 1)
@@ -1686,6 +1950,7 @@ function App() {
       id: makeId("audio"),
       authorId,
       authorName: profile.name,
+      usernameKey: usernameClaim?.key ?? profileUsernameKey,
       avatar: profile.avatar,
       body: "Voice message",
       createdAt: Date.now(),
@@ -1723,6 +1988,7 @@ function App() {
           audioUrl: draftAudio.dataUrl,
           audioMimeType: draftAudio.mimeType,
           audioDurationMs: draftAudio.durationMs,
+          usernameKey: usernameClaim?.key ?? profileUsernameKey,
           waveform: draftAudio.waveform,
         })
         setAuthorId(remoteAuthorId)
@@ -1740,7 +2006,12 @@ function App() {
   }
 
   async function startRecording() {
-    if (!ready) return
+    if (!ready || !hasUniqueUsername) {
+      if (!hasUniqueUsername) {
+        setUsernameError("Choose a unique username before recording.")
+      }
+      return
+    }
 
     if (spamGuard.bannedUntil && spamGuard.bannedUntil > Date.now()) {
       setSpamNow(Date.now())
@@ -2044,8 +2315,55 @@ function App() {
     setTrustedSites((current) => current.filter((item) => item !== site))
   }
 
+  function dragEventHasFiles(event: ReactDragEvent) {
+    return Array.from(event.dataTransfer.types).includes("Files")
+  }
+
+  function isInsideAttachmentDropCircle(event: ReactDragEvent<HTMLDivElement>) {
+    const bounds = event.currentTarget.getBoundingClientRect()
+    const centerX = bounds.left + bounds.width / 2
+    const centerY = bounds.top + bounds.height / 2
+    const distance = Math.hypot(event.clientX - centerX, event.clientY - centerY)
+    return distance <= Math.min(bounds.width, bounds.height) / 2
+  }
+
+  function handleAttachmentDrag(event: ReactDragEvent<HTMLDivElement>) {
+    if (!dragEventHasFiles(event)) return
+
+    event.preventDefault()
+    event.dataTransfer.dropEffect = "copy"
+    setAttachmentDropActive(isInsideAttachmentDropCircle(event))
+  }
+
+  function leaveAttachmentDropZone(event: ReactDragEvent<HTMLDivElement>) {
+    if (
+      event.relatedTarget instanceof Node &&
+      event.currentTarget.contains(event.relatedTarget)
+    ) {
+      return
+    }
+
+    setAttachmentDropActive(false)
+  }
+
+  function dropAttachmentFiles(event: ReactDragEvent<HTMLDivElement>) {
+    if (!dragEventHasFiles(event)) return
+
+    event.preventDefault()
+    const insideCircle = isInsideAttachmentDropCircle(event)
+    setAttachmentDropActive(false)
+    if (!insideCircle) return
+
+    void handleAttachmentFiles(event.dataTransfer.files)
+  }
+
   async function handleAttachmentFiles(fileList: FileList | null) {
     if (!ready) return
+
+    if (!hasUniqueUsername) {
+      setUsernameError("Choose a unique username before attaching files.")
+      return
+    }
 
     if (spamGuard.bannedUntil && spamGuard.bannedUntil > Date.now()) {
       setSpamNow(Date.now())
@@ -2126,7 +2444,8 @@ function App() {
   const showSendAction = hasDraft || sendFlightId !== null
   const spamBannedUntil = spamGuard.bannedUntil ?? 0
   const isSpamBanned = spamBannedUntil > spamNow
-  const shouldHideComposerBar = !ready || isSpamBanned
+  const shouldHideComposerBar =
+    !ready || !remoteIdentityReady || !hasUniqueUsername || isSpamBanned
   const spamRemainingMs = Math.max(0, spamBannedUntil - spamNow)
   const composerError = recordingError ?? attachmentError ?? spamWarning
   const chatShellStyle = voiceChatOpen
@@ -2137,6 +2456,11 @@ function App() {
     : undefined
 
   function toggleVoiceChat() {
+    if (!hasUniqueUsername) {
+      setUsernameError("Choose a unique username before joining voice.")
+      return
+    }
+
     setPanel(null)
     setVoiceChatOpen((current) => !current)
     playConfirmationSound("soft")
@@ -2220,8 +2544,11 @@ function App() {
         <AnimatePresence>
           {voiceChatOpen ? (
             <VoiceChatStage
-              participants={voiceParticipants}
+              authorId={authorId}
+              profile={profile}
               reduceMotion={Boolean(reduceMotion)}
+              remoteEnabled={remoteEnabled}
+              usernameKey={usernameClaim?.key ?? profileUsernameKey}
               onClose={closeVoiceChat}
             />
           ) : null}
@@ -2269,6 +2596,9 @@ function App() {
           activePanel={panel}
           adminStatus={adminStatus}
           adminUnlocked={adminUnlocked}
+          authBusy={authBusy}
+          authError={authError}
+          authUser={authUser}
           moderationLog={spamGuard.log ?? []}
           moderationUsers={moderationUsers}
           notificationIcon={notificationIcon}
@@ -2277,6 +2607,11 @@ function App() {
           profile={profile}
           trustedSites={trustedSites}
           unread={unread}
+          usernameBusy={usernameBusy}
+          usernameClaim={usernameClaim}
+          usernameDraft={usernameDraft}
+          usernameError={usernameError}
+          usernameReady={hasUniqueUsername}
           voiceChatOpen={voiceChatOpen}
           onAvatarFile={updateAvatarFromFile}
           onAdminUnlockedChange={setAdminUnlocked}
@@ -2288,6 +2623,8 @@ function App() {
             setPanel((current) => (current === next ? null : next))
             if (next === "notifications") setUnread(0)
           }}
+          onUsernameClaim={claimUsername}
+          onUsernameDraftChange={updateUsernameDraft}
           onProfileChange={setProfile}
           onRemoveTrustedSite={removeTrustedSite}
           onSoundKindToggle={updateSoundKind}
@@ -2295,8 +2632,28 @@ function App() {
           onUiSoundKindChange={updateUiSoundKind}
           onUiSoundPreview={previewUiSound}
           onUiSoundToggle={updateUiSoundToggle}
+          onGoogleSignIn={signInWithGoogle}
+          onGoogleSignOut={signOutGoogle}
           onVoiceToggle={toggleVoiceChat}
         />
+
+        <AnimatePresence>
+          {shouldShowOnboarding ? (
+            <OnboardingOverlay
+              authBusy={authBusy}
+              authError={authError}
+              authUser={authUser}
+              busy={usernameBusy}
+              error={usernameError}
+              reduceMotion={Boolean(reduceMotion)}
+              remoteEnabled={remoteEnabled}
+              username={usernameDraft}
+              onGoogleSignIn={signInWithGoogle}
+              onSubmit={claimUsername}
+              onUsernameChange={updateUsernameDraft}
+            />
+          ) : null}
+        </AnimatePresence>
 
         <section className="chat-window" aria-label="Chat">
           <div className="message-scroll" ref={scrollRef}>
@@ -2333,6 +2690,10 @@ function App() {
           >
             {!ready ? (
               <ComposerStatusNotice message="Loading chat state..." />
+            ) : !remoteIdentityReady ? (
+              <ComposerStatusNotice message="Connecting chat identity..." />
+            ) : !hasUniqueUsername ? (
+              <ComposerStatusNotice message="Choose a unique username to start chatting." />
             ) : isSpamBanned ? (
               <SpamBanNotice
                 reason={spamGuard.banReason}
@@ -2393,17 +2754,28 @@ function App() {
                       key="text-composer"
                       transition={{ duration: 0.16 }}
                     >
-                      <Button
-                        aria-label="Add attachment"
-                        className="composer-plus-button"
-                        data-tooltip="Add attachment"
-                        size="icon-lg"
-                        type="button"
-                        variant="ghost"
-                        onClick={() => fileInputRef.current?.click()}
+                      <div
+                        className={cn(
+                          "attachment-drop-zone",
+                          attachmentDropActive && "active"
+                        )}
+                        onDragEnter={handleAttachmentDrag}
+                        onDragLeave={leaveAttachmentDropZone}
+                        onDragOver={handleAttachmentDrag}
+                        onDrop={dropAttachmentFiles}
                       >
-                        <Paperclip data-icon="inline-start" />
-                      </Button>
+                        <Button
+                          aria-label="Add attachment"
+                          className="composer-plus-button"
+                          data-tooltip="Drop or add attachment"
+                          size="icon-lg"
+                          type="button"
+                          variant="ghost"
+                          onClick={() => fileInputRef.current?.click()}
+                        >
+                          <Paperclip data-icon="inline-start" />
+                        </Button>
+                      </div>
 
                       <div
                         className={cn(
@@ -2527,12 +2899,18 @@ function App() {
 }
 
 function VoiceChatStage({
-  participants,
+  authorId,
+  profile,
   reduceMotion,
+  remoteEnabled,
+  usernameKey,
   onClose,
 }: {
-  participants: VoiceParticipant[]
+  authorId: string
+  profile: Profile
   reduceMotion: boolean
+  remoteEnabled: boolean
+  usernameKey: string
   onClose: () => void
 }) {
   const [connected, setConnected] = useState(false)
@@ -2543,17 +2921,63 @@ function VoiceChatStage({
   const [selectedInputId, setSelectedInputId] = useState("")
   const [voiceLevel, setVoiceLevel] = useState(0)
   const [deviceMenuOpen, setDeviceMenuOpen] = useState(false)
+  const [remoteVoiceParticipants, setRemoteVoiceParticipants] = useState<
+    VoiceParticipantState[]
+  >([])
   const [micMeterVisible, setMicMeterVisible] = useState(() =>
     typeof window === "undefined"
       ? true
       : !window.matchMedia("(max-width: 720px)").matches
   )
+  const offeredPeersRef = useRef<Set<string>>(new Set())
+  const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map())
+  const pendingIceCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(
+    new Map()
+  )
+  const handleVoiceSignalRef = useRef<(signal: VoiceSignal) => void>(() => undefined)
+  const processedVoiceSignalsRef = useRef<Set<string>>(new Set())
+  const remoteAudioRefs = useRef<Map<string, HTMLAudioElement>>(new Map())
+  const syncVoicePeersRef = useRef<() => void>(() => undefined)
   const voiceAnalyserRef = useRef<AnalyserNode | null>(null)
   const voiceAudioContextRef = useRef<AudioContext | null>(null)
   const voiceFrameRef = useRef<number | null>(null)
+  const voiceJoinedAtRef = useRef<number | null>(null)
+  const voicePresenceIntervalRef = useRef<number | null>(null)
+  const isSpeakingRef = useRef(false)
   const voiceMutedRef = useRef(false)
   const voiceStreamRef = useRef<MediaStream | null>(null)
   const isSpeaking = connected && !muted && voiceLevel > 0.18
+  const visibleVoiceParticipants = useMemo<VoiceParticipant[]>(() => {
+    if (!connected) return []
+
+    const remoteParticipants = remoteVoiceParticipants
+      .filter((participant) => participant.id !== authorId)
+      .map((participant) => ({
+        avatar: participant.avatar,
+        id: participant.id,
+        isSelf: false,
+        name: participant.name,
+        speaking: participant.speaking,
+      }))
+
+    return [
+      {
+        avatar: profile.avatar,
+        id: authorId,
+        isSelf: true,
+        name: profile.name || "You",
+        speaking: isSpeaking,
+      },
+      ...remoteParticipants,
+    ].slice(0, 12)
+  }, [
+    authorId,
+    connected,
+    isSpeaking,
+    profile.avatar,
+    profile.name,
+    remoteVoiceParticipants,
+  ])
   const selectedInputLabel =
     audioInputs.find((device) => device.deviceId === selectedInputId)?.label ||
     "Default microphone"
@@ -2586,6 +3010,79 @@ function VoiceChatStage({
   }, [])
 
   useEffect(() => {
+    isSpeakingRef.current = isSpeaking
+  }, [isSpeaking])
+
+  useEffect(() => {
+    handleVoiceSignalRef.current = (signal) => {
+      void handleVoiceSignal(signal)
+    }
+
+    syncVoicePeersRef.current = () => {
+      if (!connected || !remoteEnabled) return
+
+      const remoteIds = new Set(
+        remoteVoiceParticipants
+          .filter((participant) => participant.id !== authorId)
+          .map((participant) => participant.id)
+      )
+
+      for (const participant of remoteVoiceParticipants) {
+        if (participant.id === authorId) continue
+        getOrCreatePeerConnection(participant.id)
+        if (authorId < participant.id) {
+          void ensureVoiceOffer(participant.id)
+        }
+      }
+
+      for (const peerId of peerConnectionsRef.current.keys()) {
+        if (!remoteIds.has(peerId)) {
+          closePeerConnection(peerId)
+        }
+      }
+    }
+  })
+
+  useEffect(() => {
+    if (!remoteEnabled) return
+
+    const unsubscribe = listenToRemoteVoiceParticipants(
+      setRemoteVoiceParticipants,
+      (error) => {
+        console.warn("Voice presence listener failed", error)
+        setVoiceError("Could not sync voice participants.")
+      }
+    )
+
+    return () => unsubscribe?.()
+  }, [remoteEnabled])
+
+  useEffect(() => {
+    if (!remoteEnabled || !authorId) return
+
+    const unsubscribe = listenToRemoteVoiceSignals(
+      authorId,
+      (signals) => {
+        for (const signal of signals) {
+          if (processedVoiceSignalsRef.current.has(signal.id)) continue
+          processedVoiceSignalsRef.current.add(signal.id)
+          handleVoiceSignalRef.current(signal)
+        }
+      },
+      (error) => {
+        console.warn("Voice signaling listener failed", error)
+        setVoiceError("Could not connect voice audio.")
+      }
+    )
+
+    return () => unsubscribe?.()
+  }, [authorId, remoteEnabled])
+
+  useEffect(() => {
+    syncVoicePeersRef.current()
+  }, [authorId, connected, remoteEnabled, remoteVoiceParticipants])
+
+  useEffect(() => {
     voiceMutedRef.current = muted
     voiceStreamRef.current
       ?.getAudioTracks()
@@ -2614,6 +3111,7 @@ function VoiceChatStage({
 
   function cleanupVoiceResources(resetLevel = true) {
     cleanupVoiceMeter()
+    closeAllPeerConnections()
     voiceStreamRef.current?.getTracks().forEach((track) => track.stop())
     voiceStreamRef.current = null
     voiceAnalyserRef.current = null
@@ -2626,6 +3124,217 @@ function VoiceChatStage({
       voiceAudioContextRef.current.close().catch(() => undefined)
     }
     voiceAudioContextRef.current = null
+  }
+
+  function closePeerConnection(peerId: string) {
+    const peerConnection = peerConnectionsRef.current.get(peerId)
+    if (peerConnection) {
+      peerConnection.onicecandidate = null
+      peerConnection.ontrack = null
+      peerConnection.onconnectionstatechange = null
+      peerConnection.close()
+    }
+
+    const audioElement = remoteAudioRefs.current.get(peerId)
+    if (audioElement) {
+      audioElement.pause()
+      audioElement.srcObject = null
+    }
+
+    peerConnectionsRef.current.delete(peerId)
+    pendingIceCandidatesRef.current.delete(peerId)
+    remoteAudioRefs.current.delete(peerId)
+    offeredPeersRef.current.delete(peerId)
+  }
+
+  function closeAllPeerConnections() {
+    for (const peerId of Array.from(peerConnectionsRef.current.keys())) {
+      closePeerConnection(peerId)
+    }
+    pendingIceCandidatesRef.current.clear()
+    offeredPeersRef.current.clear()
+  }
+
+  function getOrCreatePeerConnection(peerId: string) {
+    const current = peerConnectionsRef.current.get(peerId)
+    if (current) return current
+
+    const peerConnection = new RTCPeerConnection(VOICE_RTC_CONFIG)
+    const localStream = voiceStreamRef.current
+    localStream?.getAudioTracks().forEach((track) => {
+      peerConnection.addTrack(track, localStream)
+    })
+
+    peerConnection.onicecandidate = (event) => {
+      if (!event.candidate) return
+      void sendRemoteVoiceSignal({
+        candidate: event.candidate.toJSON(),
+        from: authorId,
+        to: peerId,
+        type: "candidate",
+      }).catch((error) => {
+        console.warn("Could not send voice candidate", error)
+      })
+    }
+
+    peerConnection.ontrack = (event) => {
+      const [stream] = event.streams
+      if (!stream) return
+
+      let audioElement = remoteAudioRefs.current.get(peerId)
+      if (!audioElement) {
+        audioElement = new Audio()
+        audioElement.autoplay = true
+        audioElement.setAttribute("playsinline", "true")
+        remoteAudioRefs.current.set(peerId, audioElement)
+      }
+
+      if (audioElement.srcObject !== stream) {
+        audioElement.srcObject = stream
+      }
+
+      audioElement.play().catch((error) => {
+        console.warn("Remote voice playback failed", error)
+      })
+    }
+
+    peerConnection.onconnectionstatechange = () => {
+      if (
+        peerConnection.connectionState === "failed" ||
+        peerConnection.connectionState === "closed" ||
+        peerConnection.connectionState === "disconnected"
+      ) {
+        closePeerConnection(peerId)
+      }
+    }
+
+    peerConnectionsRef.current.set(peerId, peerConnection)
+    return peerConnection
+  }
+
+  async function ensureVoiceOffer(peerId: string) {
+    if (!voiceStreamRef.current || !remoteEnabled || offeredPeersRef.current.has(peerId)) {
+      return
+    }
+
+    try {
+      const peerConnection = getOrCreatePeerConnection(peerId)
+      offeredPeersRef.current.add(peerId)
+      const offer = await peerConnection.createOffer({ offerToReceiveAudio: true })
+      await peerConnection.setLocalDescription(offer)
+      await sendRemoteVoiceSignal({
+        from: authorId,
+        sdp: toSessionDescriptionInit(peerConnection.localDescription, offer),
+        to: peerId,
+        type: "offer",
+      })
+    } catch (error) {
+      console.warn("Could not create voice offer", error)
+      offeredPeersRef.current.delete(peerId)
+      setVoiceError("Could not start voice audio with another participant.")
+    }
+  }
+
+  async function connectToRemoteVoiceParticipants() {
+    if (!remoteEnabled) return
+
+    for (const participant of remoteVoiceParticipants) {
+      if (participant.id === authorId) continue
+      getOrCreatePeerConnection(participant.id)
+      if (authorId < participant.id) {
+        await ensureVoiceOffer(participant.id)
+      }
+    }
+  }
+
+  async function handleVoiceSignal(signal: VoiceSignal) {
+    if (!voiceStreamRef.current || signal.from === authorId) return
+
+    try {
+      const peerConnection = getOrCreatePeerConnection(signal.from)
+
+      if (signal.type === "offer" && signal.sdp) {
+        await peerConnection.setRemoteDescription(
+          new RTCSessionDescription(signal.sdp)
+        )
+        await flushPendingIceCandidates(signal.from, peerConnection)
+        const answer = await peerConnection.createAnswer()
+        await peerConnection.setLocalDescription(answer)
+        await sendRemoteVoiceSignal({
+          from: authorId,
+          sdp: toSessionDescriptionInit(peerConnection.localDescription, answer),
+          to: signal.from,
+          type: "answer",
+        })
+        return
+      }
+
+      if (signal.type === "answer" && signal.sdp) {
+        if (peerConnection.signalingState !== "stable") {
+          await peerConnection.setRemoteDescription(
+            new RTCSessionDescription(signal.sdp)
+          )
+          await flushPendingIceCandidates(signal.from, peerConnection)
+        }
+        return
+      }
+
+      if (signal.type === "candidate" && signal.candidate) {
+        if (peerConnection.remoteDescription) {
+          await peerConnection.addIceCandidate(
+            new RTCIceCandidate(signal.candidate)
+          )
+        } else {
+          const queued = pendingIceCandidatesRef.current.get(signal.from) ?? []
+          queued.push(signal.candidate)
+          pendingIceCandidatesRef.current.set(signal.from, queued)
+        }
+      }
+    } catch (error) {
+      console.warn("Could not handle voice signal", error)
+      setVoiceError("Could not connect voice audio.")
+    }
+  }
+
+  async function flushPendingIceCandidates(
+    peerId: string,
+    peerConnection: RTCPeerConnection
+  ) {
+    const candidates = pendingIceCandidatesRef.current.get(peerId) ?? []
+    pendingIceCandidatesRef.current.delete(peerId)
+
+    for (const candidate of candidates) {
+      await peerConnection
+        .addIceCandidate(new RTCIceCandidate(candidate))
+        .catch((error) => console.warn("Could not add queued voice candidate", error))
+    }
+  }
+
+  function startVoicePresenceHeartbeat() {
+    if (!remoteEnabled) return
+    stopVoicePresenceHeartbeat()
+
+    const publish = () => {
+      void setRemoteVoicePresence({
+        avatar: profile.avatar,
+        joinedAt: voiceJoinedAtRef.current ?? Date.now(),
+        name: profile.name,
+        speaking: isSpeakingRef.current,
+        usernameKey,
+      }).catch((error) => {
+        console.warn("Could not publish voice presence", error)
+      })
+    }
+
+    publish()
+    voicePresenceIntervalRef.current = window.setInterval(publish, 3000)
+  }
+
+  function stopVoicePresenceHeartbeat() {
+    if (voicePresenceIntervalRef.current !== null) {
+      window.clearInterval(voicePresenceIntervalRef.current)
+      voicePresenceIntervalRef.current = null
+    }
   }
 
   function runVoiceMeter() {
@@ -2680,7 +3389,11 @@ function VoiceChatStage({
   }
 
   async function joinVoice(deviceId = selectedInputId) {
-    if (!navigator.mediaDevices?.getUserMedia || typeof AudioContext === "undefined") {
+    if (
+      !navigator.mediaDevices?.getUserMedia ||
+      typeof AudioContext === "undefined" ||
+      typeof RTCPeerConnection === "undefined"
+    ) {
       setVoiceError("Voice chat is not available in this browser.")
       return
     }
@@ -2713,11 +3426,21 @@ function VoiceChatStage({
       voiceAudioContextRef.current = audioContext
       voiceAnalyserRef.current = analyser
       voiceMutedRef.current = false
+      voiceJoinedAtRef.current = voiceJoinedAtRef.current ?? Date.now()
       setMuted(false)
       setConnected(true)
       setSelectedInputId(stream.getAudioTracks()[0]?.getSettings().deviceId || deviceId)
       setVoiceWaveform(makeQuietWaveform(36))
       void refreshAudioInputs()
+      if (remoteEnabled) {
+        void deleteRemoteVoiceSignalsForUser(authorId).catch((error) => {
+          console.warn("Could not clear old voice signals", error)
+        })
+        startVoicePresenceHeartbeat()
+        void connectToRemoteVoiceParticipants()
+      } else {
+        setVoiceError("Voice audio needs Firebase remote chat to reach other users.")
+      }
       runVoiceMeter()
     } catch (error) {
       console.warn("Voice chat failed", error)
@@ -2732,10 +3455,20 @@ function VoiceChatStage({
   }
 
   function leaveVoice() {
+    stopVoicePresenceHeartbeat()
+    if (remoteEnabled) {
+      void removeRemoteVoicePresence().catch((error) => {
+        console.warn("Could not remove voice presence", error)
+      })
+      void deleteRemoteVoiceSignalsForUser(authorId).catch((error) => {
+        console.warn("Could not remove voice signals", error)
+      })
+    }
     cleanupVoiceResources()
     setConnected(false)
     setMuted(false)
     setDeviceMenuOpen(false)
+    voiceJoinedAtRef.current = null
     setVoiceWaveform(makeQuietWaveform(36))
   }
 
@@ -2805,11 +3538,11 @@ function VoiceChatStage({
         ) : null}
 
         <div className="voice-participant-grid" aria-label="Voice participants">
-          {participants.map((participant) => (
+          {visibleVoiceParticipants.map((participant) => (
             <VoiceParticipantCard
               key={participant.id}
               participant={participant}
-              speaking={participant.isSelf && isSpeaking}
+              speaking={participant.isSelf ? isSpeaking : Boolean(participant.speaking)}
             />
           ))}
         </div>
@@ -3026,7 +3759,7 @@ function VoiceParticipantCard({
 }) {
   return (
     <div
-      aria-label={`${participant.isSelf ? "You" : participant.name}${speaking ? ", speaking" : ", in chat"}`}
+      aria-label={`${participant.isSelf ? "You" : participant.name}${speaking ? ", speaking" : ", in voice"}`}
       className={cn("voice-participant-card", speaking && "speaking")}
       data-tooltip={`${participant.isSelf ? "You" : participant.name}${speaking ? " is speaking" : ""}`}
     >
@@ -3096,10 +3829,158 @@ function ComposerStatusNotice({ message }: { message: string }) {
   )
 }
 
+function OnboardingOverlay({
+  authBusy,
+  authError,
+  authUser,
+  busy,
+  error,
+  reduceMotion,
+  remoteEnabled,
+  username,
+  onGoogleSignIn,
+  onSubmit,
+  onUsernameChange,
+}: {
+  authBusy: boolean
+  authError: string | null
+  authUser: FirebaseAuthUser | null
+  busy: boolean
+  error: string | null
+  reduceMotion: boolean
+  remoteEnabled: boolean
+  username: string
+  onGoogleSignIn: () => void | Promise<void>
+  onSubmit: (name?: string) => Promise<boolean>
+  onUsernameChange: (value: string) => void
+}) {
+  const focusPoints = [
+    {
+      copy: "Reply, react, copy, download, and swipe messages on mobile.",
+      icon: ArrowBendUpLeft,
+      title: "Messages",
+    },
+    {
+      copy: "Attach images, GIFs, files, or record voice notes.",
+      icon: Paperclip,
+      title: "Media",
+    },
+    {
+      copy: "Use separate sounds for messages, replies, mentions, and buttons.",
+      icon: Bell,
+      title: "Alerts",
+    },
+    {
+      copy: "Open voice chat and keep the text chat beside it.",
+      icon: PhoneCall,
+      title: "Voice",
+    },
+  ]
+
+  return (
+    <motion.div
+      animate={{ opacity: 1 }}
+      className="onboarding-backdrop"
+      exit={{ opacity: 0 }}
+      initial={reduceMotion ? false : { opacity: 0 }}
+      transition={{ duration: 0.18 }}
+    >
+      <motion.section
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        aria-label="Chat onboarding"
+        className="onboarding-card"
+        exit={{ opacity: 0, y: 10, scale: 0.98 }}
+        initial={reduceMotion ? false : { opacity: 0, y: 14, scale: 0.98 }}
+        transition={{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }}
+      >
+        <div className="onboarding-title">
+          <ShieldCheck weight="duotone" />
+          <div>
+            <strong>Set up Sechat</strong>
+            <span>Pick a unique username before joining the room.</span>
+          </div>
+        </div>
+
+        <div className="auth-card">
+          <div>
+            <span className="setting-label">
+              <GlobeSimple weight="duotone" />
+              Google account
+            </span>
+            <p>
+              {authUser && !authUser.isAnonymous
+                ? authUser.email || authUser.displayName || "Google connected."
+                : "Optional. Use Google to keep the same identity across devices."}
+            </p>
+            {authError ? <small className="auth-error">{authError}</small> : null}
+          </div>
+          <Button
+            disabled={authBusy || !remoteEnabled || Boolean(authUser && !authUser.isAnonymous)}
+            size="sm"
+            type="button"
+            variant="outline"
+            onClick={() => void onGoogleSignIn()}
+          >
+            {authBusy
+              ? "Opening"
+              : authUser && !authUser.isAnonymous
+                ? "Connected"
+                : "Google"}
+          </Button>
+        </div>
+
+        <form
+          className="onboarding-form"
+          onSubmit={(event) => {
+            event.preventDefault()
+            void onSubmit(username)
+          }}
+        >
+          <label htmlFor="onboarding-username">Unique username</label>
+          <div className="onboarding-username-row">
+            <Input
+              autoFocus
+              id="onboarding-username"
+              maxLength={40}
+              placeholder="e.g. Lena or milo_dev"
+              value={username}
+              onChange={(event) => onUsernameChange(event.target.value)}
+            />
+            <Button disabled={busy} type="submit" variant="default">
+              {busy ? "Checking" : "Continue"}
+            </Button>
+          </div>
+          <small className={cn("onboarding-status", error && "error")}>
+            {error ?? "Names are reserved per chat room."}
+          </small>
+        </form>
+
+        <div className="onboarding-focus-list">
+          {focusPoints.map((point) => {
+            const Icon = point.icon
+            return (
+              <div className="onboarding-focus-item" key={point.title}>
+                <Icon weight="duotone" />
+                <div>
+                  <strong>{point.title}</strong>
+                  <span>{point.copy}</span>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </motion.section>
+    </motion.div>
+  )
+}
+
 function TopLeftDock({
   activePanel,
   adminStatus,
   adminUnlocked,
+  authBusy,
+  authError,
+  authUser,
   moderationLog,
   moderationUsers,
   notificationIcon: NotificationIcon,
@@ -3108,6 +3989,11 @@ function TopLeftDock({
   profile,
   trustedSites,
   unread,
+  usernameBusy,
+  usernameClaim,
+  usernameDraft,
+  usernameError,
+  usernameReady,
   voiceChatOpen,
   onAvatarFile,
   onAdminUnlockedChange,
@@ -3118,16 +4004,23 @@ function TopLeftDock({
   onPanelChange,
   onProfileChange,
   onRemoveTrustedSite,
+  onUsernameClaim,
+  onUsernameDraftChange,
   onSoundKindToggle,
   onSoundToggle,
   onUiSoundKindChange,
   onUiSoundPreview,
   onUiSoundToggle,
+  onGoogleSignIn,
+  onGoogleSignOut,
   onVoiceToggle,
 }: {
   activePanel: Panel
   adminStatus: string | null
   adminUnlocked: boolean
+  authBusy: boolean
+  authError: string | null
+  authUser: FirebaseAuthUser | null
   moderationLog: SpamModerationLogEntry[]
   moderationUsers: ModerationUser[]
   notificationIcon: typeof Bell
@@ -3136,6 +4029,11 @@ function TopLeftDock({
   profile: Profile
   trustedSites: string[]
   unread: number
+  usernameBusy: boolean
+  usernameClaim: UsernameClaim | null
+  usernameDraft: string
+  usernameError: string | null
+  usernameReady: boolean
   voiceChatOpen: boolean
   onAvatarFile: (file: File | undefined) => void
   onAdminUnlockedChange: (unlocked: boolean) => void
@@ -3149,11 +4047,15 @@ function TopLeftDock({
   onPanelChange: (panel: Exclude<Panel, null>) => void
   onProfileChange: (profile: Profile) => void
   onRemoveTrustedSite: (site: string) => void
+  onUsernameClaim: (name?: string) => Promise<boolean>
+  onUsernameDraftChange: (value: string) => void
   onSoundKindToggle: (kind: SoundKind, enabled: boolean) => void
   onSoundToggle: (enabled: boolean) => void
   onUiSoundKindChange: (kind: UiSoundKind) => void
   onUiSoundPreview: () => void
   onUiSoundToggle: (enabled: boolean) => void
+  onGoogleSignIn: () => void | Promise<void>
+  onGoogleSignOut: () => void | Promise<void>
   onVoiceToggle: () => void
 }) {
   const reduceMotion = useReducedMotion()
@@ -3453,9 +4355,21 @@ function TopLeftDock({
 
               {activePanel === "profile" ? (
                 <ProfilePanel
+                  authBusy={authBusy}
+                  authError={authError}
+                  authUser={authUser}
                   profile={profile}
+                  usernameBusy={usernameBusy}
+                  usernameClaim={usernameClaim}
+                  usernameDraft={usernameDraft}
+                  usernameError={usernameError}
+                  usernameReady={usernameReady}
                   onAvatarFile={onAvatarFile}
+                  onGoogleSignIn={onGoogleSignIn}
+                  onGoogleSignOut={onGoogleSignOut}
                   onProfileChange={onProfileChange}
+                  onUsernameClaim={onUsernameClaim}
+                  onUsernameDraftChange={onUsernameDraftChange}
                 />
               ) : activePanel === "trusted" ? (
                 <TrustedSitesPanel
@@ -3593,6 +4507,9 @@ function AdminPanel({
     action: UserModerationState["action"]
   ) => void | Promise<void>
 }) {
+  const [peopleExpanded, setPeopleExpanded] = useState(true)
+  const [logExpanded, setLogExpanded] = useState(true)
+
   return (
     <div className="admin-panel-inner">
       <div className="panel-head">
@@ -3623,12 +4540,18 @@ function AdminPanel({
       {adminStatus ? <p className="admin-panel-status">{adminStatus}</p> : null}
 
       <AdminUserModeration
+        expanded={peopleExpanded}
         users={moderationUsers}
         onClearUserModeration={onClearUserModeration}
+        onToggleExpanded={() => setPeopleExpanded((current) => !current)}
         onModerateUser={onModerateUser}
       />
 
-      <ModerationLogView moderationLog={moderationLog} />
+      <ModerationLogView
+        expanded={logExpanded}
+        moderationLog={moderationLog}
+        onToggleExpanded={() => setLogExpanded((current) => !current)}
+      />
 
       <div className="admin-panel-actions">
         <Button size="sm" type="button" variant="outline" onClick={onLock}>
@@ -3641,140 +4564,263 @@ function AdminPanel({
 }
 
 function AdminUserModeration({
+  expanded,
   users,
   onClearUserModeration,
+  onToggleExpanded,
   onModerateUser,
 }: {
+  expanded: boolean
   users: ModerationUser[]
   onClearUserModeration: (user: ModerationUser) => void | Promise<void>
+  onToggleExpanded: () => void
   onModerateUser: (
     user: ModerationUser,
     action: UserModerationState["action"]
   ) => void | Promise<void>
 }) {
   return (
-    <div className="admin-user-panel">
-      <span className="setting-label">
-        <Prohibit weight="duotone" />
-        People
-      </span>
-      {users.length > 0 ? (
-        <div className="admin-user-list">
-          {users.slice(0, 10).map((user) => (
-            <div className="admin-user-row" key={user.id}>
-              <ChatAvatar name={user.name} size="sm" src={user.avatar} />
-              <span>
-                <strong>{user.isSelf ? `${user.name} (you)` : user.name}</strong>
-                <small>
-                  {user.messageCount} message{user.messageCount === 1 ? "" : "s"} ·{" "}
-                  {formatTime(user.lastSeenAt)}
-                </small>
-              </span>
-              <div className="admin-user-actions">
-                <Button
-                  data-tooltip="Timeout for 15 minutes"
-                  disabled={user.isSelf}
-                  size="icon-sm"
-                  type="button"
-                  variant="ghost"
-                  onClick={() => void onModerateUser(user, "timeout")}
-                >
-                  <Clock data-icon="inline-start" weight="duotone" />
-                </Button>
-                <Button
-                  data-tooltip="Ban"
-                  disabled={user.isSelf}
-                  size="icon-sm"
-                  type="button"
-                  variant="ghost"
-                  onClick={() => void onModerateUser(user, "ban")}
-                >
-                  <Prohibit data-icon="inline-start" weight="duotone" />
-                </Button>
-                <Button
-                  data-tooltip="Clear timeout or ban"
-                  disabled={user.isSelf}
-                  size="icon-sm"
-                  type="button"
-                  variant="ghost"
-                  onClick={() => void onClearUserModeration(user)}
-                >
-                  <ShieldCheck data-icon="inline-start" weight="duotone" />
-                </Button>
+    <div className={cn("admin-user-panel", !expanded && "collapsed")}>
+      <button
+        aria-expanded={expanded}
+        className="admin-section-toggle"
+        type="button"
+        onClick={onToggleExpanded}
+      >
+        <span className="setting-label">
+          <Prohibit weight="duotone" />
+          People
+        </span>
+        <span className="admin-section-meta">
+          {users.length}
+          <CaretUp className={cn(!expanded && "collapsed")} weight="bold" />
+        </span>
+      </button>
+      <AnimatePresence initial={false}>
+        {expanded ? (
+          <motion.div
+            animate={{ height: "auto", opacity: 1 }}
+            className="admin-section-content"
+            exit={{ height: 0, opacity: 0 }}
+            initial={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
+          >
+            {users.length > 0 ? (
+              <div className="admin-user-list">
+                {users.slice(0, 10).map((user) => (
+                  <div className="admin-user-row" key={user.id}>
+                    <ChatAvatar name={user.name} size="sm" src={user.avatar} />
+                    <span>
+                      <strong>{user.isSelf ? `${user.name} (you)` : user.name}</strong>
+                      <small>
+                        {user.messageCount} message{user.messageCount === 1 ? "" : "s"} ·{" "}
+                        {formatTime(user.lastSeenAt)}
+                      </small>
+                    </span>
+                    <div className="admin-user-actions">
+                      <Button
+                        data-tooltip="Timeout for 15 minutes"
+                        disabled={user.isSelf}
+                        size="icon-sm"
+                        type="button"
+                        variant="ghost"
+                        onClick={() => void onModerateUser(user, "timeout")}
+                      >
+                        <Clock data-icon="inline-start" weight="duotone" />
+                      </Button>
+                      <Button
+                        data-tooltip="Ban"
+                        disabled={user.isSelf}
+                        size="icon-sm"
+                        type="button"
+                        variant="ghost"
+                        onClick={() => void onModerateUser(user, "ban")}
+                      >
+                        <Prohibit data-icon="inline-start" weight="duotone" />
+                      </Button>
+                      <Button
+                        data-tooltip="Clear timeout or ban"
+                        disabled={user.isSelf}
+                        size="icon-sm"
+                        type="button"
+                        variant="ghost"
+                        onClick={() => void onClearUserModeration(user)}
+                      >
+                        <ShieldCheck data-icon="inline-start" weight="duotone" />
+                      </Button>
+                    </div>
+                  </div>
+                ))}
               </div>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <p className="moderation-empty">No people to moderate yet.</p>
-      )}
+            ) : (
+              <p className="moderation-empty">No people to moderate yet.</p>
+            )}
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
     </div>
   )
 }
 
 function ModerationLogView({
+  expanded,
   moderationLog,
+  onToggleExpanded,
 }: {
+  expanded: boolean
   moderationLog: SpamModerationLogEntry[]
+  onToggleExpanded: () => void
 }) {
   return (
-    <div className="moderation-log-panel">
-      <span className="setting-label">
-        <ShieldCheck weight="duotone" />
-        Moderation log
-      </span>
-      {moderationLog.length > 0 ? (
-        <div className="moderation-log-list">
-          {moderationLog.slice(0, 8).map((entry) => (
-            <div className="moderation-log-entry" key={entry.id}>
-              <strong>{moderationActionLabel(entry.action)}</strong>
-              <span>{entry.reason}</span>
-              <small>
-                {formatTime(entry.at)}
-                {entry.strikes > 0
-                  ? ` - strike ${entry.strikes}/${SPAM_BAN_TRIGGER_COUNT}`
-                  : ""}
-              </small>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <p className="moderation-empty">No spam actions yet.</p>
-      )}
+    <div className={cn("moderation-log-panel", !expanded && "collapsed")}>
+      <button
+        aria-expanded={expanded}
+        className="admin-section-toggle"
+        type="button"
+        onClick={onToggleExpanded}
+      >
+        <span className="setting-label">
+          <ShieldCheck weight="duotone" />
+          Moderation log
+        </span>
+        <span className="admin-section-meta">
+          {moderationLog.length}
+          <CaretUp className={cn(!expanded && "collapsed")} weight="bold" />
+        </span>
+      </button>
+      <AnimatePresence initial={false}>
+        {expanded ? (
+          <motion.div
+            animate={{ height: "auto", opacity: 1 }}
+            className="admin-section-content"
+            exit={{ height: 0, opacity: 0 }}
+            initial={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
+          >
+            {moderationLog.length > 0 ? (
+              <div className="moderation-log-list">
+                {moderationLog.slice(0, 20).map((entry) => (
+                  <div className="moderation-log-entry" key={entry.id}>
+                    <strong>{moderationActionLabel(entry.action)}</strong>
+                    <span>{entry.reason}</span>
+                    <small>
+                      {formatTime(entry.at)}
+                      {entry.strikes > 0
+                        ? ` - strike ${entry.strikes}/${SPAM_BAN_TRIGGER_COUNT}`
+                        : ""}
+                    </small>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="moderation-empty">No spam actions yet.</p>
+            )}
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
     </div>
   )
 }
 
 function ProfilePanel({
+  authBusy,
+  authError,
+  authUser,
   profile,
+  usernameBusy,
+  usernameClaim,
+  usernameDraft,
+  usernameError,
+  usernameReady,
   onAvatarFile,
+  onGoogleSignIn,
+  onGoogleSignOut,
   onProfileChange,
+  onUsernameClaim,
+  onUsernameDraftChange,
 }: {
+  authBusy: boolean
+  authError: string | null
+  authUser: FirebaseAuthUser | null
   profile: Profile
+  usernameBusy: boolean
+  usernameClaim: UsernameClaim | null
+  usernameDraft: string
+  usernameError: string | null
+  usernameReady: boolean
   onAvatarFile: (file: File | undefined) => void
+  onGoogleSignIn: () => void | Promise<void>
+  onGoogleSignOut: () => void | Promise<void>
   onProfileChange: (profile: Profile) => void
+  onUsernameClaim: (name?: string) => Promise<boolean>
+  onUsernameDraftChange: (value: string) => void
 }) {
   const hasAvatar = profile.avatar.trim().length > 0
   const displayedInitials = initials(profile.name) || "Y"
+  const usernameChanged =
+    cleanUsernameDisplayName(usernameDraft) !== cleanUsernameDisplayName(profile.name)
+  const googleConnected = Boolean(authUser && !authUser.isAnonymous)
 
   return (
     <div className="profile-form">
       <div className="profile-card">
         <ChatAvatar name={profile.name} src={profile.avatar} size="lg" />
-        <div className="field-stack">
-          <label htmlFor="profile-name">Display name</label>
-          <Input
-            id="profile-name"
-            maxLength={28}
-            value={profile.name}
-            onChange={(event) =>
-              onProfileChange({
-                ...profile,
-                name: event.target.value || "You",
-              })
-            }
-          />
+        <form
+          className="field-stack profile-username-form"
+          onSubmit={(event) => {
+            event.preventDefault()
+            void onUsernameClaim(usernameDraft)
+          }}
+        >
+          <label htmlFor="profile-name">Unique username</label>
+          <div className="profile-username-row">
+            <Input
+              id="profile-name"
+              maxLength={40}
+              placeholder="Pick a username"
+              value={usernameDraft}
+              onChange={(event) => onUsernameDraftChange(event.target.value)}
+            />
+            <Button
+              disabled={usernameBusy || (usernameReady && !usernameChanged)}
+              size="sm"
+              type="submit"
+              variant="outline"
+            >
+              {usernameBusy ? "Saving" : "Save"}
+            </Button>
+          </div>
+          <small className={cn("profile-username-status", usernameError && "error")}>
+            {usernameError ??
+              (usernameReady && usernameClaim
+                ? `Reserved as @${usernameClaim.key}`
+                : "Required before chatting.")}
+          </small>
+        </form>
+      </div>
+
+      <div className="auth-card profile-auth-card">
+        <div>
+          <span className="setting-label">
+            <GlobeSimple weight="duotone" />
+            Google account
+          </span>
+          <p>
+            {googleConnected
+              ? authUser?.email || authUser?.displayName || "Connected with Google."
+              : "Login or sign up with Google."}
+          </p>
+          {authError ? <small className="auth-error">{authError}</small> : null}
         </div>
+        <Button
+          disabled={authBusy}
+          size="sm"
+          type="button"
+          variant="outline"
+          onClick={() => void (googleConnected ? onGoogleSignOut() : onGoogleSignIn())}
+        >
+          {authBusy ? "Working" : googleConnected ? "Sign out" : "Google"}
+        </Button>
       </div>
 
       {hasAvatar ? (

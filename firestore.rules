@@ -11,7 +11,15 @@ service cloud.firestore {
         || get(/databases/$(database)/documents/rooms/$(roomId)/moderation/$(request.auth.uid)).data.bannedUntil <= request.time.toMillis();
     }
 
-    function validMessagePayload() {
+    function claimedUsernameMatches(roomId, usernameKey, displayName) {
+      return usernameKey is string
+        && usernameKey.matches('[a-z0-9][a-z0-9_-]{2,23}')
+        && exists(/databases/$(database)/documents/rooms/$(roomId)/usernames/$(usernameKey))
+        && get(/databases/$(database)/documents/rooms/$(roomId)/usernames/$(usernameKey)).data.authorId == request.auth.uid
+        && get(/databases/$(database)/documents/rooms/$(roomId)/usernames/$(usernameKey)).data.displayName == displayName;
+    }
+
+    function validMessagePayload(roomId) {
       return request.resource.data.keys().hasOnly([
           "authorId",
           "authorName",
@@ -26,6 +34,7 @@ service cloud.firestore {
           "messageType",
           "replyToId",
           "soundKind",
+          "usernameKey",
           "waveform"
         ])
         && request.resource.data.authorId == request.auth.uid
@@ -55,18 +64,24 @@ service cloud.firestore {
         && request.resource.data.avatar is string
         && request.resource.data.replyToId is string
         && request.resource.data.soundKind is string
+        && claimedUsernameMatches(
+          roomId,
+          request.resource.data.usernameKey,
+          request.resource.data.authorName
+        )
         && request.resource.data.waveform is list
         && request.resource.data.waveform.size() <= 80;
     }
 
-    function validReactionPayload() {
+    function validReactionPayload(roomId) {
       return request.resource.data.keys().hasOnly([
           "authorId",
           "authorName",
           "clientCreatedAt",
           "createdAt",
           "emoji",
-          "messageId"
+          "messageId",
+          "usernameKey"
         ])
         && request.resource.data.authorId == request.auth.uid
         && request.resource.data.authorName is string
@@ -79,7 +94,12 @@ service cloud.firestore {
         && request.resource.data.emoji.size() <= 8
         && request.resource.data.messageId is string
         && request.resource.data.messageId.size() > 0
-        && request.resource.data.messageId.size() <= 160;
+        && request.resource.data.messageId.size() <= 160
+        && claimedUsernameMatches(
+          roomId,
+          request.resource.data.usernameKey,
+          request.resource.data.authorName
+        );
     }
 
     function validModerationPayload() {
@@ -113,6 +133,84 @@ service cloud.firestore {
         && request.resource.data.reason is string
         && request.resource.data.reason.size() > 0
         && request.resource.data.reason.size() <= 280;
+    }
+
+    function validUsernamePayload(usernameKey) {
+      return request.resource.data.keys().hasOnly([
+          "authorId",
+          "clientUpdatedAt",
+          "displayName",
+          "updatedAt",
+          "usernameKey"
+        ])
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.clientUpdatedAt is number
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.size() >= 3
+        && request.resource.data.displayName.size() <= 40
+        && request.resource.data.displayName.matches('[A-Za-z0-9 _-]{3,40}')
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.usernameKey == usernameKey
+        && request.resource.data.usernameKey.matches('[a-z0-9][a-z0-9_-]{2,23}');
+    }
+
+    function validVoicePresencePayload(roomId) {
+      return request.resource.data.keys().hasOnly([
+          "authorId",
+          "avatar",
+          "clientUpdatedAt",
+          "joinedAt",
+          "lastSeenAt",
+          "name",
+          "speaking",
+          "updatedAt",
+          "usernameKey"
+        ])
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.avatar is string
+        && request.resource.data.avatar.size() <= 800000
+        && request.resource.data.clientUpdatedAt is number
+        && request.resource.data.joinedAt is number
+        && request.resource.data.lastSeenAt is number
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 80
+        && claimedUsernameMatches(
+          roomId,
+          request.resource.data.usernameKey,
+          request.resource.data.name
+        )
+        && request.resource.data.speaking is bool
+        && request.resource.data.updatedAt == request.time;
+    }
+
+    function validVoiceSignalPayload() {
+      return request.resource.data.keys().hasOnly([
+          "candidate",
+          "clientCreatedAt",
+          "createdAt",
+          "from",
+          "sdp",
+          "to",
+          "type"
+        ])
+        && request.resource.data.from == request.auth.uid
+        && request.resource.data.to is string
+        && request.resource.data.to.size() > 0
+        && request.resource.data.to.size() <= 160
+        && request.resource.data.to != request.auth.uid
+        && request.resource.data.type is string
+        && request.resource.data.type in ["offer", "answer", "candidate"]
+        && request.resource.data.clientCreatedAt is number
+        && request.resource.data.createdAt == request.time
+        && (
+          (request.resource.data.type == "candidate"
+            && request.resource.data.candidate is map
+            && request.resource.data.sdp == null)
+          || (request.resource.data.type in ["offer", "answer"]
+            && request.resource.data.sdp is map
+            && request.resource.data.candidate == null)
+        );
     }
 
     function validFileContentType() {
@@ -190,18 +288,18 @@ service cloud.firestore {
 
       match /messages/{messageId} {
         allow read: if signedIn();
-        allow create: if signedIn() && notModerated(roomId) && validMessagePayload();
+        allow create: if signedIn() && notModerated(roomId) && validMessagePayload(roomId);
         allow update: if false;
         allow delete: if signedIn();
       }
 
       match /reactions/{reactionId} {
         allow read: if signedIn();
-        allow create: if signedIn() && notModerated(roomId) && validReactionPayload();
+        allow create: if signedIn() && notModerated(roomId) && validReactionPayload(roomId);
         allow update: if signedIn()
           && resource.data.authorId == request.auth.uid
           && notModerated(roomId)
-          && validReactionPayload();
+          && validReactionPayload(roomId);
         allow delete: if signedIn();
       }
 
@@ -209,6 +307,34 @@ service cloud.firestore {
         allow read: if signedIn();
         allow create, update: if signedIn() && validModerationPayload();
         allow delete: if signedIn();
+      }
+
+      match /usernames/{usernameKey} {
+        allow read: if signedIn();
+        allow create: if signedIn() && notModerated(roomId) && validUsernamePayload(usernameKey);
+        allow update: if signedIn()
+          && resource.data.authorId == request.auth.uid
+          && notModerated(roomId)
+          && validUsernamePayload(usernameKey);
+        allow delete: if signedIn() && resource.data.authorId == request.auth.uid;
+      }
+
+      match /voiceParticipants/{authorId} {
+        allow read: if signedIn();
+        allow create, update: if signedIn()
+          && authorId == request.auth.uid
+          && notModerated(roomId)
+          && validVoicePresencePayload(roomId);
+        allow delete: if signedIn() && authorId == request.auth.uid;
+      }
+
+      match /voiceSignals/{signalId} {
+        allow read: if signedIn()
+          && (resource.data.to == request.auth.uid || resource.data.from == request.auth.uid);
+        allow create: if signedIn() && notModerated(roomId) && validVoiceSignalPayload();
+        allow update: if false;
+        allow delete: if signedIn()
+          && (resource.data.to == request.auth.uid || resource.data.from == request.auth.uid);
       }
 
       match /files/{fileId} {
