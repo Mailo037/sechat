@@ -408,9 +408,12 @@ export function TopLeftDock({
         >
           <div className="notification-settings-modal-inner">
             <div className="panel-head">
-              <div className="panel-title-with-icon">
+              <div className="panel-title-with-icon panel-title-copy">
                 <BellRinging weight="duotone" />
-                <strong>Notification settings</strong>
+                <div>
+                  <strong>Notification settings</strong>
+                  <span>Alerts, previews, and app cues</span>
+                </div>
               </div>
               <Button
                 aria-label="Close notification settings"
@@ -624,9 +627,12 @@ export function AdminGatePanel({
   return (
     <div className="admin-panel-inner">
       <div className="panel-head">
-        <div className="panel-title-with-icon admin-panel-title">
+        <div className="panel-title-with-icon admin-panel-title panel-title-copy">
           <LockKey weight="duotone" />
-          <strong>{isUnlocked ? "Admin unlocked" : "Admin unlock"}</strong>
+          <div>
+            <strong>{isUnlocked ? "Admin unlocked" : "Admin unlock"}</strong>
+            <span>{isUnlocked ? "Session is ready" : "Session-only access"}</span>
+          </div>
         </div>
         <Button
           aria-label="Close unlock"
@@ -740,9 +746,12 @@ export function AdminPanel({
   return (
     <div className="admin-panel-inner">
       <div className="panel-head">
-        <div className="panel-title-with-icon admin-panel-title">
+        <div className="panel-title-with-icon admin-panel-title panel-title-copy">
           <ShieldCheck weight="duotone" />
-          <strong>Admin panel</strong>
+          <div>
+            <strong>Admin panel</strong>
+            <span>Room, safety, and people</span>
+          </div>
         </div>
         <Button
           aria-label="Close admin panel"
@@ -766,8 +775,8 @@ export function AdminPanel({
           <small>People</small>
         </span>
         <span>
-          <strong>{unread}</strong>
-          <small>Unread</small>
+          <strong>{voiceParticipantIds.size}</strong>
+          <small>Voice</small>
         </span>
         <span>
           <strong>{remoteEnabled ? "Live" : "Local"}</strong>
@@ -777,41 +786,47 @@ export function AdminPanel({
 
       {adminStatus ? <p className="admin-panel-status">{adminStatus}</p> : null}
 
-      <RoomSettingsAdminPanel
-        moderationUsers={moderationUsers}
-        remoteEnabled={remoteEnabled}
-        roomSettings={roomSettings}
-        unread={unread}
-        voiceParticipantIds={voiceParticipantIds}
-        onRoomSettingsChange={onRoomSettingsChange}
-      />
+      <div className="admin-modal-layout">
+        <div className="admin-modal-column">
+          <RoomSettingsAdminPanel
+            moderationUsers={moderationUsers}
+            remoteEnabled={remoteEnabled}
+            roomSettings={roomSettings}
+            unread={unread}
+            voiceParticipantIds={voiceParticipantIds}
+            onRoomSettingsChange={onRoomSettingsChange}
+          />
 
-      <ModerationSettingsPanel
-        expanded={settingsExpanded}
-        settings={moderationSettings}
-        onSettingsChange={onModerationSettingsChange}
-        onToggleExpanded={() => setSettingsExpanded((current) => !current)}
-      />
+          <ModerationSettingsPanel
+            expanded={settingsExpanded}
+            settings={moderationSettings}
+            onSettingsChange={onModerationSettingsChange}
+            onToggleExpanded={() => setSettingsExpanded((current) => !current)}
+          />
+        </div>
 
-      <AdminUserModeration
-        expanded={peopleExpanded}
-        moderationReason={moderationSettings.reasonPreset}
-        users={moderationUsers}
-        voiceParticipantIds={voiceParticipantIds}
-        onClearUserModeration={onClearUserModeration}
-        onToggleExpanded={() => setPeopleExpanded((current) => !current)}
-        onModerateUser={onModerateUser}
-        onWarnUser={onWarnUser}
-      />
+        <div className="admin-modal-column">
+          <AdminUserModeration
+            expanded={peopleExpanded}
+            moderationReason={moderationSettings.reasonPreset}
+            users={moderationUsers}
+            voiceParticipantIds={voiceParticipantIds}
+            onClearUserModeration={onClearUserModeration}
+            onToggleExpanded={() => setPeopleExpanded((current) => !current)}
+            onModerateUser={onModerateUser}
+            onWarnUser={onWarnUser}
+          />
 
-      <ModerationLogView
-        expanded={logExpanded}
-        moderationLog={moderationLog}
-        onExportModerationLog={onExportModerationLog}
-        onToggleExpanded={() => setLogExpanded((current) => !current)}
-      />
+          <ModerationLogView
+            expanded={logExpanded}
+            moderationLog={moderationLog}
+            onExportModerationLog={onExportModerationLog}
+            onToggleExpanded={() => setLogExpanded((current) => !current)}
+          />
+        </div>
+      </div>
 
-      <div className="admin-panel-actions">
+      <div className="admin-panel-actions admin-panel-footer">
         <Button size="sm" type="button" variant="outline" onClick={onLock}>
           <LockKey data-icon="inline-start" weight="duotone" />
           Lock
@@ -846,25 +861,11 @@ export function RoomSettingsAdminPanel({
             <span>Single room frame · {roomSettings.role}</span>
           </div>
         </div>
-        <Badge variant="outline">{remoteEnabled ? "Firebase live" : "Local only"}</Badge>
-      </div>
-
-      <div className="room-frame-grid" aria-label="Room status">
-        <span>
-          <strong>{moderationUsers.length}</strong>
-          <small>People seen</small>
-        </span>
-        <span>
-          <strong>{unread}</strong>
-          <small>Unread</small>
-        </span>
-        <span>
-          <strong>{voiceParticipantIds.size}</strong>
-          <small>In voice</small>
-        </span>
-        <span>
-          <strong>{remoteEnabled ? "Live" : "Local"}</strong>
-          <small>Firebase</small>
+        <span className="admin-room-meta">
+          <Badge variant="outline">{remoteEnabled ? "Firebase live" : "Local only"}</Badge>
+          <small>
+            {moderationUsers.length} seen · {voiceParticipantIds.size} voice · {unread} unread
+          </small>
         </span>
       </div>
 
@@ -949,8 +950,7 @@ export function RoomSettingsAdminPanel({
         </button>
       </div>
       <p>
-        Multi-room navigation is framed here, but group/channel creation stays hidden while
-        Sechat remains a single-room app.
+        Single-room mode: future rooms and invite links stay parked here.
       </p>
     </section>
   )
@@ -1614,6 +1614,17 @@ export function NotificationsPanel({
   const reduceMotion = useReducedMotion()
   const showAlertCategories =
     notifications.soundsEnabled || notifications.browserEnabled
+  const enabledSoundKindCount = Object.values(notifications.soundKinds).filter(Boolean).length
+  const previewCount = [
+    notifications.attachmentPreviews ?? true,
+    notifications.voicePreviews ?? true,
+    notifications.mentionSummary ?? true,
+  ].filter(Boolean).length
+  const browserStatus = notifications.browserEnabled
+    ? permission === "granted"
+      ? "On"
+      : "Pending"
+    : "Off"
   const permissionText =
     permission === "granted"
       ? "Permission granted."
@@ -1624,131 +1635,154 @@ export function NotificationsPanel({
           : "Permission needed."
 
   return (
-    <div className={cn("settings-stack", compact && "settings-stack-compact")}>
-      <div className="settings-row">
-        <div>
-          <span className="setting-label">
-            <GlobeSimple weight="duotone" />
-            Main Chat notifications
+    <div className={cn("settings-stack", compact && "settings-stack-compact", !compact && "notification-settings-stack")}>
+      {!compact ? (
+        <div className="notification-summary-grid" aria-label="Notification summary">
+          <span>
+            <strong>{(notifications.roomEnabled ?? true) ? "On" : "Off"}</strong>
+            <small>Room</small>
           </span>
-          <p>Per-room switch for this single-room frame.</p>
-        </div>
-        <Switch
-          aria-label="Toggle Main Chat notifications"
-          checked={notifications.roomEnabled ?? true}
-          onCheckedChange={(checked) =>
-            onNotificationSettingsChange((current) => ({
-              ...current,
-              roomEnabled: checked,
-            }))
-          }
-        />
-      </div>
-
-      <div className="settings-row">
-        <div>
-          <span className="setting-label">
-            <Bell weight="duotone" />
-            Browser notifications
+          <span>
+            <strong>{browserStatus}</strong>
+            <small>Browser</small>
           </span>
-          <p>{permissionText} Uses the same categories below when this tab is not active.</p>
-        </div>
-        <Switch
-          aria-label="Toggle browser notifications"
-          checked={notifications.browserEnabled}
-          disabled={permission === "denied" || permission === "unsupported"}
-          onCheckedChange={onBrowserToggle}
-        />
-      </div>
-
-      <div className="settings-row">
-        <div>
-          <span className="setting-label">
-            {notifications.soundsEnabled ? (
-              <SpeakerHigh weight="duotone" />
-            ) : (
-              <SpeakerSlash weight="duotone" />
-            )}
-            Notification sounds
+          <span>
+            <strong>{notifications.soundsEnabled ? `${enabledSoundKindCount}/3` : "Off"}</strong>
+            <small>Alerts</small>
           </span>
-          <p>Master switch for all chat tones.</p>
+          <span>
+            <strong>{previewCount}/3</strong>
+            <small>Previews</small>
+          </span>
         </div>
-        <Switch
-          aria-label="Toggle notification sounds"
-          checked={notifications.soundsEnabled}
-          onCheckedChange={onSoundToggle}
-        />
-      </div>
+      ) : null}
 
-      <AnimatePresence initial={false}>
-        {showAlertCategories ? (
-          <motion.div
-            animate={{ height: "auto", opacity: 1, x: 0 }}
-            aria-label="Alert categories"
-            className="sound-kind-list"
-            exit={{
-              borderWidth: 0,
-              height: 0,
-              opacity: 0,
-              paddingBottom: 0,
-              paddingTop: 0,
-              x: -20,
-            }}
-            initial={
-              reduceMotion
-                ? false
-                : {
-                    borderWidth: 0,
-                    height: 0,
-                    opacity: 0,
-                    paddingBottom: 0,
-                    paddingTop: 0,
-                    x: -20,
-                  }
+      <div className="notification-settings-section notification-routing-section">
+        <div className="settings-row">
+          <div>
+            <span className="setting-label">
+              <GlobeSimple weight="duotone" />
+              Main Chat notifications
+            </span>
+            <p>Per-room switch for this single-room frame.</p>
+          </div>
+          <Switch
+            aria-label="Toggle Main Chat notifications"
+            checked={notifications.roomEnabled ?? true}
+            onCheckedChange={(checked) =>
+              onNotificationSettingsChange((current) => ({
+                ...current,
+                roomEnabled: checked,
+              }))
             }
-            key="sound-kind-list"
-            transition={{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }}
-          >
-            <div className="sound-kind-head">
-              <strong>Alert categories</strong>
-              <span>Filters sound and Chrome popups</span>
-            </div>
-            <div className="sound-kind-row">
-              <span className="setting-label">
-                <Bell weight="duotone" />
-                General chat
-              </span>
-              <Switch
-                aria-label="Toggle general chat sound"
-                checked={notifications.soundKinds.message}
-                onCheckedChange={(enabled) => onSoundKindToggle("message", enabled)}
-              />
-            </div>
-            <div className="sound-kind-row">
-              <span className="setting-label">
-                <ArrowBendUpLeft weight="duotone" />
-                Replies
-              </span>
-              <Switch
-                aria-label="Toggle reply sound"
-                checked={notifications.soundKinds.reply}
-                onCheckedChange={(enabled) => onSoundKindToggle("reply", enabled)}
-              />
-            </div>
-            <div className="sound-kind-row">
-              <span className="setting-label">
-                <At weight="duotone" />
-                Mentions
-              </span>
-              <Switch
-                aria-label="Toggle mention sound"
-                checked={notifications.soundKinds.ping}
-                onCheckedChange={(enabled) => onSoundKindToggle("ping", enabled)}
-              />
-            </div>
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
+          />
+        </div>
+
+        <div className="settings-row">
+          <div>
+            <span className="setting-label">
+              <Bell weight="duotone" />
+              Browser notifications
+            </span>
+            <p>{permissionText} Uses the same categories below when this tab is not active.</p>
+          </div>
+          <Switch
+            aria-label="Toggle browser notifications"
+            checked={notifications.browserEnabled}
+            disabled={permission === "denied" || permission === "unsupported"}
+            onCheckedChange={onBrowserToggle}
+          />
+        </div>
+
+        <div className="settings-row">
+          <div>
+            <span className="setting-label">
+              {notifications.soundsEnabled ? (
+                <SpeakerHigh weight="duotone" />
+              ) : (
+                <SpeakerSlash weight="duotone" />
+              )}
+              Notification sounds
+            </span>
+            <p>Master switch for all chat tones.</p>
+          </div>
+          <Switch
+            aria-label="Toggle notification sounds"
+            checked={notifications.soundsEnabled}
+            onCheckedChange={onSoundToggle}
+          />
+        </div>
+
+        <AnimatePresence initial={false}>
+          {showAlertCategories ? (
+            <motion.div
+              animate={{ height: "auto", opacity: 1, x: 0 }}
+              aria-label="Alert categories"
+              className="sound-kind-list"
+              exit={{
+                borderWidth: 0,
+                height: 0,
+                opacity: 0,
+                paddingBottom: 0,
+                paddingTop: 0,
+                x: -20,
+              }}
+              initial={
+                reduceMotion
+                  ? false
+                  : {
+                      borderWidth: 0,
+                      height: 0,
+                      opacity: 0,
+                      paddingBottom: 0,
+                      paddingTop: 0,
+                      x: -20,
+                    }
+              }
+              key="sound-kind-list"
+              transition={{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }}
+            >
+              <div className="sound-kind-head">
+                <strong>Alert categories</strong>
+                <span>Filters sound and Chrome popups</span>
+              </div>
+              <div className="sound-kind-row">
+                <span className="setting-label">
+                  <Bell weight="duotone" />
+                  General chat
+                </span>
+                <Switch
+                  aria-label="Toggle general chat sound"
+                  checked={notifications.soundKinds.message}
+                  onCheckedChange={(enabled) => onSoundKindToggle("message", enabled)}
+                />
+              </div>
+              <div className="sound-kind-row">
+                <span className="setting-label">
+                  <ArrowBendUpLeft weight="duotone" />
+                  Replies
+                </span>
+                <Switch
+                  aria-label="Toggle reply sound"
+                  checked={notifications.soundKinds.reply}
+                  onCheckedChange={(enabled) => onSoundKindToggle("reply", enabled)}
+                />
+              </div>
+              <div className="sound-kind-row">
+                <span className="setting-label">
+                  <At weight="duotone" />
+                  Mentions
+                </span>
+                <Switch
+                  aria-label="Toggle mention sound"
+                  checked={notifications.soundKinds.ping}
+                  onCheckedChange={(enabled) => onSoundKindToggle("ping", enabled)}
+                />
+              </div>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+      </div>
 
       {compact ? (
         <>
@@ -1769,34 +1803,36 @@ export function NotificationsPanel({
         </>
       ) : (
         <>
-          <div className="settings-row stacked-setting-row">
-            <div>
-              <span className="setting-label">
-                <At weight="duotone" />
-                Keyword alerts
-              </span>
-              <p>Comma-separated words that should behave like mentions.</p>
-            </div>
-            <Input
-              aria-label="Keyword alerts"
-              placeholder="build, urgent, mailo"
-              value={(notifications.keywordAlerts ?? []).join(", ")}
-              onChange={(event) => {
-                const keywordAlerts = event.currentTarget.value
-                  .split(",")
-                  .map((item) => item.trim())
-                  .filter(Boolean)
-                  .slice(0, 20)
+          <div className="notification-settings-section notification-keyword-section">
+            <div className="settings-row stacked-setting-row">
+              <div>
+                <span className="setting-label">
+                  <At weight="duotone" />
+                  Keyword alerts
+                </span>
+                <p>Comma-separated words that should behave like mentions.</p>
+              </div>
+              <Input
+                aria-label="Keyword alerts"
+                placeholder="build, urgent, mailo"
+                value={(notifications.keywordAlerts ?? []).join(", ")}
+                onChange={(event) => {
+                  const keywordAlerts = event.currentTarget.value
+                    .split(",")
+                    .map((item) => item.trim())
+                    .filter(Boolean)
+                    .slice(0, 20)
 
-                onNotificationSettingsChange((current) => ({
-                  ...current,
-                  keywordAlerts,
-                }))
-              }}
-            />
+                  onNotificationSettingsChange((current) => ({
+                    ...current,
+                    keywordAlerts,
+                  }))
+                }}
+              />
+            </div>
           </div>
 
-          <div className="sound-kind-list notification-preview-list">
+          <div className="sound-kind-list notification-preview-list notification-settings-section">
             <div className="sound-kind-head">
               <strong>Notification previews</strong>
               <span>Attachment and voice details in Chrome notifications.</span>
@@ -1851,98 +1887,100 @@ export function NotificationsPanel({
             </div>
           </div>
 
-          <div className="settings-row">
-            <div>
-              <span className="setting-label">
-                {notifications.uiSoundsEnabled ? (
-                  <SpeakerHigh weight="duotone" />
-                ) : (
-                  <SpeakerSlash weight="duotone" />
-                )}
-                Button sounds
-              </span>
-              <p>Short confirmation cues for send, discard, and file actions.</p>
+          <div className="notification-settings-section notification-cue-section">
+            <div className="settings-row">
+              <div>
+                <span className="setting-label">
+                  {notifications.uiSoundsEnabled ? (
+                    <SpeakerHigh weight="duotone" />
+                  ) : (
+                    <SpeakerSlash weight="duotone" />
+                  )}
+                  Button sounds
+                </span>
+                <p>Short confirmation cues for send, discard, and file actions.</p>
+              </div>
+              <Switch
+                aria-label="Toggle button confirmation sounds"
+                checked={notifications.uiSoundsEnabled}
+                onCheckedChange={onUiSoundToggle}
+              />
             </div>
-            <Switch
-              aria-label="Toggle button confirmation sounds"
-              checked={notifications.uiSoundsEnabled}
-              onCheckedChange={onUiSoundToggle}
-            />
+
+            <AnimatePresence initial={false}>
+              {notifications.uiSoundsEnabled ? (
+                <motion.div
+                  animate={{ height: "auto", opacity: 1, x: 0 }}
+                  className="ui-sound-picker"
+                  exit={{
+                    borderWidth: 0,
+                    height: 0,
+                    opacity: 0,
+                    paddingBottom: 0,
+                    paddingTop: 0,
+                    x: -20,
+                  }}
+                  initial={
+                    reduceMotion
+                      ? false
+                      : {
+                          borderWidth: 0,
+                          height: 0,
+                          opacity: 0,
+                          paddingBottom: 0,
+                          paddingTop: 0,
+                          x: -20,
+                        }
+                  }
+                  key="ui-sound-picker"
+                  transition={{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }}
+                >
+                  <div className="ui-sound-picker-head">
+                    <div>
+                      <span>Confirmation tone</span>
+                      <small>General button feedback is louder now.</small>
+                    </div>
+                  </div>
+                  <div className="ui-sound-options">
+                    {uiSoundOptions.map((option) => (
+                      <button
+                        aria-pressed={notifications.uiSound === option.kind}
+                        className={cn(
+                          "ui-sound-option",
+                          notifications.uiSound === option.kind && "active"
+                        )}
+                        key={option.kind}
+                        type="button"
+                        onClick={() => onUiSoundKindChange(option.kind)}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="ui-cue-preview-row">
+                    <Button size="sm" type="button" variant="ghost" onClick={onUiSoundPreview}>
+                      <Play data-icon="inline-start" weight="fill" />
+                      General
+                    </Button>
+                    {uiCuePreviewOptions.map((option) => (
+                      <Button
+                        key={option.kind}
+                        size="sm"
+                        type="button"
+                        variant="ghost"
+                        onClick={() => onUiCuePreview(option.kind)}
+                      >
+                        <Play data-icon="inline-start" weight="fill" />
+                        {option.label}
+                      </Button>
+                    ))}
+                  </div>
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
           </div>
 
-          <AnimatePresence initial={false}>
-            {notifications.uiSoundsEnabled ? (
-              <motion.div
-                animate={{ height: "auto", opacity: 1, x: 0 }}
-                className="ui-sound-picker"
-                exit={{
-                  borderWidth: 0,
-                  height: 0,
-                  opacity: 0,
-                  paddingBottom: 0,
-                  paddingTop: 0,
-                  x: -20,
-                }}
-                initial={
-                  reduceMotion
-                    ? false
-                    : {
-                        borderWidth: 0,
-                        height: 0,
-                        opacity: 0,
-                        paddingBottom: 0,
-                        paddingTop: 0,
-                        x: -20,
-                      }
-                }
-                key="ui-sound-picker"
-                transition={{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }}
-              >
-                <div className="ui-sound-picker-head">
-                  <div>
-                    <span>Confirmation tone</span>
-                    <small>General button feedback is louder now.</small>
-                  </div>
-                </div>
-                <div className="ui-sound-options">
-                  {uiSoundOptions.map((option) => (
-                    <button
-                      aria-pressed={notifications.uiSound === option.kind}
-                      className={cn(
-                        "ui-sound-option",
-                        notifications.uiSound === option.kind && "active"
-                      )}
-                      key={option.kind}
-                      type="button"
-                      onClick={() => onUiSoundKindChange(option.kind)}
-                    >
-                      {option.label}
-                    </button>
-                  ))}
-                </div>
-                <div className="ui-cue-preview-row">
-                  <Button size="sm" type="button" variant="ghost" onClick={onUiSoundPreview}>
-                    <Play data-icon="inline-start" weight="fill" />
-                    General
-                  </Button>
-                  {uiCuePreviewOptions.map((option) => (
-                    <Button
-                      key={option.kind}
-                      size="sm"
-                      type="button"
-                      variant="ghost"
-                      onClick={() => onUiCuePreview(option.kind)}
-                    >
-                      <Play data-icon="inline-start" weight="fill" />
-                      {option.label}
-                    </Button>
-                  ))}
-                </div>
-              </motion.div>
-            ) : null}
-          </AnimatePresence>
-
-          <p className="status-copy">
+          <p className="status-copy notification-modal-note">
             Browser alerts only appear after permission is granted. Sound playback may
             start after your first click in this tab.
           </p>
