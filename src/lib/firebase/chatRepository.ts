@@ -531,6 +531,7 @@ export function listenToRemoteVoiceParticipants(
 
 export async function setRemoteVoicePresence(input: {
   avatar?: string
+  cameraOn?: boolean
   joinedAt: number
   name: string
   speaking: boolean
@@ -549,6 +550,7 @@ export async function setRemoteVoicePresence(input: {
     {
       authorId: user.uid,
       avatar: input.avatar ?? "",
+      cameraOn: input.cameraOn === true,
       clientUpdatedAt: now,
       joinedAt: input.joinedAt,
       lastSeenAt: now,
@@ -1460,6 +1462,7 @@ function toVoiceParticipant(
 
   return {
     avatar: typeof data.avatar === "string" ? data.avatar : "",
+    cameraOn: data.cameraOn === true,
     id,
     joinedAt: typeof data.joinedAt === "number" ? data.joinedAt : lastSeenAt,
     lastSeenAt,

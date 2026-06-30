@@ -270,6 +270,18 @@ body,
   padding-top: 10px;
 }
 
+.voice-stage-content.video-focus-active {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  align-self: stretch;
+  align-items: center;
+  align-content: stretch;
+  justify-content: flex-start;
+  gap: 12px;
+}
+
 .voice-main-card {
   display: grid;
   width: min(560px, 100%);
@@ -522,12 +534,11 @@ body,
 }
 
 .voice-participant-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, 58px);
+  display: flex;
+  flex-wrap: wrap;
   align-self: start;
   align-items: center;
   justify-content: center;
-  justify-items: center;
   gap: 12px;
   width: min(520px, 100%);
 }
@@ -597,6 +608,19 @@ body,
   opacity: 0.58;
 }
 
+.voice-participant-card.has-video {
+  width: 118px;
+  height: 74px;
+  place-items: stretch;
+  padding: 3px;
+  border-radius: 16px;
+  overflow: hidden;
+}
+
+.voice-participant-card.has-video.muted {
+  opacity: 0.72;
+}
+
 .voice-participant-avatar {
   position: relative;
   width: 46px;
@@ -664,6 +688,143 @@ body,
 .voice-participant-card.speaking .voice-speaking-indicator::after {
   animation: voice-speaking-pulse 900ms ease-out infinite;
   border-color: rgba(244, 244, 245, 0.38);
+}
+
+.voice-video-tile,
+.voice-video-focus {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid rgba(82, 82, 91, 0.58);
+  background: #09090a;
+}
+
+.voice-video-tile {
+  width: 100%;
+  height: 100%;
+  border-radius: 12px;
+}
+
+.voice-video-media,
+.voice-video-focus-media {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: #050506;
+  object-fit: cover;
+}
+
+.voice-video-media.mirrored,
+.voice-video-focus-media.mirrored {
+  transform: scaleX(-1);
+}
+
+.voice-video-placeholder,
+.voice-video-focus-placeholder {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+  background:
+    radial-gradient(circle at 50% 38%, rgba(63, 63, 70, 0.42), transparent 44%),
+    rgba(17, 17, 19, 0.96);
+  color: #d4d4d8;
+}
+
+.voice-video-placeholder {
+  grid-template-columns: auto auto;
+  gap: 7px;
+}
+
+.voice-video-placeholder .chat-avatar {
+  width: 30px;
+  height: 30px;
+}
+
+.voice-video-placeholder svg,
+.voice-video-focus-placeholder svg {
+  width: 20px;
+  height: 20px;
+}
+
+.voice-video-focus-placeholder {
+  gap: 10px;
+}
+
+.voice-video-name {
+  position: absolute;
+  right: 6px;
+  bottom: 5px;
+  left: 6px;
+  overflow: hidden;
+  padding: 3px 6px;
+  border: 1px solid rgba(244, 244, 245, 0.12);
+  border-radius: 999px;
+  background: rgba(9, 9, 10, 0.68);
+  color: #f4f4f5;
+  font-size: 0.64rem;
+  font-weight: 760;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.voice-video-focus {
+  width: min(860px, 100%);
+  flex: 1 1 auto;
+  min-height: min(440px, calc(100dvh - 280px));
+  align-self: center;
+  justify-self: center;
+  border-radius: 20px;
+  box-shadow: var(--shadow-tight);
+}
+
+.voice-video-focus-bar {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  left: 10px;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 6px 6px 10px;
+  border: 1px solid rgba(82, 82, 91, 0.62);
+  border-radius: 999px;
+  background: rgba(17, 17, 19, 0.76);
+  backdrop-filter: blur(18px) saturate(115%);
+}
+
+.voice-video-focus-bar span {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  color: #f4f4f5;
+}
+
+.voice-video-focus-bar span > svg {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+}
+
+.voice-video-focus-bar strong {
+  overflow: hidden;
+  font-size: 0.78rem;
+  font-weight: 780;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.voice-video-focus-close {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(82, 82, 91, 0.62);
+  border-radius: 999px;
+  background: rgba(32, 32, 34, 0.88);
+  color: #f4f4f5;
 }
 
 .voice-participant-menu {
@@ -747,6 +908,11 @@ body,
 .voice-control-button.active {
   border-color: rgba(244, 244, 245, 0.5);
   background: rgba(244, 244, 245, 0.14);
+}
+
+.voice-control-button.loading {
+  cursor: wait;
+  opacity: 0.7;
 }
 
 .voice-control-button.leave {
@@ -6089,6 +6255,13 @@ body,
     padding: 12px 14px 8px;
   }
 
+  .voice-stage-content.video-focus-active {
+    height: 100%;
+    gap: 8px;
+    overflow-y: hidden;
+    padding: 10px 10px 8px;
+  }
+
   .voice-main-card {
     gap: 8px;
   }
@@ -6140,6 +6313,11 @@ body,
     padding: 0 14px max(10px, env(safe-area-inset-bottom));
   }
 
+  .voice-stage.has-video-focus .voice-mic-test,
+  .voice-stage.has-video-focus .voice-meter-reveal {
+    display: none;
+  }
+
   .voice-device-menu {
     position: fixed;
     bottom: calc(100dvh - var(--voice-stage-height) + 56px);
@@ -6180,10 +6358,28 @@ body,
     height: 52px;
   }
 
+  .voice-participant-card.has-video {
+    flex-basis: 96px;
+    width: 96px;
+    height: 60px;
+  }
+
   .voice-participant-avatar,
   .voice-participant-avatar .chat-avatar {
     width: 40px;
     height: 40px;
+  }
+
+  .voice-video-focus {
+    min-height: clamp(142px, calc(var(--voice-stage-height) - 160px), 300px);
+    border-radius: 16px;
+  }
+
+  .voice-video-focus-bar {
+    right: 7px;
+    bottom: 7px;
+    left: 7px;
+    padding: 5px 5px 5px 9px;
   }
 
   .voice-chat-resizer {

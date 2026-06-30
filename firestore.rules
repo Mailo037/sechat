@@ -329,6 +329,7 @@ service cloud.firestore {
       return request.resource.data.keys().hasOnly([
           "authorId",
           "avatar",
+          "cameraOn",
           "clientUpdatedAt",
           "joinedAt",
           "lastSeenAt",
@@ -340,6 +341,7 @@ service cloud.firestore {
         && request.resource.data.authorId == request.auth.uid
         && request.resource.data.avatar is string
         && request.resource.data.avatar.size() <= 800000
+        && request.resource.data.cameraOn is bool
         && request.resource.data.clientUpdatedAt is number
         && request.resource.data.joinedAt is number
         && request.resource.data.lastSeenAt is number

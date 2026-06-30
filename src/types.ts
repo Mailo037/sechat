@@ -108,6 +108,7 @@ export type ModerationUser = {
 
 export type VoiceParticipantState = {
   avatar?: string
+  cameraOn?: boolean
   id: string
   joinedAt: number
   lastSeenAt: number
