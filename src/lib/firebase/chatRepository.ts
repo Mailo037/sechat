@@ -558,8 +558,7 @@ export async function setRemoteVoicePresence(input: {
       speaking: input.speaking,
       updatedAt: serverTimestamp(),
       usernameKey: input.usernameKey.trim(),
-    },
-    { merge: true }
+    }
   )
 
   return user.uid

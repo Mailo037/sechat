@@ -13,6 +13,20 @@ import type { LowLatencyMediaTrackConstraints, SinkAudioElement, SpeechRecogniti
 import { ChatAvatar } from "@/components/chat/ChatAvatar"
 import { averageRounded, clampLevel, isInterruptedPlaybackError, isMediaPermissionError, isMicrophonePermissionError, makeQuietWaveform, sortAudioDevices, toSessionDescriptionInit } from "@/components/chat/media-utils"
 
+function isPermissionDeniedError(error: unknown) {
+  const code =
+    typeof error === "object" && error !== null && "code" in error
+      ? String(error.code)
+      : ""
+  const message = error instanceof Error ? error.message : String(error ?? "")
+  const normalized = `${code} ${message}`.toLowerCase()
+
+  return (
+    normalized.includes("permission-denied") ||
+    normalized.includes("missing or insufficient permissions")
+  )
+}
+
 export function VoiceChatStage({
   adminUnlocked,
   authorId,
@@ -1001,6 +1015,12 @@ export function VoiceChatStage({
     } catch (error) {
       lastVoicePresenceWriteAtRef.current = Date.now()
       console.warn("Could not publish voice presence", error)
+      if (isPermissionDeniedError(error)) {
+        voicePresenceForcePendingRef.current = false
+        stopVoicePresenceHeartbeat()
+        setVoiceError("Could not sync voice presence. Reserve your username and rejoin voice.")
+        return
+      }
       voicePresenceForcePendingRef.current = true
     } finally {
       voicePresenceWriteInFlightRef.current = false
