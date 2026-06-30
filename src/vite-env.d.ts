@@ -1,13 +1,5 @@
 /// <reference types="vite/client" />
 
-interface ImportMetaEnv {
-  readonly VITE_WEB_PASSWORD?: string
-}
-
-interface ImportMeta {
-  readonly env: ImportMetaEnv
-}
-
 type SechatFirebaseConfig = {
   readonly enabled: boolean
   readonly apiKey: string
@@ -23,3 +15,4 @@ type SechatFirebaseConfig = {
 }
 
 declare const __SECHAT_FIREBASE_CONFIG__: SechatFirebaseConfig
+declare const __SECHAT_WEB_PASSWORD__: string

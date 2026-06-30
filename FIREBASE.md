@@ -25,9 +25,9 @@ Copy `.env.example` into Vercel Project Settings -> Environment Variables and fi
 ```bash
 FIREBASE_ENABLED=true
 FIREBASE_API_KEY=...
-FIREBASE_AUTH_DOMAIN=...
-FIREBASE_PROJECT_ID=...
-FIREBASE_STORAGE_BUCKET=...
+FIREBASE_AUTH_DOMAIN=sechat-app.firebaseapp.com
+FIREBASE_PROJECT_ID=sechat-app
+FIREBASE_STORAGE_BUCKET=sechat-app.firebasestorage.app
 FIREBASE_MESSAGING_SENDER_ID=...
 FIREBASE_APP_ID=...
 FIREBASE_DATABASE_ID=
@@ -35,9 +35,8 @@ FIREBASE_ROOM_ID=main
 WEB_PASSWORD=...
 ```
 
-Leave `FIREBASE_DATABASE_ID` empty for the default Firestore database. If
-`FIREBASE_STORAGE_BUCKET` is empty, the app falls back to
-`<project-id>.firebasestorage.app`, which matches new Firebase Storage buckets.
+Leave `FIREBASE_DATABASE_ID` empty for the default Firestore database. This
+project uses the `sechat-app.firebasestorage.app` Firebase Storage bucket.
 
 Current upload limits are enforced in the browser and in Storage rules:
 

@@ -18,6 +18,8 @@ import {
 import {
   connectFirestoreEmulator,
   getFirestore,
+  initializeFirestore,
+  setLogLevel,
   type Firestore,
 } from "firebase/firestore"
 import {
@@ -84,6 +86,7 @@ export function getFirebaseServices() {
   if (!firebaseRemoteEnabled() || !firebaseConfigReady()) return null
   if (services) return services
 
+  setLogLevel("error")
   const storageBucket = getFirebaseStorageBucket()
 
   const app =
@@ -99,13 +102,31 @@ export function getFirebaseServices() {
 
   const auth = getAuth(app)
   const databaseId = getFirebaseDatabaseId()
-  const db = databaseId ? getFirestore(app, databaseId) : getFirestore(app)
+  const db = createFirestore(app, databaseId)
   const storage = getStorage(app)
   services = { app, auth, db, storage }
 
   connectEmulators(services)
 
   return services
+}
+
+function createFirestore(app: FirebaseApp, databaseId: string) {
+  try {
+    return initializeFirestore(
+      app,
+      {
+        experimentalForceLongPolling: true,
+        experimentalLongPollingOptions: {
+          timeoutSeconds: 10,
+        },
+        ignoreUndefinedProperties: true,
+      },
+      databaseId || undefined
+    )
+  } catch {
+    return databaseId ? getFirestore(app, databaseId) : getFirestore(app)
+  }
 }
 
 function connectEmulators(current: FirebaseServices) {

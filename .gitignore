@@ -10,8 +10,7 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
-.env
-.env.*
+.env*
 !.env.example
 *.local
 
@@ -27,6 +26,4 @@ dist-ssr
 *.sw?
 
 .vercel
-.env*
-!.env.example
-.firebaserc
+.playwright-cli

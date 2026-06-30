@@ -7,7 +7,7 @@ import path from 'node:path'
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const readEnv = (key: string, fallback = '') =>
-    env[key] ?? env[`VITE_${key}`] ?? fallback
+    env[key] ?? fallback
   const isEnabled = (key: string) => readEnv(key) === 'true'
 
   return {
@@ -25,9 +25,7 @@ export default defineConfig(({ mode }) => {
         useEmulators: isEnabled('FIREBASE_USE_EMULATORS'),
         emulatorHost: readEnv('FIREBASE_EMULATOR_HOST', '127.0.0.1'),
       }),
-      'import.meta.env.VITE_WEB_PASSWORD': JSON.stringify(
-        env.VITE_WEB_PASSWORD ?? env.WEB_PASSWORD ?? ''
-      ),
+      __SECHAT_WEB_PASSWORD__: JSON.stringify(env.WEB_PASSWORD ?? ''),
     },
     plugins: [react(), tailwindcss()],
     resolve: {

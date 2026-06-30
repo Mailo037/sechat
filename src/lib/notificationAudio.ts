@@ -1,8 +1,44 @@
 import type { ChatMessage, SoundKind, UiSoundKind } from "@/types"
 
 let audioContext: AudioContext | null = null
+let audioInteractionSeen = false
+
+function markAudioInteraction() {
+  audioInteractionSeen = true
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("pointerdown", markAudioInteraction, {
+    capture: true,
+    once: true,
+    passive: true,
+  })
+  window.addEventListener("keydown", markAudioInteraction, {
+    capture: true,
+    once: true,
+  })
+}
+
+function hasAudioActivation() {
+  if (audioInteractionSeen) return true
+  if (typeof navigator === "undefined") return false
+
+  const activation = (
+    navigator as Navigator & {
+      userActivation?: { hasBeenActive?: boolean; isActive?: boolean }
+    }
+  ).userActivation
+
+  return activation?.hasBeenActive === true || activation?.isActive === true
+}
 
 function getAudioContext() {
+  if (!hasAudioActivation()) return null
+
+  if (audioContext?.state === "closed") {
+    audioContext = null
+  }
+
   if (!audioContext) {
     audioContext = new AudioContext()
   }
@@ -13,6 +49,8 @@ function getAudioContext() {
 export async function unlockAudio() {
   try {
     const context = getAudioContext()
+    if (!context) return
+
     if (context.state === "suspended") {
       await context.resume()
     }
@@ -71,6 +109,12 @@ export function playNotificationSound(kind: SoundKind, enabled: boolean) {
 
   try {
     const context = getAudioContext()
+    if (!context) return
+
+    if (context.state === "suspended") {
+      void context.resume().catch(() => undefined)
+    }
+
     const now = context.currentTime
     const master = context.createGain()
     master.gain.setValueAtTime(0.0001, now)
@@ -104,6 +148,12 @@ export function playUiSound(kind: UiSoundKind, enabled: boolean) {
 
   try {
     const context = getAudioContext()
+    if (!context) return
+
+    if (context.state === "suspended") {
+      void context.resume().catch(() => undefined)
+    }
+
     const now = context.currentTime
     const master = context.createGain()
     master.gain.setValueAtTime(0.0001, now)

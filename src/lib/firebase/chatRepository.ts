@@ -3,6 +3,7 @@ import {
   collection,
   deleteDoc,
   doc,
+  getDoc,
   getDocs,
   limit,
   onSnapshot,
@@ -31,7 +32,9 @@ import type {
   MessageReaction,
   MessageType,
   SoundKind,
+  UiSoundKind,
   UserModerationState,
+  UserPreferences,
   UsernameClaim,
   VoiceKickState,
   VoiceParticipantState,
@@ -167,6 +170,41 @@ export async function claimRemoteUsername(
     key,
     name,
   }
+}
+
+export async function loadRemoteUserPreferences(userId: string) {
+  const current = getFirebaseServices()
+  if (!current || !userId) return null
+
+  const snapshot = await getDoc(doc(current.db, "users", userId))
+  return snapshot.exists() ? toUserPreferences(snapshot.data()) : null
+}
+
+export async function saveRemoteUserPreferences(input: UserPreferences) {
+  const current = getFirebaseServices()
+  const user = await ensureAnonymousUser()
+  if (!current || !user || user.isAnonymous) {
+    return
+  }
+
+  await setDoc(
+    doc(current.db, "users", user.uid),
+    {
+      clientUpdatedAt: Date.now(),
+      moderationSettings: sanitizeModerationSettings(input.moderationSettings),
+      notifications: sanitizeNotificationSettings(input.notifications),
+      profile: sanitizeProfile(input.profile),
+      roomSettings: sanitizeRoomSettings(input.roomSettings),
+      trustedSites: sanitizeTrustedSites(input.trustedSites),
+      updatedAt: serverTimestamp(),
+      usernameClaim:
+        input.usernameClaim?.authorId === user.uid
+          ? sanitizeUsernameClaim(input.usernameClaim)
+          : null,
+      version: input.version,
+    },
+    { merge: true }
+  )
 }
 
 export function listenToRemoteMessages(
@@ -378,6 +416,32 @@ export function listenToRemoteModeration(
   )
 }
 
+export function listenToRemoteModerations(
+  onModerations: (moderations: UserModerationState[]) => void,
+  onError: (error: Error) => void
+): Unsubscribe | null {
+  const current = getFirebaseServices()
+  if (!current) return null
+
+  const roomId = getFirebaseRoomId()
+  return onSnapshot(
+    collection(current.db, "rooms", roomId, "moderation"),
+    (snapshot) => {
+      const moderations = snapshot.docs
+        .map((moderation) =>
+          toUserModerationState(moderation.id, moderation.data())
+        )
+        .filter((moderation): moderation is UserModerationState =>
+          Boolean(moderation)
+        )
+        .sort((a, b) => b.bannedUntil - a.bannedUntil)
+
+      onModerations(moderations)
+    },
+    (error) => onError(error)
+  )
+}
+
 export async function setRemoteUserModeration(input: {
   action: UserModerationState["action"]
   authorId: string
@@ -547,7 +611,6 @@ export async function kickRemoteVoiceParticipant(input: {
       reason: input.reason?.trim() || "Removed from voice chat",
     }),
     deleteDoc(doc(current.db, "rooms", roomId, "voiceParticipants", input.authorId)),
-    deleteRemoteVoiceSignalsForUser(input.authorId),
   ])
 }
 
@@ -606,8 +669,9 @@ export async function sendRemoteVoiceSignal(input: {
 
 export async function deleteRemoteVoiceSignalsForUser(authorId: string) {
   const current = getFirebaseServices()
-  await ensureAnonymousUser()
+  const user = await ensureAnonymousUser()
   if (!current || !authorId) return
+  if (authorId !== user?.uid) return
 
   const roomId = getFirebaseRoomId()
   const signalsRef = collection(current.db, "rooms", roomId, "voiceSignals")
@@ -645,7 +709,27 @@ function sanitizeAttachment(attachment: MessageAttachment): MessageAttachment | 
     mimeType: attachment.mimeType,
     name: attachment.name,
     size: attachment.size,
+    thumbnailUrl: normalizeAttachmentThumbnailUrl(attachment.thumbnailUrl),
+    waveform: normalizeWaveform(attachment.waveform),
   }
+}
+
+function normalizeAttachmentThumbnailUrl(value: unknown) {
+  if (typeof value !== "string") return undefined
+  const thumbnailUrl = value.trim()
+  if (!thumbnailUrl || thumbnailUrl.length > 180000) return undefined
+  return thumbnailUrl.startsWith("data:image/") ? thumbnailUrl : undefined
+}
+
+function normalizeWaveform(value: unknown) {
+  if (!Array.isArray(value)) return undefined
+
+  const waveform = value
+    .filter((item): item is number => typeof item === "number" && Number.isFinite(item))
+    .map((item) => Math.max(0.04, Math.min(1, Number(item.toFixed(3)))))
+    .slice(0, 64)
+
+  return waveform.length > 0 ? waveform : undefined
 }
 
 function cleanUsernameDisplayName(displayName: string) {
@@ -1084,6 +1168,255 @@ function toChatUser(snapshot: QueryDocumentSnapshot<DocumentData>): ChatUser | n
   }
 }
 
+function toUserPreferences(data: DocumentData): UserPreferences | null {
+  const profile = toProfile(data.profile)
+  const notifications = toNotificationSettings(data.notifications)
+  if (!profile || !notifications) return null
+
+  return {
+    version: typeof data.version === "number" ? data.version : 1,
+    profile,
+    usernameClaim: toUsernameClaim(data.usernameClaim),
+    notifications,
+    moderationSettings: toModerationSettings(data.moderationSettings),
+    roomSettings: toRoomSettings(data.roomSettings),
+    trustedSites: sanitizeTrustedSites(data.trustedSites),
+  }
+}
+
+function toProfile(value: unknown) {
+  if (!value || typeof value !== "object") return null
+
+  const input = value as Partial<Record<keyof UserPreferences["profile"], unknown>>
+  const name =
+    typeof input.name === "string" && input.name.trim()
+      ? cleanUsernameDisplayName(input.name)
+      : "You"
+  const avatar = typeof input.avatar === "string" ? input.avatar.slice(0, 800000) : ""
+
+  return {
+    accentColor:
+      typeof input.accentColor === "string" && /^#[0-9a-f]{6}$/i.test(input.accentColor)
+        ? input.accentColor
+        : "#f4f4f5",
+    name,
+    avatar,
+    joinedAt:
+      typeof input.joinedAt === "number" && Number.isFinite(input.joinedAt)
+        ? input.joinedAt
+        : Date.now(),
+    statusText:
+      typeof input.statusText === "string" ? input.statusText.trim().slice(0, 80) : "",
+  }
+}
+
+function toUsernameClaim(value: unknown): UsernameClaim | null {
+  if (!value || typeof value !== "object") return null
+
+  const input = value as Partial<Record<keyof UsernameClaim, unknown>>
+  if (
+    typeof input.authorId !== "string" ||
+    typeof input.key !== "string" ||
+    typeof input.name !== "string"
+  ) {
+    return null
+  }
+
+  const name = cleanUsernameDisplayName(input.name)
+  const key = usernameKeyFromDisplayName(name)
+  if (key !== input.key || !isValidUsernameKey(key)) return null
+
+  return {
+    authorId: input.authorId,
+    key,
+    name,
+  }
+}
+
+function toNotificationSettings(value: unknown) {
+  if (!value || typeof value !== "object") return null
+
+  const input = value as Record<string, unknown>
+  const soundKinds =
+    input.soundKinds && typeof input.soundKinds === "object"
+      ? (input.soundKinds as Record<string, unknown>)
+      : {}
+  const soundsEnabled =
+    typeof input.soundsEnabled === "boolean" ? input.soundsEnabled : true
+
+  return {
+    attachmentPreviews:
+      typeof input.attachmentPreviews === "boolean" ? input.attachmentPreviews : true,
+    browserEnabled:
+      typeof input.browserEnabled === "boolean" ? input.browserEnabled : false,
+    keywordAlerts: sanitizeStringList(input.keywordAlerts, 20),
+    mentionSummary:
+      typeof input.mentionSummary === "boolean" ? input.mentionSummary : true,
+    roomEnabled: typeof input.roomEnabled === "boolean" ? input.roomEnabled : true,
+    soundsEnabled,
+    soundKinds: {
+      message:
+        typeof soundKinds.message === "boolean" ? soundKinds.message : soundsEnabled,
+      reply: typeof soundKinds.reply === "boolean" ? soundKinds.reply : soundsEnabled,
+      ping: typeof soundKinds.ping === "boolean" ? soundKinds.ping : soundsEnabled,
+    },
+    uiSoundsEnabled:
+      typeof input.uiSoundsEnabled === "boolean" ? input.uiSoundsEnabled : true,
+    uiSound: isUiSoundKind(input.uiSound) ? input.uiSound : "soft",
+    voicePreviews: typeof input.voicePreviews === "boolean" ? input.voicePreviews : true,
+  }
+}
+
+function sanitizeProfile(profile: UserPreferences["profile"]) {
+  return {
+    name: cleanUsernameDisplayName(profile.name) || "You",
+    avatar: profile.avatar.slice(0, 800000),
+    accentColor:
+      profile.accentColor && /^#[0-9a-f]{6}$/i.test(profile.accentColor)
+        ? profile.accentColor
+        : "#f4f4f5",
+    joinedAt: profile.joinedAt ?? Date.now(),
+    statusText: profile.statusText?.trim().slice(0, 80) ?? "",
+  }
+}
+
+function sanitizeUsernameClaim(claim: UsernameClaim): UsernameClaim | null {
+  const name = cleanUsernameDisplayName(claim.name)
+  const key = usernameKeyFromDisplayName(name)
+  if (key !== claim.key || !isValidUsernameKey(key)) return null
+
+  return {
+    authorId: claim.authorId,
+    key,
+    name,
+  }
+}
+
+function sanitizeNotificationSettings(
+  notifications: UserPreferences["notifications"]
+) {
+  return {
+    attachmentPreviews: notifications.attachmentPreviews ?? true,
+    browserEnabled: notifications.browserEnabled,
+    keywordAlerts: sanitizeStringList(notifications.keywordAlerts, 20),
+    mentionSummary: notifications.mentionSummary ?? true,
+    roomEnabled: notifications.roomEnabled ?? true,
+    soundsEnabled: notifications.soundsEnabled,
+    soundKinds: {
+      message: notifications.soundKinds.message,
+      reply: notifications.soundKinds.reply,
+      ping: notifications.soundKinds.ping,
+    },
+    uiSoundsEnabled: notifications.uiSoundsEnabled,
+    uiSound: notifications.uiSound,
+    voicePreviews: notifications.voicePreviews ?? true,
+  }
+}
+
+function toRoomSettings(value: unknown): UserPreferences["roomSettings"] {
+  if (!value || typeof value !== "object") {
+    return sanitizeRoomSettings(undefined)
+  }
+  return sanitizeRoomSettings(value as Partial<UserPreferences["roomSettings"]>)
+}
+
+function sanitizeRoomSettings(
+  settings?: Partial<UserPreferences["roomSettings"]>
+): UserPreferences["roomSettings"] {
+  const role: UserPreferences["roomSettings"]["role"] =
+    settings?.role === "owner" ||
+    settings?.role === "admin" ||
+    settings?.role === "trusted" ||
+    settings?.role === "guest"
+      ? settings.role
+      : "owner"
+  return {
+    announcement:
+      typeof settings?.announcement === "string"
+        ? settings.announcement.trim().slice(0, 220)
+        : "",
+    archived: settings?.archived ?? false,
+    audioPlaybackRate:
+      typeof settings?.audioPlaybackRate === "number"
+        ? Math.max(0.5, Math.min(2, settings.audioPlaybackRate))
+        : 1,
+    compactMode: settings?.compactMode ?? false,
+    imageCompressionQuality:
+      typeof settings?.imageCompressionQuality === "number"
+        ? Math.max(0.45, Math.min(0.95, settings.imageCompressionQuality))
+        : 0.82,
+    reducedData: settings?.reducedData ?? false,
+    role,
+    topic:
+      typeof settings?.topic === "string" && settings.topic.trim()
+        ? settings.topic.trim().slice(0, 90)
+        : "Main Chat",
+  }
+}
+
+function toModerationSettings(value: unknown): UserPreferences["moderationSettings"] {
+  if (!value || typeof value !== "object") {
+    return sanitizeModerationSettings(undefined)
+  }
+  return sanitizeModerationSettings(
+    value as Partial<UserPreferences["moderationSettings"]>
+  )
+}
+
+function sanitizeModerationSettings(
+  settings?: Partial<UserPreferences["moderationSettings"]>
+): UserPreferences["moderationSettings"] {
+  const wordFilterMode =
+    settings?.wordFilterMode === "off" ||
+    settings?.wordFilterMode === "warn" ||
+    settings?.wordFilterMode === "block"
+      ? settings.wordFilterMode
+      : "warn"
+  return {
+    reasonPreset:
+      typeof settings?.reasonPreset === "string" && settings.reasonPreset.trim()
+        ? settings.reasonPreset.trim().slice(0, 120)
+        : "Spam or unsafe behavior",
+    slowModeSeconds:
+      typeof settings?.slowModeSeconds === "number"
+        ? Math.max(0, Math.min(120, Math.round(settings.slowModeSeconds)))
+        : 0,
+    warningExpiresMinutes:
+      typeof settings?.warningExpiresMinutes === "number"
+        ? Math.max(1, Math.min(60, Math.round(settings.warningExpiresMinutes)))
+        : 5,
+    wordFilterMode,
+    wordFilterWords: sanitizeStringList(settings?.wordFilterWords, 50).map((word) =>
+      word.toLowerCase()
+    ),
+  }
+}
+
+function sanitizeTrustedSites(value: unknown) {
+  if (!Array.isArray(value)) return []
+
+  return Array.from(
+    new Set(
+      value
+        .filter((site): site is string => typeof site === "string")
+        .map((site) => site.trim())
+        .filter((site) => site.length > 0 && site.length <= 2048)
+    )
+  ).slice(0, 50)
+}
+
+function sanitizeStringList(value: unknown, limit: number) {
+  if (!Array.isArray(value)) return []
+  return Array.from(
+    new Set(
+      value
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    )
+  ).slice(0, limit)
+}
+
 function toRemoteReaction(
   snapshot: QueryDocumentSnapshot<DocumentData>
 ): RemoteReaction | null {
@@ -1256,6 +1589,17 @@ function isSoundKind(value: unknown): value is SoundKind {
   return value === "message" || value === "reply" || value === "ping"
 }
 
+function isUiSoundKind(value: unknown): value is UiSoundKind {
+  return (
+    value === "soft" ||
+    value === "click" ||
+    value === "done" ||
+    value === "pop" ||
+    value === "mute" ||
+    value === "deafen"
+  )
+}
+
 function normalizeAttachments(value: unknown): MessageAttachment[] | undefined {
   if (!Array.isArray(value)) return undefined
 
@@ -1274,5 +1618,11 @@ function normalizeAttachments(value: unknown): MessageAttachment[] | undefined {
     )
   })
 
-  return attachments.length > 0 ? attachments : undefined
+  const normalized = attachments.map((attachment) => ({
+    ...attachment,
+    thumbnailUrl: normalizeAttachmentThumbnailUrl(attachment.thumbnailUrl),
+    waveform: normalizeWaveform(attachment.waveform),
+  }))
+
+  return normalized.length > 0 ? normalized : undefined
 }

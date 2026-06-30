@@ -10,6 +10,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
+  type SyntheticEvent as ReactSyntheticEvent,
 } from "react"
 import { AnimatePresence, motion, useReducedMotion } from "motion/react"
 import {
@@ -20,9 +21,11 @@ import {
   Bell,
   BellRinging,
   BellSlash,
+  Broom,
   Camera,
   CaretUp,
   Check,
+  Flag,
   CopySimple,
   Clock,
   Prohibit,
@@ -40,10 +43,14 @@ import {
   PhoneCall,
   PhoneDisconnect,
   Play,
+  Plus,
+  PushPinSimple,
   ShieldCheck,
+  ShareFat,
   Smiley,
   SpeakerHigh,
   SpeakerSlash,
+  Star,
   Stop,
   Trash,
   X,
@@ -67,6 +74,7 @@ import {
   showBrowserNotification,
   unlockAudio,
 } from "@/lib/notificationAudio"
+import { clearAppCache, reloadAppAfterCacheClear } from "@/lib/appCache"
 import {
   listenToFirebaseAuth,
   signInWithGoogleAccount,
@@ -79,8 +87,10 @@ import {
   deleteRemoteMessage,
   deleteRemoteVoiceSignalsForUser,
   kickRemoteVoiceParticipant,
+  loadRemoteUserPreferences,
   listenToRemoteMessages,
   listenToRemoteModeration,
+  listenToRemoteModerations,
   listenToRemoteUsers,
   listenToRemoteVoiceKick,
   listenToRemoteVoiceParticipants,
@@ -91,10 +101,17 @@ import {
   sendRemoteMessage,
   sendRemoteReaction,
   sendRemoteVoiceSignal,
+  saveRemoteUserPreferences,
   setRemoteVoicePresence,
   setRemoteUserModeration,
 } from "@/lib/firebase/chatRepository"
-import { loadChatState, saveChatState } from "@/lib/storage"
+import {
+  chatStateKeyForUserId,
+  deleteChatState,
+  loadChatState,
+  LOCAL_CHAT_STATE_KEY,
+  saveChatState,
+} from "@/lib/storage"
 import { cn } from "@/lib/utils"
 import type {
   ChatMessage,
@@ -102,14 +119,17 @@ import type {
   MessageAttachment,
   MessageReaction,
   MessageType,
+  ModerationSettings,
   ModerationUser,
   NotificationSettings,
   PersistedChatState,
   Profile,
+  RoomSettings,
   SoundKind,
   SpamModerationLogEntry,
   SpamGuardState,
   UiSoundKind,
+  UserPreferences,
   UserModerationState,
   UsernameClaim,
   VoiceParticipantState,
@@ -124,6 +144,24 @@ type LinkDialogState = {
 }
 type MediaViewerState = {
   attachment: MessageAttachment
+}
+type MessageEditState = {
+  body: string
+  message: ChatMessage
+}
+type AvatarCropState = {
+  dataUrl: string
+  zoom: number
+}
+type ThreadPromptState = {
+  messageId: string
+  rootId: string
+}
+type TenorGifPreview = {
+  displayUrl: string
+  embedUrl: string
+  id: string
+  sourceUrl: string
 }
 type MentionRange = {
   end: number
@@ -187,13 +225,46 @@ type VoiceConnectionStats = {
   peers: number
   pingMs?: number
 }
+type VoicePresencePayload = {
+  avatar?: string
+  joinedAt: number
+  name: string
+  speaking: boolean
+  usernameKey: string
+}
 type SinkAudioElement = HTMLAudioElement & {
   setSinkId?: (sinkId: string) => Promise<void>
+}
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike
+type SpeechRecognitionLike = {
+  continuous: boolean
+  interimResults: boolean
+  lang: string
+  onerror: ((event: Event) => void) | null
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null
+  onend: (() => void) | null
+  start: () => void
+  stop: () => void
+}
+type SpeechRecognitionEventLike = {
+  results: ArrayLike<ArrayLike<{ transcript: string }>>
+  resultIndex: number
+}
+type LowLatencyMediaTrackConstraints = MediaTrackConstraints & {
+  latency?: { ideal: number }
 }
 
 const AUDIO_BAR_COUNT = 44
 const MESSAGE_AUDIO_BAR_COUNT = 28
+const VOICE_ACTIVITY_UPDATE_MS = 40
+const VOICE_ANALYSER_FFT_SIZE = 256
+const VOICE_PRESENCE_HEARTBEAT_MS = 4000
+const VOICE_PRESENCE_MIN_WRITE_MS = 900
+const VOICE_PRESENCE_RETRY_BACKOFF_MS = 3500
+const VOICE_SPEAKING_RELEASE_MS = 260
+const VOICE_SPEAKING_THRESHOLD = 0.18
 const VOICE_RTC_CONFIG: RTCConfiguration = {
+  iceCandidatePoolSize: 4,
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
 }
 const MAX_RECORDING_MS = 120000
@@ -273,6 +344,9 @@ const USERNAME_MAX_KEY_LENGTH = 24
 const defaultProfile: Profile = {
   name: "You",
   avatar: "",
+  joinedAt: Date.now(),
+  statusText: "",
+  accentColor: "#f4f4f5",
 }
 
 const defaultSoundKinds: Record<SoundKind, boolean> = {
@@ -294,23 +368,59 @@ const uiCuePreviewOptions: Array<{ kind: UiSoundKind; label: string }> = [
 ]
 
 const defaultNotifications: NotificationSettings = {
+  attachmentPreviews: true,
   browserEnabled: false,
+  keywordAlerts: [],
+  mentionSummary: true,
+  roomEnabled: true,
   soundsEnabled: true,
   soundKinds: { ...defaultSoundKinds },
   uiSoundsEnabled: true,
   uiSound: "soft",
+  voicePreviews: true,
 }
+
+const defaultRoomSettings: RoomSettings = {
+  announcement: "",
+  archived: false,
+  audioPlaybackRate: 1,
+  compactMode: false,
+  imageCompressionQuality: 0.82,
+  reducedData: false,
+  role: "owner",
+  topic: "Main Chat",
+}
+
+const defaultModerationSettings: ModerationSettings = {
+  reasonPreset: "Spam or unsafe behavior",
+  slowModeSeconds: 0,
+  warningExpiresMinutes: 5,
+  wordFilterMode: "warn",
+  wordFilterWords: [],
+}
+
+const moderationReasonPresets = [
+  "Spam or unsafe behavior",
+  "Harassment",
+  "NSFW or illegal content",
+  "Impersonation",
+  "Voice disruption",
+]
 
 const defaultSpamGuard: SpamGuardState = {
   log: [],
   strikes: 0,
 }
 
-function readCachedSpamGuard() {
+function spamGuardCacheKey(storageKey = LOCAL_CHAT_STATE_KEY) {
+  return `${SPAM_GUARD_CACHE_KEY}:${storageKey}`
+}
+
+function readCachedSpamGuard(storageKey = LOCAL_CHAT_STATE_KEY) {
   if (typeof window === "undefined") return defaultSpamGuard
 
   try {
-    const raw = window.localStorage.getItem(SPAM_GUARD_CACHE_KEY)
+    const raw = window.localStorage.getItem(spamGuardCacheKey(storageKey))
     if (!raw) return defaultSpamGuard
     return normalizeSpamGuard(JSON.parse(raw))
   } catch {
@@ -318,20 +428,29 @@ function readCachedSpamGuard() {
   }
 }
 
-function writeCachedSpamGuard(spamGuard: SpamGuardState) {
+function writeCachedSpamGuard(
+  spamGuard: SpamGuardState,
+  storageKey = LOCAL_CHAT_STATE_KEY
+) {
   if (typeof window === "undefined") return
 
   try {
     const normalized = normalizeSpamGuard(spamGuard)
+    const key = spamGuardCacheKey(storageKey)
     if (!normalized.bannedUntil && normalized.strikes === 0) {
-      window.localStorage.removeItem(SPAM_GUARD_CACHE_KEY)
+      window.localStorage.removeItem(key)
       return
     }
 
-    window.localStorage.setItem(SPAM_GUARD_CACHE_KEY, JSON.stringify(normalized))
+    window.localStorage.setItem(key, JSON.stringify(normalized))
   } catch {
     // Local persistence is defensive; IndexedDB remains the primary store.
   }
+}
+
+function clearCachedSpamGuard(storageKey = LOCAL_CHAT_STATE_KEY) {
+  if (typeof window === "undefined") return
+  window.localStorage.removeItem(spamGuardCacheKey(storageKey))
 }
 
 function mergeSpamGuardStates(
@@ -382,9 +501,11 @@ function isLegacyMessage(message: ChatMessage) {
 function createInitialState(): PersistedChatState {
   return {
     version: CURRENT_DATA_VERSION,
-    profile: defaultProfile,
+    profile: { ...defaultProfile, joinedAt: Date.now() },
     usernameClaim: null,
     notifications: defaultNotifications,
+    moderationSettings: defaultModerationSettings,
+    roomSettings: defaultRoomSettings,
     spamGuard: defaultSpamGuard,
     trustedSites: [],
     messages: [],
@@ -400,9 +521,11 @@ function normalizeStoredState(stored: PersistedChatState | undefined) {
       profile:
         stored.profile?.name === LEGACY_DEFAULT_NAME
           ? defaultProfile
-          : (stored.profile ?? defaultProfile),
+          : normalizeProfile(stored.profile),
       usernameClaim: normalizeUsernameClaim(stored.usernameClaim),
       notifications: normalizeNotifications(stored.notifications),
+      moderationSettings: normalizeModerationSettings(stored.moderationSettings),
+      roomSettings: normalizeRoomSettings(stored.roomSettings),
       spamGuard: normalizeSpamGuard(stored.spamGuard),
       trustedSites: normalizeTrustedSites(stored.trustedSites),
     }
@@ -413,12 +536,102 @@ function normalizeStoredState(stored: PersistedChatState | undefined) {
     profile:
       stored.profile?.name === LEGACY_DEFAULT_NAME
         ? defaultProfile
-        : (stored.profile ?? defaultProfile),
+        : normalizeProfile(stored.profile),
     usernameClaim: normalizeUsernameClaim(stored.usernameClaim),
     notifications: normalizeNotifications(stored.notifications),
+    moderationSettings: normalizeModerationSettings(stored.moderationSettings),
+    roomSettings: normalizeRoomSettings(stored.roomSettings),
     spamGuard: normalizeSpamGuard(stored.spamGuard),
     trustedSites: normalizeTrustedSites(stored.trustedSites),
     messages: stored.messages.filter((message) => !isLegacyMessage(message)),
+  }
+}
+
+function preferencesFromState(state: PersistedChatState): UserPreferences {
+  return {
+    version: CURRENT_DATA_VERSION,
+    profile: state.profile,
+    usernameClaim: state.usernameClaim ?? null,
+    notifications: state.notifications,
+    moderationSettings: state.moderationSettings,
+    roomSettings: state.roomSettings,
+    trustedSites: state.trustedSites,
+  }
+}
+
+function stateWithPreferences(
+  state: PersistedChatState,
+  preferences: UserPreferences
+): PersistedChatState {
+  const normalized = normalizeStoredState({
+    ...createInitialState(),
+    ...preferences,
+    messages: state.messages,
+    spamGuard: state.spamGuard,
+  })
+
+  return {
+    ...state,
+    profile: normalized.profile,
+    usernameClaim: normalized.usernameClaim,
+    notifications: normalized.notifications,
+    moderationSettings: normalized.moderationSettings,
+    roomSettings: normalized.roomSettings,
+    trustedSites: normalized.trustedSites,
+  }
+}
+
+function suggestedProfileFromGoogle(user: FirebaseAuthUser): Profile {
+  const name =
+    cleanUsernameDisplayName(user.displayName) ||
+    cleanUsernameDisplayName(user.email.split("@")[0] ?? "") ||
+    defaultProfile.name
+
+  return {
+    name,
+    avatar: user.photoURL,
+  }
+}
+
+function seedStateFromGoogle(
+  state: PersistedChatState,
+  user: FirebaseAuthUser
+): PersistedChatState {
+  const googleProfile = suggestedProfileFromGoogle(user)
+  const nextName =
+    state.profile.name === defaultProfile.name ? googleProfile.name : state.profile.name
+
+  return {
+    ...state,
+    profile: {
+      ...state.profile,
+      name: nextName,
+      avatar: state.profile.avatar.trim() ? state.profile.avatar : googleProfile.avatar,
+      joinedAt: state.profile.joinedAt ?? Date.now(),
+    },
+  }
+}
+
+function normalizeProfile(value: unknown): Profile {
+  if (!value || typeof value !== "object") return { ...defaultProfile, joinedAt: Date.now() }
+
+  const input = value as Partial<Profile>
+  return {
+    accentColor:
+      typeof input.accentColor === "string" && /^#[0-9a-f]{6}$/i.test(input.accentColor)
+        ? input.accentColor
+        : defaultProfile.accentColor,
+    name:
+      typeof input.name === "string" && input.name.trim()
+        ? cleanUsernameDisplayName(input.name)
+        : defaultProfile.name,
+    avatar: typeof input.avatar === "string" ? input.avatar : "",
+    joinedAt:
+      typeof input.joinedAt === "number" && Number.isFinite(input.joinedAt)
+        ? input.joinedAt
+        : Date.now(),
+    statusText:
+      typeof input.statusText === "string" ? input.statusText.trim().slice(0, 80) : "",
   }
 }
 
@@ -438,7 +651,17 @@ function normalizeNotifications(value: unknown): NotificationSettings {
       : undefined
 
   return {
+    attachmentPreviews: input.attachmentPreviews ?? true,
     browserEnabled: input.browserEnabled ?? false,
+    keywordAlerts: Array.isArray(input.keywordAlerts)
+      ? input.keywordAlerts
+          .filter((item): item is string => typeof item === "string")
+          .map((item) => item.trim())
+          .filter(Boolean)
+          .slice(0, 20)
+      : [],
+    mentionSummary: input.mentionSummary ?? true,
+    roomEnabled: input.roomEnabled ?? true,
     soundsEnabled,
     soundKinds: {
       message: soundKindsInput?.message ?? soundsEnabled,
@@ -447,6 +670,80 @@ function normalizeNotifications(value: unknown): NotificationSettings {
     },
     uiSoundsEnabled: input.uiSoundsEnabled ?? true,
     uiSound: isUiSoundKind(input.uiSound) ? input.uiSound : defaultNotifications.uiSound,
+    voicePreviews: input.voicePreviews ?? true,
+  }
+}
+
+function normalizeRoomSettings(value: unknown): RoomSettings {
+  if (!value || typeof value !== "object") return { ...defaultRoomSettings }
+
+  const input = value as Partial<RoomSettings>
+  const role: RoomSettings["role"] =
+    input.role === "owner" ||
+    input.role === "admin" ||
+    input.role === "trusted" ||
+    input.role === "guest"
+      ? input.role
+      : defaultRoomSettings.role
+  const quality =
+    typeof input.imageCompressionQuality === "number"
+      ? Math.max(0.45, Math.min(0.95, input.imageCompressionQuality))
+      : defaultRoomSettings.imageCompressionQuality
+  const playbackRate =
+    typeof input.audioPlaybackRate === "number"
+      ? Math.max(0.5, Math.min(2, input.audioPlaybackRate))
+      : defaultRoomSettings.audioPlaybackRate
+
+  return {
+    announcement:
+      typeof input.announcement === "string"
+        ? input.announcement.trim().slice(0, 220)
+        : "",
+    archived: input.archived ?? false,
+    audioPlaybackRate: playbackRate,
+    compactMode: input.compactMode ?? false,
+    imageCompressionQuality: quality,
+    reducedData: input.reducedData ?? false,
+    role,
+    topic:
+      typeof input.topic === "string" && input.topic.trim()
+        ? input.topic.trim().slice(0, 90)
+        : defaultRoomSettings.topic,
+  }
+}
+
+function normalizeModerationSettings(value: unknown): ModerationSettings {
+  if (!value || typeof value !== "object") return { ...defaultModerationSettings }
+
+  const input = value as Partial<ModerationSettings>
+  const mode =
+    input.wordFilterMode === "off" ||
+    input.wordFilterMode === "warn" ||
+    input.wordFilterMode === "block"
+      ? input.wordFilterMode
+      : defaultModerationSettings.wordFilterMode
+
+  return {
+    reasonPreset:
+      typeof input.reasonPreset === "string" && input.reasonPreset.trim()
+        ? input.reasonPreset.trim().slice(0, 120)
+        : defaultModerationSettings.reasonPreset,
+    slowModeSeconds:
+      typeof input.slowModeSeconds === "number"
+        ? Math.max(0, Math.min(120, Math.round(input.slowModeSeconds)))
+        : defaultModerationSettings.slowModeSeconds,
+    warningExpiresMinutes:
+      typeof input.warningExpiresMinutes === "number"
+        ? Math.max(1, Math.min(60, Math.round(input.warningExpiresMinutes)))
+        : defaultModerationSettings.warningExpiresMinutes,
+    wordFilterMode: mode,
+    wordFilterWords: Array.isArray(input.wordFilterWords)
+      ? input.wordFilterWords
+          .filter((item): item is string => typeof item === "string")
+          .map((item) => item.trim().toLowerCase())
+          .filter(Boolean)
+          .slice(0, 50)
+      : [],
   }
 }
 
@@ -580,6 +877,8 @@ function normalizeModerationLog(value: unknown): SpamModerationLogEntry[] {
         (entry.action === "warn" ||
           entry.action === "ban" ||
           entry.action === "timeout" ||
+          entry.action === "report" ||
+          entry.action === "word-filter" ||
           entry.action === "delete" ||
           entry.action === "clear") &&
         typeof entry.at === "number" &&
@@ -603,6 +902,18 @@ function spamFingerprint(candidate: SpamCandidate) {
   ].join(":")
 }
 
+function wordFilterMatch(body: string, settings: ModerationSettings) {
+  if (settings.wordFilterMode === "off" || !body.trim()) return null
+
+  const normalized = body.toLowerCase()
+  return (
+    settings.wordFilterWords.find((word) => {
+      if (!word) return false
+      return normalized.includes(word.toLowerCase())
+    }) ?? null
+  )
+}
+
 function formatRemainingTime(milliseconds: number) {
   const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1000))
   if (totalSeconds > 365 * 24 * 60 * 60) return "after an admin unban"
@@ -619,8 +930,12 @@ function moderationActionLabel(action: SpamModerationLogEntry["action"]) {
       return "Restriction cleared"
     case "delete":
       return "Message deleted"
+    case "report":
+      return "Report"
     case "timeout":
       return "Timeout"
+    case "word-filter":
+      return "Word filter"
     case "warn":
     default:
       return "Warning"
@@ -807,7 +1122,7 @@ function initials(name: string) {
 }
 
 function configuredAdminPassword() {
-  return (import.meta.env.VITE_WEB_PASSWORD ?? "").trim()
+  return String(__SECHAT_WEB_PASSWORD__ ?? "").trim()
 }
 
 function readAdminUnlocked() {
@@ -908,6 +1223,95 @@ function compactWaveform(values: number[], targetCount = AUDIO_BAR_COUNT) {
   return padded.map((value) => Number(clampLevel(value).toFixed(3)))
 }
 
+async function getAudioBufferWaveform(buffer: ArrayBuffer, targetCount = AUDIO_BAR_COUNT) {
+  if (typeof OfflineAudioContext === "undefined") return undefined
+
+  try {
+    const offlineContext = new OfflineAudioContext(1, 1, 44100)
+    const audioBuffer = await offlineContext.decodeAudioData(buffer.slice(0))
+    const channelCount = Math.max(1, audioBuffer.numberOfChannels)
+    const channelData = Array.from({ length: channelCount }, (_, index) =>
+      audioBuffer.getChannelData(index)
+    )
+    const sampleCount = audioBuffer.length
+    const bucketSize = Math.max(1, Math.floor(sampleCount / targetCount))
+    const levels: number[] = []
+
+    for (let index = 0; index < targetCount; index += 1) {
+      const start = index * bucketSize
+      const end = index === targetCount - 1
+        ? sampleCount
+        : Math.min(sampleCount, start + bucketSize)
+      let sum = 0
+      let count = 0
+
+      for (let sampleIndex = start; sampleIndex < end; sampleIndex += 1) {
+        let mixedSample = 0
+        for (const channel of channelData) {
+          mixedSample += channel[sampleIndex] ?? 0
+        }
+        const normalizedSample = mixedSample / channelCount
+        sum += normalizedSample * normalizedSample
+        count += 1
+      }
+
+      const rms = count > 0 ? Math.sqrt(sum / count) : 0
+      levels.push(clampLevel(0.05 + rms * 4.8))
+    }
+
+    return compactWaveform(levels, targetCount)
+  } catch (error) {
+    console.warn("Audio waveform analysis failed", error)
+    return undefined
+  }
+}
+
+function isAudioFileLike(file: File) {
+  return (
+    file.type.startsWith("audio/") ||
+    /\.(aac|flac|m4a|mp3|oga|ogg|opus|wav|webm)$/i.test(file.name)
+  )
+}
+
+async function getAudioFileWaveform(file: File, targetCount = AUDIO_BAR_COUNT) {
+  if (!isAudioFileLike(file)) return undefined
+  return getAudioBufferWaveform(await file.arrayBuffer(), targetCount)
+}
+
+async function getAudioSourceWaveform(source: string, targetCount = MESSAGE_AUDIO_BAR_COUNT) {
+  if (!source) return undefined
+  if (!canFetchAudioWaveformSource(source)) return undefined
+
+  try {
+    const response = await fetch(source, { cache: "reload" })
+    if (!response.ok) return undefined
+    return getAudioBufferWaveform(await response.arrayBuffer(), targetCount)
+  } catch {
+    return undefined
+  }
+}
+
+function canFetchAudioWaveformSource(source: string) {
+  if (
+    source.startsWith("data:") ||
+    source.startsWith("blob:") ||
+    typeof window === "undefined"
+  ) {
+    return true
+  }
+
+  try {
+    const url = new URL(source, window.location.href)
+    return (
+      url.origin === window.location.origin ||
+      url.hostname === "firebasestorage.googleapis.com" ||
+      url.hostname === "storage.googleapis.com"
+    )
+  } catch {
+    return false
+  }
+}
+
 function formatDuration(milliseconds: number) {
   const totalSeconds = Math.max(0, Math.round(milliseconds / 1000))
   const minutes = Math.floor(totalSeconds / 60)
@@ -933,14 +1337,256 @@ function fileToDataUrl(file: File) {
   })
 }
 
-async function fileToAttachment(file: File): Promise<MessageAttachment> {
-  const dataUrl = await fileToDataUrl(file)
+function dataUrlByteLength(dataUrl: string) {
+  const payload = dataUrl.split(",")[1] ?? ""
+  return Math.max(0, Math.round((payload.length * 3) / 4))
+}
+
+function canvasToDataUrl(
+  canvas: HTMLCanvasElement,
+  mimeType: string,
+  quality: number
+) {
+  return canvas.toDataURL(mimeType, quality)
+}
+
+async function compressImageFileToDataUrl(file: File, quality: number) {
+  if (
+    typeof document === "undefined" ||
+    file.type === "image/gif" ||
+    !file.type.startsWith("image/")
+  ) {
+    return fileToDataUrl(file)
+  }
+
+  const sourceUrl = URL.createObjectURL(file)
+  try {
+    const image = new Image()
+    image.decoding = "async"
+    const loaded = new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve()
+      image.onerror = () => reject(new Error("Image compression failed"))
+    })
+    image.src = sourceUrl
+    await loaded
+
+    const maxSide = 2200
+    const scale = Math.min(1, maxSide / Math.max(image.naturalWidth, image.naturalHeight))
+    const canvas = document.createElement("canvas")
+    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale))
+    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale))
+    const context = canvas.getContext("2d")
+    if (!context) return fileToDataUrl(file)
+    context.drawImage(image, 0, 0, canvas.width, canvas.height)
+    return canvasToDataUrl(
+      canvas,
+      file.type === "image/png" ? "image/webp" : file.type || "image/jpeg",
+      quality
+    )
+  } catch {
+    return fileToDataUrl(file)
+  } finally {
+    URL.revokeObjectURL(sourceUrl)
+  }
+}
+
+async function cropAvatarDataUrl(dataUrl: string, zoom: number) {
+  const image = new Image()
+  image.decoding = "async"
+  const loaded = new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve()
+    image.onerror = () => reject(new Error("Avatar crop failed"))
+  })
+  image.src = dataUrl
+  await loaded
+
+  const outputSize = 320
+  const canvas = document.createElement("canvas")
+  canvas.width = outputSize
+  canvas.height = outputSize
+  const context = canvas.getContext("2d")
+  if (!context) return dataUrl
+
+  const sourceSide = Math.min(image.naturalWidth, image.naturalHeight) / zoom
+  const sourceX = (image.naturalWidth - sourceSide) / 2
+  const sourceY = (image.naturalHeight - sourceSide) / 2
+  context.drawImage(
+    image,
+    sourceX,
+    sourceY,
+    sourceSide,
+    sourceSide,
+    0,
+    0,
+    outputSize,
+    outputSize
+  )
+  return canvas.toDataURL("image/webp", 0.86)
+}
+
+function canvasHasVisibleFrame(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number
+) {
+  try {
+    const pixels = context.getImageData(0, 0, width, height).data
+    for (let index = 0; index < pixels.length; index += 16) {
+      const brightness = pixels[index] + pixels[index + 1] + pixels[index + 2]
+      if (brightness > 18) return true
+    }
+  } catch {
+    return true
+  }
+
+  return false
+}
+
+function createVideoFallbackThumbnail(fileName: string, width = 360, height = 360) {
+  const canvas = document.createElement("canvas")
+  canvas.width = width
+  canvas.height = height
+  const context = canvas.getContext("2d")
+  if (!context) return undefined
+
+  context.fillStyle = "#18181b"
+  context.fillRect(0, 0, width, height)
+  context.fillStyle = "#27272a"
+  context.fillRect(0, Math.round(height * 0.68), width, Math.round(height * 0.32))
+  context.beginPath()
+  context.arc(width / 2, height * 0.44, Math.min(width, height) * 0.16, 0, Math.PI * 2)
+  context.fillStyle = "#f4f4f5"
+  context.fill()
+  context.beginPath()
+  context.moveTo(width / 2 - 10, height * 0.44 - 16)
+  context.lineTo(width / 2 - 10, height * 0.44 + 16)
+  context.lineTo(width / 2 + 18, height * 0.44)
+  context.closePath()
+  context.fillStyle = "#111113"
+  context.fill()
+  context.fillStyle = "#f4f4f5"
+  context.font = "700 22px sans-serif"
+  context.textAlign = "center"
+  context.textBaseline = "middle"
+  context.fillText("Video", width / 2, height * 0.78)
+  context.fillStyle = "#a1a1aa"
+  context.font = "600 16px sans-serif"
+  context.fillText(fileName.slice(0, 34), width / 2, height * 0.9)
+
+  return canvas.toDataURL("image/jpeg", 0.76)
+}
+
+function getVideoFileThumbnail(file: File) {
+  if (typeof document === "undefined" || typeof URL === "undefined") {
+    return Promise.resolve(undefined)
+  }
+
+  return new Promise<string | undefined>((resolve) => {
+    const objectUrl = URL.createObjectURL(file)
+    const video = document.createElement("video")
+    let timeoutId: number | undefined
+    let settled = false
+    const fallbackThumbnail = () => createVideoFallbackThumbnail(file.name)
+
+    const finish = (thumbnailUrl?: string) => {
+      if (settled) return
+      settled = true
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId)
+      video.pause()
+      video.removeAttribute("src")
+      video.load()
+      URL.revokeObjectURL(objectUrl)
+      resolve(thumbnailUrl)
+    }
+
+    const capture = () => {
+      if (!video.videoWidth || !video.videoHeight) {
+        finish(fallbackThumbnail())
+        return
+      }
+
+      const maxSize = 360
+      const scale = Math.min(1, maxSize / Math.max(video.videoWidth, video.videoHeight))
+      const canvas = document.createElement("canvas")
+      canvas.width = Math.max(1, Math.round(video.videoWidth * scale))
+      canvas.height = Math.max(1, Math.round(video.videoHeight * scale))
+      const context = canvas.getContext("2d")
+      if (!context) {
+        finish(fallbackThumbnail())
+        return
+      }
+
+      context.drawImage(video, 0, 0, canvas.width, canvas.height)
+      const thumbnailUrl = canvasHasVisibleFrame(context, canvas.width, canvas.height)
+        ? canvas.toDataURL("image/jpeg", 0.76)
+        : createVideoFallbackThumbnail(file.name)
+      finish(thumbnailUrl)
+    }
+
+    const scheduleCapture = () => {
+      const frameVideo = video as HTMLVideoElement & {
+        requestVideoFrameCallback?: (callback: () => void) => number
+      }
+      if (frameVideo.requestVideoFrameCallback) {
+        frameVideo.requestVideoFrameCallback(() => capture())
+        return
+      }
+
+      window.requestAnimationFrame(capture)
+    }
+
+    video.muted = true
+    video.playsInline = true
+    video.preload = "metadata"
+    video.addEventListener("error", () => finish(fallbackThumbnail()), { once: true })
+    video.addEventListener(
+      "loadedmetadata",
+      () => {
+        const duration = Number.isFinite(video.duration) ? video.duration : 0
+        const targetTime = duration > 0.75 ? Math.min(0.75, duration * 0.2) : 0
+
+        if (targetTime <= 0) {
+          if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+            scheduleCapture()
+            return
+          }
+          video.addEventListener("loadeddata", scheduleCapture, { once: true })
+          return
+        }
+
+        try {
+          video.currentTime = targetTime
+        } catch {
+          capture()
+        }
+      },
+      { once: true }
+    )
+    video.addEventListener("seeked", scheduleCapture, { once: true })
+
+    timeoutId = window.setTimeout(() => finish(fallbackThumbnail()), 4500)
+    video.src = objectUrl
+    video.load()
+  })
+}
+
+async function fileToAttachment(
+  file: File,
+  imageCompressionQuality = defaultRoomSettings.imageCompressionQuality
+): Promise<MessageAttachment> {
   const isImageFile =
     file.type.startsWith("image/") ||
     /\.(avif|gif|jpe?g|png|webp)$/i.test(file.name)
   const isVideoFile =
     file.type.startsWith("video/") ||
     /\.(m4v|mov|mp4|ogv|webm)$/i.test(file.name)
+  const [dataUrl, thumbnailUrl, waveform] = await Promise.all([
+    isImageFile
+      ? compressImageFileToDataUrl(file, imageCompressionQuality)
+      : fileToDataUrl(file),
+    isVideoFile ? getVideoFileThumbnail(file) : Promise.resolve(undefined),
+    isVideoFile ? Promise.resolve(undefined) : getAudioFileWaveform(file),
+  ])
 
   return {
     id: makeId("attachment"),
@@ -948,7 +1594,10 @@ async function fileToAttachment(file: File): Promise<MessageAttachment> {
     kind: isImageFile ? "image" : isVideoFile ? "video" : "file",
     mimeType: file.type || "application/octet-stream",
     name: file.name || "Attachment",
-    size: file.size,
+    originalSize: file.size,
+    size: isImageFile ? Math.min(file.size, dataUrlByteLength(dataUrl)) : file.size,
+    thumbnailUrl,
+    waveform,
   }
 }
 
@@ -986,6 +1635,14 @@ function isMicrophonePermissionError(error: unknown) {
   )
 }
 
+function isInterruptedPlaybackError(error: unknown) {
+  return (
+    error instanceof DOMException &&
+    error.name === "AbortError" &&
+    error.message.toLowerCase().includes("interrupted")
+  )
+}
+
 function sortAudioDevices(devices: MediaDeviceInfo[]) {
   return [...devices].sort((first, second) => {
     if (first.deviceId === "default" && second.deviceId !== "default") return -1
@@ -1013,6 +1670,53 @@ function shouldShowBrowserNotification() {
   return document.hidden || !document.hasFocus()
 }
 
+function readableRemoteError(error: unknown, fallback: string) {
+  const text = error instanceof Error ? error.message : String(error ?? "")
+  const code =
+    typeof error === "object" && error !== null && "code" in error
+      ? String(error.code)
+      : ""
+  const normalized = `${code} ${text}`.toLowerCase()
+
+  if (
+    normalized.includes("network") ||
+    normalized.includes("err_name_not_resolved") ||
+    normalized.includes("err_network_changed") ||
+    normalized.includes("auth/network-request-failed") ||
+    normalized.includes("storage/retry-limit-exceeded")
+  ) {
+    return "Firebase is unreachable right now. Check your connection or DNS, then clear cache and reload."
+  }
+
+  return fallback
+}
+
+function useCacheClearAction() {
+  const [cacheClearing, setCacheClearing] = useState(false)
+  const [cacheStatus, setCacheStatus] = useState<string | null>(null)
+
+  async function clearBrowserCache() {
+    if (cacheClearing) return
+
+    setCacheClearing(true)
+    setCacheStatus("Clearing app cache...")
+
+    try {
+      const result = await clearAppCache()
+      setCacheStatus(
+        `Cleared ${result.cacheCount} cache${result.cacheCount === 1 ? "" : "s"} and ${result.serviceWorkerCount} worker${result.serviceWorkerCount === 1 ? "" : "s"}. Reloading...`
+      )
+      window.setTimeout(reloadAppAfterCacheClear, 650)
+    } catch (error) {
+      console.warn("Cache clear failed", error)
+      setCacheStatus("Could not clear cache. Try a hard refresh.")
+      setCacheClearing(false)
+    }
+  }
+
+  return { cacheClearing, cacheStatus, clearBrowserCache }
+}
+
 function App() {
   const reduceMotion = useReducedMotion()
   const [ready, setReady] = useState(false)
@@ -1024,14 +1728,23 @@ function App() {
   const [authUser, setAuthUser] = useState<FirebaseAuthUser | null>(null)
   const [authBusy, setAuthBusy] = useState(false)
   const [authError, setAuthError] = useState<string | null>(null)
+  const [activeStorageKey, setActiveStorageKey] = useState(LOCAL_CHAT_STATE_KEY)
+  const [remoteUnavailableReason, setRemoteUnavailableReason] = useState<string | null>(
+    null
+  )
   const [notifications, setNotifications] =
     useState<NotificationSettings>(defaultNotifications)
+  const [roomSettings, setRoomSettings] =
+    useState<RoomSettings>(defaultRoomSettings)
+  const [moderationSettings, setModerationSettings] =
+    useState<ModerationSettings>(defaultModerationSettings)
   const [spamGuard, setSpamGuard] = useState<SpamGuardState>(readCachedSpamGuard)
   const [spamWarning, setSpamWarning] = useState<string | null>(null)
   const [spamNow, setSpamNow] = useState(Date.now())
   const [trustedSites, setTrustedSites] = useState<string[]>([])
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [remoteUsers, setRemoteUsers] = useState<ChatUser[]>([])
+  const [remoteModerations, setRemoteModerations] = useState<UserModerationState[]>([])
   const [pendingMessages, setPendingMessages] = useState<ChatMessage[]>([])
   const [authorId, setAuthorId] = useState("me")
   const [draft, setDraft] = useState("")
@@ -1046,6 +1759,24 @@ function App() {
   const [recordingMode, setRecordingMode] = useState<RecordingMode>("idle")
   const [recordingElapsedMs, setRecordingElapsedMs] = useState(0)
   const [replyToId, setReplyToId] = useState<string | undefined>()
+  const [threadPrompt, setThreadPrompt] = useState<ThreadPromptState | null>(null)
+  const [threadPanelRootId, setThreadPanelRootId] = useState<string | null>(null)
+  const [dismissedThreadRoots, setDismissedThreadRoots] = useState<Set<string>>(
+    () => new Set()
+  )
+  const [selectedMessageIds, setSelectedMessageIds] = useState<Set<string>>(
+    () => new Set()
+  )
+  const [translatedMessageIds, setTranslatedMessageIds] = useState<Set<string>>(
+    () => new Set()
+  )
+  const [editTarget, setEditTarget] = useState<MessageEditState | null>(null)
+  const [avatarCrop, setAvatarCrop] = useState<AvatarCropState | null>(null)
+  const [draggedAttachmentId, setDraggedAttachmentId] = useState<string | null>(null)
+  const [attachmentDropIndex, setAttachmentDropIndex] = useState<number | null>(null)
+  const [voiceParticipantIds, setVoiceParticipantIds] = useState<Set<string>>(
+    () => new Set()
+  )
   const [mentionRange, setMentionRange] = useState<MentionRange | null>(null)
   const [mentionActiveIndex, setMentionActiveIndex] = useState(0)
   const [panel, setPanel] = useState<Panel>(null)
@@ -1061,6 +1792,7 @@ function App() {
   const [voiceChatOpen, setVoiceChatOpen] = useState(false)
   const [voiceChatWidth, setVoiceChatWidth] = useState(420)
   const [voiceStageHeight, setVoiceStageHeight] = useState(340)
+  const [visibleMessageLimit, setVisibleMessageLimit] = useState(80)
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null)
   const analyserRef = useRef<AnalyserNode | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
@@ -1078,6 +1810,7 @@ function App() {
   const recordingFrameRef = useRef<number | null>(null)
   const recordingSessionRef = useRef(0)
   const recordingStartedAtRef = useRef<number | null>(null)
+  const retryFailedMessageRef = useRef<(message: ChatMessage) => void>(() => undefined)
   const sendFlightTimeoutRef = useRef<number | null>(null)
   const sendHistoryRef = useRef<SpamSendEntry[]>([])
   const spamWarningTimeoutRef = useRef<number | null>(null)
@@ -1085,8 +1818,14 @@ function App() {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const highlightTimeoutRef = useRef<number | null>(null)
+  const lastSavedRemotePreferencesRef = useRef("")
   const cleanupRan = useRef(false)
-  const remoteEnabled = remoteChatAvailable()
+  const configuredRemoteEnabled = remoteChatAvailable()
+  const remoteEnabled = configuredRemoteEnabled && !remoteUnavailableReason
+  const googleUser = authUser && !authUser.isAnonymous ? authUser : null
+  const accountStorageKey = googleUser
+    ? chatStateKeyForUserId(googleUser.uid)
+    : LOCAL_CHAT_STATE_KEY
   const mobileReplyGesture = useMediaQuery("(max-width: 720px)")
   const profileUsernameKey = usernameKeyFromName(profile.name)
   const remoteIdentityReady = !remoteEnabled || authorId !== "me"
@@ -1096,6 +1835,47 @@ function App() {
     usernameClaim?.key === profileUsernameKey &&
     usernameClaim?.name === cleanUsernameDisplayName(profile.name) &&
     (!remoteEnabled || usernameClaim?.authorId === authorId)
+  const activeAdminRestriction = useMemo<UserModerationState | null>(() => {
+    if (activeModeration && activeModeration.bannedUntil > spamNow) {
+      return activeModeration
+    }
+
+    if (
+      spamGuard.banSource !== "admin" ||
+      !spamGuard.bannedUntil ||
+      spamGuard.bannedUntil <= spamNow
+    ) {
+      return null
+    }
+
+    const cachedEntry = (spamGuard.log ?? []).find(
+      (entry) =>
+        (entry.action === "ban" || entry.action === "timeout") &&
+        entry.bannedUntil === spamGuard.bannedUntil
+    )
+    if (!cachedEntry || cachedEntry.action !== "ban") return null
+
+    return {
+      action: cachedEntry.action,
+      at: cachedEntry.at,
+      authorId: cachedEntry.targetAuthorId ?? authorId,
+      authorName: cachedEntry.targetAuthorName ?? profile.name,
+      bannedUntil: cachedEntry.bannedUntil ?? spamGuard.bannedUntil,
+      moderatorName: "Admin",
+      reason: cachedEntry.reason,
+    }
+  }, [
+    activeModeration,
+    authorId,
+    profile.name,
+    spamGuard.banSource,
+    spamGuard.bannedUntil,
+    spamGuard.log,
+    spamNow,
+  ])
+  const activeAdminBan =
+    activeAdminRestriction?.action === "ban" &&
+    activeAdminRestriction.bannedUntil > spamNow
   const shouldShowOnboarding = ready && remoteIdentityReady && !hasUniqueUsername
 
   const replyTo = useMemo(
@@ -1103,13 +1883,38 @@ function App() {
     [messages, replyToId]
   )
 
+  const allDisplayedMessages = useMemo(
+    () => (activeAdminBan ? [] : [...messages, ...pendingMessages]),
+    [activeAdminBan, messages, pendingMessages]
+  )
+  const hiddenOlderMessageCount = Math.max(
+    0,
+    allDisplayedMessages.length - visibleMessageLimit
+  )
   const displayedMessages = useMemo(
-    () => [...messages, ...pendingMessages],
-    [messages, pendingMessages]
+    () => allDisplayedMessages.slice(-visibleMessageLimit),
+    [allDisplayedMessages, visibleMessageLimit]
   )
   const messageGroups = useMemo(
     () => groupMessages(displayedMessages),
     [displayedMessages]
+  )
+  const pinnedMessages = useMemo(
+    () =>
+      messages
+        .filter((message) => message.pinnedAt)
+        .toSorted((a, b) => (b.pinnedAt ?? 0) - (a.pinnedAt ?? 0))
+        .slice(0, 4),
+    [messages]
+  )
+  const activeThreadMessages = useMemo(
+    () =>
+      threadPanelRootId
+        ? messages.filter(
+            (message) => replyRootIdFor(messages, message.id) === threadPanelRootId
+          )
+        : [],
+    [messages, threadPanelRootId]
   )
 
   function jumpToMessage(messageId: string) {
@@ -1130,6 +1935,28 @@ function App() {
       setHighlightedMessageId((current) => (current === messageId ? null : current))
       highlightTimeoutRef.current = null
     }, 1800)
+  }
+
+  function maybePromptForThread(message: ChatMessage, nextMessages: ChatMessage[]) {
+    if (!message.replyToId) return
+
+    const chain = replyChainFor(nextMessages, message.id)
+    if (chain.length < 3) return
+
+    const rootId = chain[0]?.id
+    if (!rootId || dismissedThreadRoots.has(rootId)) return
+
+    setThreadPrompt({ messageId: message.id, rootId })
+  }
+
+  function dismissThreadPrompt(rootId: string) {
+    setDismissedThreadRoots((current) => new Set(current).add(rootId))
+    setThreadPrompt(null)
+  }
+
+  function openThread(rootId: string) {
+    setThreadPanelRootId(rootId)
+    dismissThreadPrompt(rootId)
   }
 
   useEffect(() => {
@@ -1171,6 +1998,39 @@ function App() {
 
   const moderationUsers = useMemo<ModerationUser[]>(() => {
     const users = new Map<string, ModerationUser>()
+    const now = spamNow
+    const moderationByUser = new Map<string, UserModerationState>()
+
+    for (const entry of [...(spamGuard.log ?? [])].reverse()) {
+      if (!entry.targetAuthorId) continue
+
+      if (entry.action === "clear") {
+        moderationByUser.delete(entry.targetAuthorId)
+        continue
+      }
+
+      if (
+        (entry.action === "ban" || entry.action === "timeout") &&
+        entry.bannedUntil &&
+        entry.bannedUntil > now
+      ) {
+        moderationByUser.set(entry.targetAuthorId, {
+          action: entry.action,
+          at: entry.at,
+          authorId: entry.targetAuthorId,
+          authorName: entry.targetAuthorName ?? "User",
+          bannedUntil: entry.bannedUntil,
+          moderatorName: "Admin",
+          reason: entry.reason,
+        })
+      }
+    }
+
+    for (const moderation of remoteModerations) {
+      if (moderation.bannedUntil > now) {
+        moderationByUser.set(moderation.authorId, moderation)
+      }
+    }
 
     for (const user of remoteUsers) {
       const isSelf = user.id === authorId
@@ -1180,6 +2040,7 @@ function App() {
         isSelf,
         lastSeenAt: user.lastSeenAt,
         messageCount: 0,
+        moderation: moderationByUser.get(user.id),
         name: isSelf ? profile.name : user.name,
       })
     }
@@ -1192,6 +2053,7 @@ function App() {
         isSelf: true,
         lastSeenAt: Math.max(current?.lastSeenAt ?? 0, Date.now()),
         messageCount: current?.messageCount ?? 0,
+        moderation: current?.moderation ?? moderationByUser.get(authorId),
         name: profile.name,
       })
     }
@@ -1207,6 +2069,7 @@ function App() {
         isSelf,
         lastSeenAt: Math.max(current?.lastSeenAt ?? 0, message.createdAt),
         messageCount: (current?.messageCount ?? 0) + 1,
+        moderation: current?.moderation ?? moderationByUser.get(message.authorId),
         name: isSelf ? profile.name : message.authorName || current?.name || "User",
       })
     }
@@ -1215,7 +2078,17 @@ function App() {
       if (a.isSelf !== b.isSelf) return a.isSelf ? -1 : 1
       return b.lastSeenAt - a.lastSeenAt
     })
-  }, [authorId, messages, profile.avatar, profile.name, remoteUsers, usernameClaim])
+  }, [
+    authorId,
+    messages,
+    profile.avatar,
+    profile.name,
+    remoteModerations,
+    remoteUsers,
+    spamGuard.log,
+    spamNow,
+    usernameClaim,
+  ])
 
   const usernameByAuthorId = useMemo(() => {
     const usernames = new Map<string, string>()
@@ -1229,7 +2102,7 @@ function App() {
     if (!mentionRange) return []
 
     const query = mentionRange.query.toLowerCase()
-    return moderationUsers
+    const people = moderationUsers
       .filter((user) => user.id !== authorId && user.name.trim())
       .map((user) => {
         const mention = usernameByAuthorId.get(user.id) ?? usernameKeyFromName(user.name)
@@ -1247,8 +2120,23 @@ function App() {
           user.mention.toLowerCase().includes(query)
         )
       })
+    const roomMentions: MentionSuggestion[] = adminUnlocked
+      ? [
+          { id: "room-mention", mention: "room", name: "Everyone in Main Chat" },
+          { id: "everyone-mention", mention: "everyone", name: "Everyone online" },
+        ]
+      : []
+
+    return [...roomMentions, ...people]
+      .filter((user) => {
+        if (!query) return true
+        return (
+          user.name.toLowerCase().includes(query) ||
+          user.mention.toLowerCase().includes(query)
+        )
+      })
       .slice(0, 6)
-  }, [authorId, mentionRange, moderationUsers, usernameByAuthorId])
+  }, [adminUnlocked, authorId, mentionRange, moderationUsers, usernameByAuthorId])
 
   const stateForStorage = useMemo<PersistedChatState>(
     () => ({
@@ -1256,43 +2144,166 @@ function App() {
       profile,
       usernameClaim,
       notifications,
+      moderationSettings,
+      roomSettings,
       spamGuard,
       trustedSites,
       messages,
     }),
-    [profile, usernameClaim, notifications, spamGuard, trustedSites, messages]
+    [
+      profile,
+      usernameClaim,
+      notifications,
+      moderationSettings,
+      roomSettings,
+      spamGuard,
+      trustedSites,
+      messages,
+    ]
   )
+
+  const stateForPreferences = useMemo<UserPreferences>(
+    () => preferencesFromState(stateForStorage),
+    [stateForStorage]
+  )
+
+  function applyStoredState(next: PersistedChatState, storageKey: string) {
+    const cachedSpamGuard = readCachedSpamGuard(storageKey)
+    const nextSpamGuard = mergeSpamGuardStates(next.spamGuard, cachedSpamGuard)
+    setProfile(next.profile)
+    setUsernameClaim(next.usernameClaim ?? null)
+    setUsernameDraft(next.profile.name === defaultProfile.name ? "" : next.profile.name)
+    setNotifications(next.notifications)
+    setModerationSettings(next.moderationSettings)
+    setRoomSettings(next.roomSettings)
+    setSpamGuard(nextSpamGuard)
+    writeCachedSpamGuard(nextSpamGuard, storageKey)
+    setTrustedSites(next.trustedSites)
+    setMessages(next.messages)
+  }
 
   useEffect(() => {
     let isMounted = true
+    const currentGoogleUser = googleUser
+    const nextStorageKey = accountStorageKey
 
-    loadChatState().then((stored) => {
+    setReady(false)
+
+    async function loadAccountState() {
+      const [stored, remotePreferences] = await Promise.all([
+        loadChatState(nextStorageKey),
+        currentGoogleUser && remoteEnabled
+          ? loadRemoteUserPreferences(currentGoogleUser.uid).catch((error) => {
+              console.warn("Remote user preferences failed", error)
+              setAuthError("Could not load Google preferences for this account.")
+              return null
+            })
+          : Promise.resolve(null),
+      ])
       if (!isMounted) return
-      const next = normalizeStoredState(stored)
-      const cachedSpamGuard = readCachedSpamGuard()
-      const nextSpamGuard = mergeSpamGuardStates(next.spamGuard, cachedSpamGuard)
-      setProfile(next.profile)
-      setUsernameClaim(next.usernameClaim ?? null)
-      setUsernameDraft(
-        next.profile.name === defaultProfile.name ? "" : next.profile.name
-      )
-      setNotifications(next.notifications)
-      setSpamGuard(nextSpamGuard)
-      writeCachedSpamGuard(nextSpamGuard)
-      setTrustedSites(next.trustedSites)
-      setMessages(next.messages)
+
+      const localState = normalizeStoredState(stored)
+      const next =
+        currentGoogleUser && remotePreferences
+          ? stateWithPreferences(localState, remotePreferences)
+          : currentGoogleUser
+            ? seedStateFromGoogle(localState, currentGoogleUser)
+            : localState
+
+      applyStoredState(next, nextStorageKey)
+      setActiveStorageKey(nextStorageKey)
+      lastSavedRemotePreferencesRef.current =
+        currentGoogleUser && remotePreferences
+          ? JSON.stringify(preferencesFromState(next))
+          : ""
+      setReady(true)
+    }
+
+    loadAccountState().catch((error) => {
+      console.warn("Account state load failed", error)
+      if (!isMounted) return
+      applyStoredState(createInitialState(), nextStorageKey)
+      setActiveStorageKey(nextStorageKey)
+      lastSavedRemotePreferencesRef.current = ""
+      setAuthError("Could not load preferences for this account.")
       setReady(true)
     })
 
     return () => {
       isMounted = false
     }
-  }, [])
+  }, [
+    accountStorageKey,
+    googleUser,
+    googleUser?.displayName,
+    googleUser?.email,
+    googleUser?.photoURL,
+    googleUser?.uid,
+    remoteEnabled,
+  ])
 
   useEffect(() => {
-    if (!ready) return
-    saveChatState(stateForStorage)
-  }, [ready, stateForStorage])
+    if (!ready || activeStorageKey !== accountStorageKey) return
+    saveChatState(stateForStorage, activeStorageKey)
+  }, [accountStorageKey, activeStorageKey, ready, stateForStorage])
+
+  useEffect(() => {
+    if (!ready || typeof window === "undefined") return
+
+    const storedDraft = window.localStorage.getItem(
+      `sechat-draft:${activeStorageKey}:main`
+    )
+    if (storedDraft !== null) {
+      setDraft(storedDraft)
+    }
+  }, [activeStorageKey, ready])
+
+  useEffect(() => {
+    if (!ready || typeof window === "undefined") return
+
+    const key = `sechat-draft:${activeStorageKey}:main`
+    if (draft.trim()) {
+      window.localStorage.setItem(key, draft)
+    } else {
+      window.localStorage.removeItem(key)
+    }
+  }, [activeStorageKey, draft, ready])
+
+  useEffect(() => {
+    if (
+      activeAdminBan ||
+      !ready ||
+      !googleUser ||
+      !remoteEnabled ||
+      activeStorageKey !== accountStorageKey
+    ) {
+      return
+    }
+
+    const serialized = JSON.stringify(stateForPreferences)
+    if (serialized === lastSavedRemotePreferencesRef.current) return
+
+    const timeout = window.setTimeout(() => {
+      saveRemoteUserPreferences(stateForPreferences)
+        .then(() => {
+          lastSavedRemotePreferencesRef.current = serialized
+        })
+        .catch((error) => {
+          console.warn("Remote user preferences save failed", error)
+          setAuthError("Could not save Google preferences for this account.")
+        })
+    }, 400)
+
+    return () => window.clearTimeout(timeout)
+  }, [
+    accountStorageKey,
+    activeStorageKey,
+    activeAdminBan,
+    googleUser,
+    ready,
+    remoteEnabled,
+    stateForPreferences,
+  ])
 
   useEffect(() => {
     setMentionActiveIndex((current) =>
@@ -1303,8 +2314,8 @@ function App() {
   }, [mentionSuggestions.length])
 
   useEffect(() => {
-    writeCachedSpamGuard(spamGuard)
-  }, [spamGuard])
+    writeCachedSpamGuard(spamGuard, activeStorageKey)
+  }, [activeStorageKey, spamGuard])
 
   useEffect(() => {
     const bannedUntil = spamGuard.bannedUntil
@@ -1356,6 +2367,14 @@ function App() {
       })
       .catch((error) => {
         console.warn("Remote chat setup failed", error)
+        if (!cancelled) {
+          const message = readableRemoteError(
+            error,
+            "Firebase chat could not connect. Local fallback is active for this tab."
+          )
+          setRemoteUnavailableReason(message)
+          setAuthError(message)
+        }
       })
 
     return () => {
@@ -1364,6 +2383,13 @@ function App() {
   }, [remoteEnabled])
 
   useEffect(() => {
+    if (activeAdminBan) {
+      setMessages([])
+      seenMessageIdsRef.current = new Set()
+      seenMessagesReadyRef.current = false
+      return
+    }
+
     if (!remoteEnabled) return
 
     const unsubscribeMessages = listenToRemoteMessages(
@@ -1376,7 +2402,7 @@ function App() {
     )
 
     return () => unsubscribeMessages?.()
-  }, [remoteEnabled])
+  }, [activeAdminBan, remoteEnabled])
 
   useEffect(() => {
     if (!remoteEnabled) {
@@ -1393,6 +2419,22 @@ function App() {
 
     return () => unsubscribeUsers?.()
   }, [remoteEnabled])
+
+  useEffect(() => {
+    if (!remoteEnabled || !adminUnlocked) {
+      setRemoteModerations([])
+      return
+    }
+
+    const unsubscribeModerations = listenToRemoteModerations(
+      setRemoteModerations,
+      (error) => {
+        console.warn("Remote moderations listener failed", error)
+      }
+    )
+
+    return () => unsubscribeModerations?.()
+  }, [adminUnlocked, remoteEnabled])
 
   useEffect(() => {
     if (!remoteEnabled || authorId === "me") return
@@ -1419,7 +2461,7 @@ function App() {
   }, [remoteEnabled])
 
   useEffect(() => {
-    if (!authUser || authUser.isAnonymous) return
+    if (!ready || !authUser || authUser.isAnonymous) return
 
     const suggestedName =
       cleanUsernameDisplayName(authUser.displayName) ||
@@ -1428,14 +2470,7 @@ function App() {
     if (!usernameClaim && !usernameDraft.trim() && suggestedName) {
       setUsernameDraft(suggestedName)
     }
-
-    if (authUser.photoURL && !profile.avatar.trim()) {
-      setProfile((current) => ({
-        ...current,
-        avatar: current.avatar.trim() ? current.avatar : authUser.photoURL,
-      }))
-    }
-  }, [authUser, profile.avatar, usernameClaim, usernameDraft])
+  }, [authUser, ready, usernameClaim, usernameDraft])
 
   useEffect(() => {
     if (!ready || !remoteEnabled || authorId === "me" || !usernameClaim) return
@@ -1487,6 +2522,26 @@ function App() {
   }, [activeModeration, remoteModerationReady])
 
   useEffect(() => {
+    if (!activeAdminBan) return
+
+    setPanel(null)
+    setPendingLink(null)
+    setMediaViewer(null)
+    setVoiceChatOpen(false)
+    setUnread(0)
+    setReplyToId(undefined)
+    setMentionRange(null)
+    setDraft("")
+    setAttachmentDrafts([])
+    setAttachmentDropActive(false)
+    setPendingMessages([])
+    setHighlightedMessageId(null)
+    seenMessageIdsRef.current = new Set()
+    seenMessagesReadyRef.current = false
+    resetRecording()
+  }, [activeAdminBan])
+
+  useEffect(() => {
     if (!ready || cleanupRan.current) return
     cleanupRan.current = true
 
@@ -1505,7 +2560,7 @@ function App() {
   }, [displayedMessages.length, reduceMotion])
 
   useEffect(() => {
-    if (!ready) return
+    if (!ready || activeAdminBan) return
 
     if (!seenMessagesReadyRef.current) {
       seenMessageIdsRef.current = new Set(messages.map((message) => message.id))
@@ -1527,21 +2582,37 @@ function App() {
     setUnread((current) => current + incomingMessages.length)
 
     incomingMessages.forEach((message) => {
-      const kind = getMessageSoundKind(message, messages, authorId, profile.name)
+      if (notifications.roomEnabled === false) return
+
+      const keywordPing = (notifications.keywordAlerts ?? []).some((keyword) =>
+        keyword && message.body.toLowerCase().includes(keyword.toLowerCase())
+      )
+      const kind = keywordPing
+        ? "ping"
+        : getMessageSoundKind(message, messages, authorId, profile.name)
       const soundEnabled =
         notifications.soundsEnabled && notifications.soundKinds[kind]
       const browserEnabled =
         notifications.browserEnabled &&
         notifications.soundKinds[kind] &&
         shouldShowBrowserNotification()
+      const notificationMessage: ChatMessage = {
+        ...message,
+        attachments:
+          notifications.attachmentPreviews === false ? undefined : message.attachments,
+        body:
+          message.messageType === "audio" && notifications.voicePreviews === false
+            ? ""
+            : message.body,
+      }
 
       playNotificationSound(kind, soundEnabled)
       showBrowserNotification(
-        { ...message, soundKind: kind },
+        { ...notificationMessage, soundKind: kind },
         browserEnabled
       )
     })
-  }, [authorId, messages, notifications, profile.name, ready])
+  }, [activeAdminBan, authorId, messages, notifications, profile.name, ready])
 
   useEffect(() => {
     audioDraftRef.current = audioDraft
@@ -1550,6 +2621,22 @@ function App() {
   useEffect(() => {
     audioWaveformRef.current = audioWaveform
   }, [audioWaveform])
+
+  useEffect(() => {
+    if (!remoteEnabled || activeAdminBan) return
+
+    const retryQueuedMessages = () => {
+      messages
+        .filter((message) => message.sendStatus === "failed")
+        .slice(0, 5)
+        .forEach((message) => {
+          retryFailedMessageRef.current(message)
+        })
+    }
+
+    window.addEventListener("online", retryQueuedMessages)
+    return () => window.removeEventListener("online", retryQueuedMessages)
+  }, [activeAdminBan, messages, remoteEnabled])
 
   useEffect(() => {
     const textarea = textareaRef.current
@@ -1822,6 +2909,41 @@ function App() {
       return false
     }
 
+    if (
+      moderationSettings.slowModeSeconds > 0 &&
+      sendHistoryRef.current.at(-1) &&
+      now - sendHistoryRef.current.at(-1)!.at <
+        moderationSettings.slowModeSeconds * 1000
+    ) {
+      const remainingSeconds = Math.ceil(
+        (moderationSettings.slowModeSeconds * 1000 -
+          (now - sendHistoryRef.current.at(-1)!.at)) /
+          1000
+      )
+      setSpamWarning(`Slow mode is active. Try again in ${remainingSeconds}s.`)
+      return false
+    }
+
+    const filteredWord = wordFilterMatch(candidate.body, moderationSettings)
+    if (filteredWord) {
+      pushModerationLog({
+        id: makeId("moderation"),
+        action: "word-filter",
+        at: now,
+        reason: `Word filter matched "${filteredWord}" in a message from ${profile.name}`,
+        strikes: moderationSettings.wordFilterMode === "block" ? 1 : 0,
+        targetAuthorId: authorId,
+        targetAuthorName: profile.name,
+      })
+
+      if (moderationSettings.wordFilterMode === "block") {
+        setSpamWarning(`That message was blocked by the word filter: ${filteredWord}`)
+        return false
+      }
+
+      setSpamWarning(`Word filter warning: ${filteredWord}`)
+    }
+
     const violation = spamViolationFor(candidate)
     if (violation) {
       registerSpamTrigger(violation)
@@ -1873,7 +2995,7 @@ function App() {
   function pushModerationLog(entry: SpamModerationLogEntry) {
     setSpamGuard((current) => ({
       ...current,
-      log: [entry, ...(current.log ?? [])].slice(0, 20),
+      log: [entry, ...(current.log ?? [])].slice(0, 100),
     }))
   }
 
@@ -1909,16 +3031,18 @@ function App() {
 
   async function moderateUser(
     user: ModerationUser,
-    action: UserModerationState["action"]
+    action: UserModerationState["action"],
+    reasonInput?: string
   ) {
     if (!adminUnlocked) return
 
     const now = Date.now()
     const bannedUntil = now + (action === "ban" ? ADMIN_BAN_MS : ADMIN_TIMEOUT_MS)
     const reason =
-      action === "ban"
+      reasonInput?.trim() ||
+      (action === "ban"
         ? "Banned by an admin"
-        : `Timed out for ${formatRemainingTime(ADMIN_TIMEOUT_MS)}`
+        : `Timed out for ${formatRemainingTime(ADMIN_TIMEOUT_MS)}`)
     const logEntry: SpamModerationLogEntry = {
       id: makeId("moderation"),
       action,
@@ -2004,6 +3128,24 @@ function App() {
     }
   }
 
+  function warnUser(user: ModerationUser, reason = moderationSettings.reasonPreset) {
+    if (!adminUnlocked) return
+
+    const now = Date.now()
+    pushModerationLog({
+      id: makeId("moderation"),
+      action: "warn",
+      at: now,
+      bannedUntil: now + moderationSettings.warningExpiresMinutes * 60 * 1000,
+      reason: `${reason}: ${user.name}`,
+      strikes: 0,
+      targetAuthorId: user.id,
+      targetAuthorName: user.name,
+    })
+    setAdminStatus(`${user.name} warned for ${moderationSettings.warningExpiresMinutes}m.`)
+    playConfirmationSound("soft")
+  }
+
   async function claimUsername(inputName = usernameDraft) {
     const cleanName = cleanUsernameDisplayName(inputName)
     const validationError = usernameValidationError(cleanName)
@@ -2066,24 +3208,19 @@ function App() {
       setAuthUser(user)
       setAuthorId(user.uid)
 
+      const googleProfile = suggestedProfileFromGoogle(user)
       const claimBelongsToUser = usernameClaim?.authorId === user.uid
       if (usernameClaim && !claimBelongsToUser) {
         setUsernameClaim(null)
       }
 
-      const suggestedName =
-        cleanUsernameDisplayName(user.displayName) ||
-        cleanUsernameDisplayName(user.email.split("@")[0] ?? "")
-      if (!claimBelongsToUser && suggestedName) {
-        setUsernameDraft(suggestedName)
+      if (!claimBelongsToUser && googleProfile.name) {
+        setUsernameDraft(
+          googleProfile.name === defaultProfile.name ? "" : googleProfile.name
+        )
       }
 
-      if (user.photoURL) {
-        setProfile((current) => ({
-          ...current,
-          avatar: current.avatar.trim() ? current.avatar : user.photoURL,
-        }))
-      }
+      setProfile(googleProfile)
 
       playConfirmationSound("done")
     } catch (error) {
@@ -2102,6 +3239,8 @@ function App() {
 
     try {
       const user = await signOutToAnonymousUser()
+      await deleteChatState(LOCAL_CHAT_STATE_KEY)
+      clearCachedSpamGuard(LOCAL_CHAT_STATE_KEY)
       setAuthUser(user)
       setAuthorId(user?.uid ?? "me")
       setUsernameClaim(null)
@@ -2122,6 +3261,8 @@ function App() {
   }
 
   async function toggleReaction(messageId: string, emoji: string) {
+    if (activeAdminBan) return
+
     if (!hasUniqueUsername) {
       setUsernameError("Choose a unique username before reacting.")
       return
@@ -2171,7 +3312,194 @@ function App() {
     }
   }
 
+  function updateLocalMessage(
+    messageId: string,
+    updater: (message: ChatMessage) => ChatMessage
+  ) {
+    setMessages((current) =>
+      current.map((message) => (message.id === messageId ? updater(message) : message))
+    )
+  }
+
+  function toggleMessagePin(message: ChatMessage) {
+    if (activeAdminBan) return
+    updateLocalMessage(message.id, (current) => ({
+      ...current,
+      pinnedAt: current.pinnedAt ? undefined : Date.now(),
+    }))
+    playConfirmationSound("soft")
+  }
+
+  function toggleMessageStar(message: ChatMessage) {
+    if (activeAdminBan) return
+    updateLocalMessage(message.id, (current) => {
+      const starredBy = new Set(current.starredBy ?? [])
+      if (starredBy.has(authorId)) {
+        starredBy.delete(authorId)
+      } else {
+        starredBy.add(authorId)
+      }
+      return { ...current, starredBy: Array.from(starredBy) }
+    })
+    playConfirmationSound("pop")
+  }
+
+  function toggleMessageSelection(message: ChatMessage) {
+    if (activeAdminBan) return
+    setSelectedMessageIds((current) => {
+      const next = new Set(current)
+      if (next.has(message.id)) {
+        next.delete(message.id)
+      } else {
+        next.add(message.id)
+      }
+      return next
+    })
+    playConfirmationSound("click")
+  }
+
+  function toggleMessageTranslation(message: ChatMessage) {
+    if (activeAdminBan || !message.body.trim()) return
+    setTranslatedMessageIds((current) => {
+      const next = new Set(current)
+      if (next.has(message.id)) {
+        next.delete(message.id)
+      } else {
+        next.add(message.id)
+      }
+      return next
+    })
+    playConfirmationSound("soft")
+  }
+
+  function askMessageAi(message: ChatMessage) {
+    if (activeAdminBan) return
+    const note = createLocalAiNote(message)
+    updateLocalMessage(message.id, (current) => ({
+      ...current,
+      aiNote: note,
+    }))
+    setSpamWarning(note)
+    playConfirmationSound("done")
+  }
+
+  function forwardMessage(message: ChatMessage) {
+    if (activeAdminBan) return
+    const forwarded: ChatMessage = {
+      id: makeId("me"),
+      authorId,
+      authorName: profile.name,
+      usernameKey: usernameClaim?.key ?? profileUsernameKey,
+      avatar: profile.avatar,
+      body: message.body || messagePreview(message),
+      createdAt: Date.now(),
+      attachments: message.attachments,
+      audioDurationMs: message.audioDurationMs,
+      audioMimeType: message.audioMimeType,
+      audioUrl: message.audioUrl,
+      forwardedFrom: message.authorName,
+      messageType: message.messageType,
+      waveform: message.waveform,
+    }
+    setMessages((current) => [...current, forwarded])
+    playConfirmationSound("done")
+  }
+
+  function reportMessage(message: ChatMessage) {
+    if (activeAdminBan) return
+    const reason = `Reported message from ${message.authorName || "User"}`
+    updateLocalMessage(message.id, (current) => ({
+      ...current,
+      reports: [
+        ...(current.reports ?? []),
+        { at: Date.now(), authorId, authorName: profile.name, reason },
+      ],
+    }))
+    pushModerationLog({
+      id: makeId("moderation"),
+      action: "report",
+      at: Date.now(),
+      reason,
+      strikes: 0,
+      targetAuthorId: message.authorId,
+      targetAuthorName: message.authorName,
+    })
+    setAdminStatus("Report added to the admin queue.")
+    playConfirmationSound("soft")
+  }
+
+  function openMessageEdit(message: ChatMessage) {
+    if (activeAdminBan || message.messageType === "audio" || !message.body.trim()) return
+    if (message.authorId !== authorId && !adminUnlocked) return
+    setEditTarget({ body: message.body, message })
+  }
+
+  function saveMessageEdit() {
+    if (!editTarget) return
+    const body = editTarget.body.trim()
+    if (!body) return
+
+    updateLocalMessage(editTarget.message.id, (current) => ({
+      ...current,
+      body,
+      editedAt: Date.now(),
+      editHistory: [
+        ...(current.editHistory ?? []),
+        { at: Date.now(), body: current.body },
+      ].slice(-8),
+    }))
+    setEditTarget(null)
+    playConfirmationSound("done")
+  }
+
+  async function retryFailedMessage(message: ChatMessage) {
+    if (activeAdminBan || message.sendStatus !== "failed") return
+    if (!remoteEnabled) {
+      setAttachmentError("Firebase remote chat is not available.")
+      return
+    }
+
+    updateLocalMessage(message.id, (current) => ({ ...current, sendStatus: "sending", uploadProgress: 0 }))
+    try {
+      const remoteAuthorId = await sendRemoteMessage({
+        authorName: profile.name,
+        avatar: profile.avatar,
+        body: message.body,
+        attachments: message.attachments,
+        audioDurationMs: message.audioDurationMs,
+        audioMimeType: message.audioMimeType,
+        audioUrl: message.audioUrl,
+        messageType: message.messageType,
+        onUploadProgress: (progress) =>
+          updateLocalMessage(message.id, (current) => ({
+            ...current,
+            uploadProgress: Math.max(0, Math.min(1, progress)),
+          })),
+        replyToId: message.replyToId,
+        usernameKey: usernameClaim?.key ?? profileUsernameKey,
+        waveform: message.waveform,
+      })
+      setAuthorId(remoteAuthorId)
+      setMessages((current) => current.filter((item) => item.id !== message.id))
+      playConfirmationSound("done")
+    } catch (error) {
+      console.warn("Retry send failed", error)
+      updateLocalMessage(message.id, (current) => ({
+        ...current,
+        sendStatus: "failed",
+        uploadProgress: undefined,
+      }))
+      setAttachmentError(readableRemoteError(error, "Retry failed."))
+    }
+  }
+
+  retryFailedMessageRef.current = (message) => {
+    void retryFailedMessage(message)
+  }
+
   async function sendMessage() {
+    if (activeAdminBan) return
+
     const body = draft.trim()
     const attachments = attachmentDrafts
     if (!body && attachments.length === 0) return
@@ -2206,6 +3534,7 @@ function App() {
     setAttachmentDrafts([])
     setAttachmentError(null)
     setReplyToId(undefined)
+    maybePromptForThread(sent, [...messages, sent])
 
     if (remoteEnabled) {
       const pendingMessage = createPendingMessage({
@@ -2233,7 +3562,15 @@ function App() {
         return
       } catch (error) {
         console.warn("Remote send failed; keeping message local", error)
+        setAttachmentError(
+          readableRemoteError(
+            error,
+            "Firebase upload failed. The message was saved only on this device."
+          )
+        )
         removePendingMessage(pendingMessage.id)
+        setMessages((current) => [...current, { ...sent, sendStatus: "failed" }])
+        return
       }
     }
 
@@ -2282,6 +3619,7 @@ function App() {
     }
 
     setReplyToId(undefined)
+    maybePromptForThread(sent, [...messages, sent])
 
     if (remoteEnabled) {
       const pendingMessage = createPendingMessage({
@@ -2316,7 +3654,15 @@ function App() {
         return true
       } catch (error) {
         console.warn("Remote audio send failed; keeping message local", error)
+        setRecordingError(
+          readableRemoteError(
+            error,
+            "Firebase audio upload failed. The voice message was saved only on this device."
+          )
+        )
         removePendingMessage(pendingMessage.id)
+        setMessages((current) => [...current, { ...sent, sendStatus: "failed" }])
+        return false
       }
     }
 
@@ -2604,6 +3950,8 @@ function App() {
   }
 
   function handleExternalLink(url: string, displayUrl: string) {
+    if (activeAdminBan) return
+
     const origin = originFromUrl(url)
     if (!origin) return
 
@@ -2616,6 +3964,8 @@ function App() {
   }
 
   function openPendingLink(trustSite: boolean) {
+    if (activeAdminBan) return
+
     if (!pendingLink) return
 
     if (trustSite) {
@@ -2647,6 +3997,8 @@ function App() {
   }
 
   function handleAttachmentDrag(event: ReactDragEvent<HTMLDivElement>) {
+    if (activeAdminBan) return
+
     if (!dragEventHasFiles(event)) return
 
     event.preventDefault()
@@ -2666,6 +4018,8 @@ function App() {
   }
 
   function dropAttachmentFiles(event: ReactDragEvent<HTMLDivElement>) {
+    if (activeAdminBan) return
+
     if (!dragEventHasFiles(event)) return
 
     event.preventDefault()
@@ -2681,6 +4035,8 @@ function App() {
   }
 
   async function handleAttachmentFileArray(files: File[]) {
+    if (activeAdminBan) return
+
     if (!ready) return
 
     if (!hasUniqueUsername) {
@@ -2731,7 +4087,11 @@ function App() {
     }
 
     try {
-      const nextAttachments = await Promise.all(acceptedFiles.map(fileToAttachment))
+      const nextAttachments = await Promise.all(
+        acceptedFiles.map((file) =>
+          fileToAttachment(file, roomSettings.imageCompressionQuality)
+        )
+      )
       setAttachmentDrafts((current) => [...current, ...nextAttachments])
       playConfirmationSound("soft")
     } catch (error) {
@@ -2747,6 +4107,24 @@ function App() {
     playConfirmationSound("click")
   }
 
+  function reorderAttachmentDraft(sourceId: string, targetIndex: number) {
+    setAttachmentDrafts((current) => {
+      const sourceIndex = current.findIndex((attachment) => attachment.id === sourceId)
+      if (sourceIndex < 0) return current
+
+      const next = [...current]
+      const [moved] = next.splice(sourceIndex, 1)
+      if (!moved) return current
+
+      const adjustedTargetIndex = sourceIndex < targetIndex ? targetIndex - 1 : targetIndex
+      next.splice(Math.max(0, Math.min(next.length, adjustedTargetIndex)), 0, moved)
+      return next
+    })
+    setDraggedAttachmentId(null)
+    setAttachmentDropIndex(null)
+    playConfirmationSound("click")
+  }
+
   function pasteAttachmentFiles(event: ReactClipboardEvent<HTMLTextAreaElement>) {
     const files = filesFromClipboard(event.clipboardData)
     if (files.length === 0) return
@@ -2759,12 +4137,25 @@ function App() {
     if (!file) return
     const reader = new FileReader()
     reader.onload = () => {
-      setProfile((current) => ({
-        ...current,
-        avatar: typeof reader.result === "string" ? reader.result : current.avatar,
-      }))
+      if (typeof reader.result === "string") {
+        setAvatarCrop({ dataUrl: reader.result, zoom: 1 })
+      }
     }
     reader.readAsDataURL(file)
+  }
+
+  async function applyAvatarCrop() {
+    if (!avatarCrop) return
+    try {
+      const cropped = await cropAvatarDataUrl(avatarCrop.dataUrl, avatarCrop.zoom)
+      setProfile((current) => ({ ...current, avatar: cropped }))
+      setAvatarCrop(null)
+      playConfirmationSound("done")
+    } catch (error) {
+      console.warn("Avatar crop failed", error)
+      setProfile((current) => ({ ...current, avatar: avatarCrop.dataUrl }))
+      setAvatarCrop(null)
+    }
   }
 
   function updateMentionRange(value: string, cursorPosition: number | null) {
@@ -2861,7 +4252,12 @@ function App() {
   const spamBannedUntil = spamGuard.bannedUntil ?? 0
   const isSpamBanned = spamBannedUntil > spamNow
   const shouldHideComposerBar =
-    !ready || !remoteIdentityReady || !hasUniqueUsername || isSpamBanned
+    !ready ||
+    !remoteIdentityReady ||
+    !hasUniqueUsername ||
+    isSpamBanned ||
+    activeAdminBan ||
+    roomSettings.archived
   const spamRemainingMs = Math.max(0, spamBannedUntil - spamNow)
   const composerError = recordingError ?? attachmentError ?? spamWarning
   const chatShellStyle = voiceChatOpen
@@ -2872,6 +4268,8 @@ function App() {
     : undefined
 
   function toggleVoiceChat() {
+    if (activeAdminBan) return
+
     if (!hasUniqueUsername) {
       setUsernameError("Choose a unique username before joining voice.")
       return
@@ -2954,25 +4352,29 @@ function App() {
     <main className="chat-app">
       <TooltipLayer />
       <div
-        className={cn("chat-shell", voiceChatOpen && "voice-active")}
+        aria-hidden={activeAdminBan}
+        className={cn("chat-shell", voiceChatOpen && !activeAdminBan && "voice-active")}
+        inert={activeAdminBan ? true : undefined}
         style={chatShellStyle}
       >
         <AnimatePresence>
-          {voiceChatOpen ? (
+          {voiceChatOpen && !activeAdminBan ? (
             <VoiceChatStage
               adminUnlocked={adminUnlocked}
               authorId={authorId}
+              interactionLocked={activeAdminBan}
               profile={profile}
               reduceMotion={Boolean(reduceMotion)}
               remoteEnabled={remoteEnabled}
               usernameKey={usernameClaim?.key ?? profileUsernameKey}
               onClose={closeVoiceChat}
+              onParticipantsChange={setVoiceParticipantIds}
               onUiCue={playVoiceUiCue}
             />
           ) : null}
         </AnimatePresence>
 
-        {voiceChatOpen ? (
+        {voiceChatOpen && !activeAdminBan ? (
           <div
             aria-label="Resize voice chat"
             className="voice-chat-resizer"
@@ -3018,11 +4420,14 @@ function App() {
           authError={authError}
           authUser={authUser}
           moderationLog={spamGuard.log ?? []}
+          moderationSettings={moderationSettings}
           moderationUsers={moderationUsers}
           notificationIcon={notificationIcon}
           notifications={notifications}
           permission={permission}
           profile={profile}
+          remoteEnabled={remoteEnabled}
+          roomSettings={roomSettings}
           trustedSites={trustedSites}
           unread={unread}
           usernameBusy={usernameBusy}
@@ -3031,12 +4436,16 @@ function App() {
           usernameError={usernameError}
           usernameReady={hasUniqueUsername}
           voiceChatOpen={voiceChatOpen}
+          voiceParticipantIds={voiceParticipantIds}
           onAvatarFile={updateAvatarFromFile}
           onAdminUnlockedChange={setAdminUnlocked}
           onBrowserToggle={updateBrowserNotifications}
+          onNotificationSettingsChange={setNotifications}
           onClearUserModeration={clearUserModeration}
           onClose={() => setPanel(null)}
+          onModerationSettingsChange={setModerationSettings}
           onModerateUser={moderateUser}
+          onWarnUser={warnUser}
           onPanelChange={(next) => {
             setPanel((current) => (current === next ? null : next))
             if (next === "notifications") setUnread(0)
@@ -3045,6 +4454,7 @@ function App() {
           onUsernameDraftChange={updateUsernameDraft}
           onProfileChange={setProfile}
           onRemoveTrustedSite={removeTrustedSite}
+          onRoomSettingsChange={setRoomSettings}
           onSoundKindToggle={updateSoundKind}
           onSoundToggle={updateSound}
           onUiSoundKindChange={updateUiSoundKind}
@@ -3074,9 +4484,68 @@ function App() {
           ) : null}
         </AnimatePresence>
 
-        <section className="chat-window" aria-label="Chat">
+        <section className={cn("chat-window", roomSettings.compactMode && "compact-chat")} aria-label="Chat">
+          {(roomSettings.topic || roomSettings.announcement) ? (
+            <div className="room-announcement-banner">
+              <div>
+                <strong>{roomSettings.topic || "Main Chat"}</strong>
+                {roomSettings.announcement ? <span>{roomSettings.announcement}</span> : null}
+              </div>
+              <Badge variant="outline">{roomSettings.role}</Badge>
+            </div>
+          ) : null}
+          {pinnedMessages.length > 0 ? (
+            <div className="pinned-message-bar" aria-label="Pinned messages">
+              <PushPinSimple weight="duotone" />
+              <div>
+                {pinnedMessages.map((message) => (
+                  <button
+                    key={message.id}
+                    type="button"
+                    onClick={() => jumpToMessage(message.id)}
+                  >
+                    <strong>{message.authorName}</strong>
+                    <span>{messagePreview(message)}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {threadPrompt ? (
+            <div className="thread-suggestion-banner" role="status">
+              <div>
+                <strong>Reply chain detected</strong>
+                <span>This chain has 3 messages. Open it as a thread?</span>
+              </div>
+              <Button
+                size="sm"
+                type="button"
+                variant="default"
+                onClick={() => openThread(threadPrompt.rootId)}
+              >
+                Open thread
+              </Button>
+              <Button
+                size="sm"
+                type="button"
+                variant="ghost"
+                onClick={() => dismissThreadPrompt(threadPrompt.rootId)}
+              >
+                Not now
+              </Button>
+            </div>
+          ) : null}
           <div className="message-scroll" ref={scrollRef}>
-            <div className="message-stack">
+            <div className={cn("message-stack", messageGroups.length === 0 && "empty")}>
+              {hiddenOlderMessageCount > 0 ? (
+                <button
+                  className="load-older-button"
+                  type="button"
+                  onClick={() => setVisibleMessageLimit((current) => current + 80)}
+                >
+                  Load {Math.min(80, hiddenOlderMessageCount)} older messages
+                </button>
+              ) : null}
               {messageGroups.length > 0 ? (
                 messageGroups.map((group) => (
                   <MessageBlock
@@ -3090,15 +4559,32 @@ function App() {
                     quoteFor={(message) =>
                       messages.find((item) => item.id === message.replyToId)
                     }
+                    reducedData={roomSettings.reducedData}
                     onExternalLink={handleExternalLink}
                     onOpenMedia={setMediaViewer}
                     onDeleteMessage={deleteMessageAsAdmin}
+                    onEditMessage={openMessageEdit}
+                    onForwardMessage={forwardMessage}
                     onJumpToMessage={jumpToMessage}
+                    onAskAi={askMessageAi}
+                    onPinMessage={toggleMessagePin}
+                    onReportMessage={reportMessage}
+                    onRetryMessage={retryFailedMessage}
                     onReact={toggleReaction}
                     onReply={setReplyToId}
+                    onSelectMessage={toggleMessageSelection}
+                    onStarMessage={toggleMessageStar}
+                    onTranslateMessage={toggleMessageTranslation}
+                    selectedMessageIds={selectedMessageIds}
+                    translatedMessageIds={translatedMessageIds}
                   />
                 ))
-              ) : null}
+              ) : (
+                <div className="empty-chat-state" role="status">
+                  <strong>{roomSettings.topic || "Main Chat"}</strong>
+                  <span>No messages yet. Start the room from the composer below.</span>
+                </div>
+              )}
             </div>
           </div>
 
@@ -3122,6 +4608,8 @@ function App() {
                 remainingMs={spamRemainingMs}
                 source={spamGuard.banSource}
               />
+            ) : roomSettings.archived ? (
+              <ComposerStatusNotice message="This room frame is archived. Messages are kept read-only." />
             ) : (
               <>
                 <input
@@ -3152,13 +4640,49 @@ function App() {
                       initial={reduceMotion ? false : { opacity: 0, y: 8, scale: 0.98 }}
                       transition={{ duration: 0.16 }}
                     >
-                      {attachmentDrafts.map((attachment) => (
+                      <div className="attachment-draft-tools">
+                        <span>Image quality {Math.round(roomSettings.imageCompressionQuality * 100)}%</span>
+                        <input
+                          aria-label="Image compression quality"
+                          max="0.95"
+                          min="0.45"
+                          step="0.05"
+                          type="range"
+                          value={roomSettings.imageCompressionQuality}
+                          onChange={(event) => {
+                            const imageCompressionQuality = Number(event.currentTarget.value)
+                            setRoomSettings((current) => ({
+                              ...current,
+                              imageCompressionQuality,
+                            }))
+                          }}
+                        />
+                      </div>
+                      {attachmentDrafts.map((attachment, index) => (
                         <AttachmentPreview
                           attachment={attachment}
+                          dragging={draggedAttachmentId === attachment.id}
+                          dropBefore={attachmentDropIndex === index}
                           key={attachment.id}
+                          onDragEnd={() => {
+                            if (draggedAttachmentId && attachmentDropIndex !== null) {
+                              reorderAttachmentDraft(draggedAttachmentId, attachmentDropIndex)
+                              return
+                            }
+                            setDraggedAttachmentId(null)
+                            setAttachmentDropIndex(null)
+                          }}
+                          onDragEnter={() => setAttachmentDropIndex(index)}
+                          onDragStart={() => {
+                            setDraggedAttachmentId(attachment.id)
+                            setAttachmentDropIndex(index)
+                          }}
                           onRemove={() => removeAttachmentDraft(attachment.id)}
                         />
                       ))}
+                      {draggedAttachmentId && attachmentDropIndex === attachmentDrafts.length ? (
+                        <span className="attachment-drop-ghost" />
+                      ) : null}
                     </motion.div>
                   ) : null}
                 </AnimatePresence>
@@ -3327,8 +4851,52 @@ function App() {
               onClose={() => setMediaViewer(null)}
             />
           ) : null}
+          {threadPanelRootId ? (
+            <ThreadPanelDialog
+              messages={activeThreadMessages}
+              profile={profile}
+              rootId={threadPanelRootId}
+              onClose={() => setThreadPanelRootId(null)}
+              onJumpToMessage={(messageId) => {
+                setThreadPanelRootId(null)
+                window.setTimeout(() => jumpToMessage(messageId), 50)
+              }}
+            />
+          ) : null}
+          {editTarget ? (
+            <MessageEditDialog
+              body={editTarget.body}
+              message={editTarget.message}
+              onBodyChange={(body) =>
+                setEditTarget((current) => (current ? { ...current, body } : current))
+              }
+              onCancel={() => setEditTarget(null)}
+              onSave={saveMessageEdit}
+            />
+          ) : null}
+          {avatarCrop ? (
+            <AvatarCropDialog
+              crop={avatarCrop}
+              onApply={() => void applyAvatarCrop()}
+              onCancel={() => setAvatarCrop(null)}
+              onZoomChange={(zoom) =>
+                setAvatarCrop((current) => (current ? { ...current, zoom } : current))
+              }
+            />
+          ) : null}
         </AnimatePresence>
       </div>
+      <AnimatePresence>
+        {activeAdminBan ? (
+          <BanLockdownOverlay
+            reason={activeAdminRestriction?.reason}
+            remainingMs={Math.max(
+              0,
+              (activeAdminRestriction?.bannedUntil ?? spamNow) - spamNow
+            )}
+          />
+        ) : null}
+      </AnimatePresence>
     </main>
   )
 }
@@ -3375,20 +4943,24 @@ function MentionMenu({
 function VoiceChatStage({
   adminUnlocked,
   authorId,
+  interactionLocked,
   profile,
   reduceMotion,
   remoteEnabled,
   usernameKey,
   onClose,
+  onParticipantsChange,
   onUiCue,
 }: {
   adminUnlocked: boolean
   authorId: string
+  interactionLocked: boolean
   profile: Profile
   reduceMotion: boolean
   remoteEnabled: boolean
   usernameKey: string
   onClose: () => void
+  onParticipantsChange: (participants: Set<string>) => void
   onUiCue: (kind: UiSoundKind) => void
 }) {
   const [connected, setConnected] = useState(false)
@@ -3406,10 +4978,15 @@ function VoiceChatStage({
     peers: 0,
   })
   const [voiceLevel, setVoiceLevel] = useState(0)
+  const [voiceSensitivity, setVoiceSensitivity] = useState(VOICE_SPEAKING_THRESHOLD)
+  const [captionsEnabled, setCaptionsEnabled] = useState(false)
+  const [voiceCaption, setVoiceCaption] = useState("")
   const [deviceMenuOpen, setDeviceMenuOpen] = useState(false)
+  const [outputMenuOpen, setOutputMenuOpen] = useState(false)
   const [mutedVoicePeers, setMutedVoicePeers] = useState<Set<string>>(
     () => new Set()
   )
+  const [voicePeerVolumes, setVoicePeerVolumes] = useState<Record<string, number>>({})
   const [remoteVoiceParticipants, setRemoteVoiceParticipants] = useState<
     VoiceParticipantState[]
   >([])
@@ -3427,13 +5004,26 @@ function VoiceChatStage({
   const handleVoiceSignalRef = useRef<(signal: VoiceSignal) => void>(() => undefined)
   const processedVoiceSignalsRef = useRef<Set<string>>(new Set())
   const remoteAudioRefs = useRef<Map<string, HTMLAudioElement>>(new Map())
+  const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null)
   const syncVoicePeersRef = useRef<() => void>(() => undefined)
   const voiceAnalyserRef = useRef<AnalyserNode | null>(null)
   const voiceAudioContextRef = useRef<AudioContext | null>(null)
   const voiceFrameRef = useRef<number | null>(null)
   const voiceJoinedAtRef = useRef<number | null>(null)
   const voicePresenceIntervalRef = useRef<number | null>(null)
+  const voicePresenceTimerRef = useRef<number | null>(null)
+  const voicePresenceWriteInFlightRef = useRef(false)
+  const voicePresenceForcePendingRef = useRef(false)
   const voiceStatsIntervalRef = useRef<number | null>(null)
+  const voiceLevelRef = useRef(0)
+  const lastVoiceActivityAtRef = useRef(0)
+  const lastVoicePresencePayloadRef = useRef<VoicePresencePayload | null>(null)
+  const lastVoicePresenceWriteAtRef = useRef(0)
+  const voicePresenceProfileRef = useRef({
+    avatar: profile.avatar,
+    name: profile.name,
+    usernameKey,
+  })
   const authorIdRef = useRef(authorId)
   const connectedRef = useRef(false)
   const isSpeakingRef = useRef(false)
@@ -3441,11 +5031,12 @@ function VoiceChatStage({
   const deafenedRef = useRef(false)
   const micMeterVisibleRef = useRef(micMeterVisible)
   const mutedVoicePeersRef = useRef<Set<string>>(new Set())
+  const voicePeerVolumesRef = useRef<Record<string, number>>({})
   const remoteEnabledRef = useRef(remoteEnabled)
   const selectedOutputIdRef = useRef("")
   const voiceMutedRef = useRef(false)
   const voiceStreamRef = useRef<MediaStream | null>(null)
-  const isSpeaking = connected && !muted && voiceLevel > 0.18
+  const isSpeaking = connected && !muted && voiceLevel > voiceSensitivity
   const visibleVoiceParticipants = useMemo<VoiceParticipant[]>(() => {
     const remoteParticipants = remoteVoiceParticipants
       .filter((participant) => participant.id !== authorId)
@@ -3501,6 +5092,10 @@ function VoiceChatStage({
     : "Not connected"
 
   useEffect(() => {
+    onParticipantsChange(new Set(visibleVoiceParticipants.map((participant) => participant.id)))
+  }, [onParticipantsChange, visibleVoiceParticipants])
+
+  useEffect(() => {
     void refreshAudioInputs()
 
     const mediaDevices = navigator.mediaDevices
@@ -3531,21 +5126,37 @@ function VoiceChatStage({
   }, [authorId, remoteEnabled])
 
   useEffect(() => {
+    voicePresenceProfileRef.current = {
+      avatar: profile.avatar,
+      name: profile.name,
+      usernameKey,
+    }
+
+    if (connectedRef.current && remoteEnabledRef.current) {
+      publishVoicePresence({ force: true })
+    }
+  }, [profile.avatar, profile.name, usernameKey])
+
+  useEffect(() => {
     leaveVoiceRef.current = leaveVoice
   })
 
   useEffect(() => {
     isSpeakingRef.current = isSpeaking
-  }, [isSpeaking])
+    if (connected && remoteEnabled) {
+      publishVoicePresence()
+    }
+  }, [connected, isSpeaking, remoteEnabled])
 
   useEffect(() => {
     deafenedRef.current = deafened
     mutedVoicePeersRef.current = mutedVoicePeers
+    voicePeerVolumesRef.current = voicePeerVolumes
     selectedOutputIdRef.current = selectedOutputId
     for (const [peerId, audioElement] of remoteAudioRefs.current.entries()) {
       applyRemoteAudioSettings(audioElement, peerId)
     }
-  }, [deafened, mutedVoicePeers, selectedOutputId])
+  }, [deafened, mutedVoicePeers, selectedOutputId, voicePeerVolumes])
 
   useEffect(() => {
     handleVoiceSignalRef.current = (signal) => {
@@ -3647,6 +5258,7 @@ function VoiceChatStage({
       })
 
     if (muted) {
+      voiceLevelRef.current = 0
       setVoiceWaveform(makeQuietWaveform(36))
       setVoiceLevel(0)
     }
@@ -3654,10 +5266,64 @@ function VoiceChatStage({
 
   useEffect(() => {
     return () => {
+      speechRecognitionRef.current?.stop()
       removeVoiceRemoteSession()
       cleanupVoiceResources(false)
     }
   }, [])
+
+  function speechRecognitionConstructor() {
+    if (typeof window === "undefined") return null
+    const speechWindow = window as unknown as Window &
+      Record<"SpeechRecognition" | "webkitSpeechRecognition", SpeechRecognitionConstructor | undefined>
+    return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null
+  }
+
+  function toggleCaptions() {
+    if (captionsEnabled) {
+      speechRecognitionRef.current?.stop()
+      speechRecognitionRef.current = null
+      setCaptionsEnabled(false)
+      return
+    }
+
+    const Recognition = speechRecognitionConstructor()
+    if (!Recognition) {
+      setVoiceCaption("Captions are not available in this browser.")
+      return
+    }
+
+    const recognition = new Recognition()
+    recognition.continuous = true
+    recognition.interimResults = true
+    recognition.lang = navigator.language || "en-US"
+    recognition.onresult = (event) => {
+      const latest = event.results[event.results.length - 1]
+      const transcript = latest?.[0]?.transcript?.trim()
+      if (transcript) setVoiceCaption(transcript)
+    }
+    recognition.onerror = () => {
+      setVoiceCaption("Captions stopped.")
+    }
+    recognition.onend = () => {
+      if (captionsEnabled) {
+        try {
+          recognition.start()
+        } catch {
+          setCaptionsEnabled(false)
+        }
+      }
+    }
+    speechRecognitionRef.current = recognition
+    setCaptionsEnabled(true)
+    setVoiceCaption("Listening for captions...")
+    try {
+      recognition.start()
+    } catch {
+      setCaptionsEnabled(false)
+      setVoiceCaption("Could not start captions.")
+    }
+  }
 
   function cleanupVoiceMeter() {
     if (voiceFrameRef.current !== null) {
@@ -3666,19 +5332,12 @@ function VoiceChatStage({
     }
   }
 
-  function pauseVoiceMeter() {
-    cleanupVoiceMeter()
-    setVoiceWaveform(makeQuietWaveform(36))
-    setVoiceLevel(0)
-  }
-
   function setInputMeterVisible(visible: boolean) {
     micMeterVisibleRef.current = visible
     setMicMeterVisible(visible)
 
     if (!visible) {
-      pauseVoiceMeter()
-      return
+      setVoiceWaveform(makeQuietWaveform(36))
     }
 
     if (connectedRef.current && voiceAnalyserRef.current) {
@@ -3693,7 +5352,11 @@ function VoiceChatStage({
     voiceStreamRef.current?.getTracks().forEach((track) => track.stop())
     voiceStreamRef.current = null
     voiceAnalyserRef.current = null
-    if (resetLevel) setVoiceLevel(0)
+    if (resetLevel) {
+      voiceLevelRef.current = 0
+      lastVoiceActivityAtRef.current = 0
+      setVoiceLevel(0)
+    }
 
     if (
       voiceAudioContextRef.current &&
@@ -3848,6 +5511,9 @@ function VoiceChatStage({
     audioElement.muted =
       deafenedRef.current ||
       (Boolean(peerId) && mutedVoicePeersRef.current.has(peerId as string))
+    audioElement.volume = peerId
+      ? voicePeerVolumesRef.current[peerId] ?? 1
+      : 1
 
     const sinkElement = audioElement as SinkAudioElement
     const outputId = selectedOutputIdRef.current
@@ -3899,6 +5565,7 @@ function VoiceChatStage({
       }
 
       audioElement.play().catch((error) => {
+        if (isInterruptedPlaybackError(error)) return
         console.warn("Remote voice playback failed", error)
       })
     }
@@ -3944,13 +5611,16 @@ function VoiceChatStage({
   async function connectToRemoteVoiceParticipants() {
     if (!remoteEnabled) return
 
-    for (const participant of remoteVoiceParticipants) {
-      if (participant.id === authorId) continue
-      getOrCreatePeerConnection(participant.id)
-      if (authorId < participant.id) {
-        await ensureVoiceOffer(participant.id)
-      }
-    }
+    await Promise.all(
+      remoteVoiceParticipants.map(async (participant) => {
+        if (participant.id === authorId) return
+
+        getOrCreatePeerConnection(participant.id)
+        if (authorId < participant.id) {
+          await ensureVoiceOffer(participant.id)
+        }
+      })
+    )
   }
 
   async function handleVoiceSignal(signal: VoiceSignal) {
@@ -4020,20 +5690,106 @@ function VoiceChatStage({
     if (!remoteEnabled) return
     stopVoicePresenceHeartbeat()
 
-    const publish = () => {
-      void setRemoteVoicePresence({
-        avatar: profile.avatar,
-        joinedAt: voiceJoinedAtRef.current ?? Date.now(),
-        name: profile.name,
-        speaking: isSpeakingRef.current,
-        usernameKey,
-      }).catch((error) => {
-        console.warn("Could not publish voice presence", error)
-      })
+    lastVoicePresencePayloadRef.current = null
+    lastVoicePresenceWriteAtRef.current = 0
+    publishVoicePresence({ force: true, minDelayMs: 0 })
+    voicePresenceIntervalRef.current = window.setInterval(
+      () => publishVoicePresence({ force: true }),
+      VOICE_PRESENCE_HEARTBEAT_MS
+    )
+  }
+
+  function currentVoicePresencePayload(): VoicePresencePayload | null {
+    if (!remoteEnabledRef.current || !voiceStreamRef.current) return null
+
+    const presence = voicePresenceProfileRef.current
+    return {
+      avatar: presence.avatar,
+      joinedAt: voiceJoinedAtRef.current ?? Date.now(),
+      name: presence.name,
+      speaking: isSpeakingRef.current,
+      usernameKey: presence.usernameKey,
+    }
+  }
+
+  function isSameVoicePresencePayload(
+    current: VoicePresencePayload,
+    next: VoicePresencePayload
+  ) {
+    return (
+      current.avatar === next.avatar &&
+      current.joinedAt === next.joinedAt &&
+      current.name === next.name &&
+      current.speaking === next.speaking &&
+      current.usernameKey === next.usernameKey
+    )
+  }
+
+  function publishVoicePresence({
+    force = false,
+    minDelayMs = VOICE_PRESENCE_MIN_WRITE_MS,
+  }: {
+    force?: boolean
+    minDelayMs?: number
+  } = {}) {
+    if (!remoteEnabledRef.current || !voiceStreamRef.current) return
+
+    if (force) {
+      voicePresenceForcePendingRef.current = true
     }
 
-    publish()
-    voicePresenceIntervalRef.current = window.setInterval(publish, 3000)
+    if (voicePresenceTimerRef.current !== null) return
+
+    const elapsedMs = Date.now() - lastVoicePresenceWriteAtRef.current
+    const delayMs = Math.max(0, minDelayMs - elapsedMs)
+    voicePresenceTimerRef.current = window.setTimeout(() => {
+      voicePresenceTimerRef.current = null
+      void flushVoicePresence()
+    }, delayMs)
+  }
+
+  async function flushVoicePresence() {
+    if (!remoteEnabledRef.current || !voiceStreamRef.current) return
+
+    if (voicePresenceWriteInFlightRef.current) {
+      if (voicePresenceTimerRef.current === null) {
+        voicePresenceTimerRef.current = window.setTimeout(() => {
+          voicePresenceTimerRef.current = null
+          void flushVoicePresence()
+        }, VOICE_PRESENCE_MIN_WRITE_MS)
+      }
+      return
+    }
+
+    const payload = currentVoicePresencePayload()
+    if (!payload) return
+
+    const force = voicePresenceForcePendingRef.current
+    voicePresenceForcePendingRef.current = false
+
+    const lastPayload = lastVoicePresencePayloadRef.current
+    if (!force && lastPayload && isSameVoicePresencePayload(lastPayload, payload)) {
+      return
+    }
+
+    voicePresenceWriteInFlightRef.current = true
+    try {
+      await setRemoteVoicePresence(payload)
+      lastVoicePresencePayloadRef.current = payload
+      lastVoicePresenceWriteAtRef.current = Date.now()
+    } catch (error) {
+      lastVoicePresenceWriteAtRef.current = Date.now()
+      console.warn("Could not publish voice presence", error)
+      voicePresenceForcePendingRef.current = true
+    } finally {
+      voicePresenceWriteInFlightRef.current = false
+      if (voicePresenceForcePendingRef.current) {
+        publishVoicePresence({
+          force: true,
+          minDelayMs: VOICE_PRESENCE_RETRY_BACKOFF_MS,
+        })
+      }
+    }
   }
 
   function stopVoicePresenceHeartbeat() {
@@ -4041,6 +5797,13 @@ function VoiceChatStage({
       window.clearInterval(voicePresenceIntervalRef.current)
       voicePresenceIntervalRef.current = null
     }
+    if (voicePresenceTimerRef.current !== null) {
+      window.clearTimeout(voicePresenceTimerRef.current)
+      voicePresenceTimerRef.current = null
+    }
+    voicePresenceForcePendingRef.current = false
+    lastVoicePresencePayloadRef.current = null
+    lastVoicePresenceWriteAtRef.current = 0
   }
 
   function removeVoiceRemoteSession() {
@@ -4055,6 +5818,22 @@ function VoiceChatStage({
     })
   }
 
+  function commitVoiceLevel(level: number) {
+    const nextLevel = level <= 0 ? 0 : Number(clampLevel(level).toFixed(3))
+    const currentLevel = voiceLevelRef.current
+    const wasSpeaking = currentLevel > voiceSensitivity
+    const nowSpeaking = nextLevel > voiceSensitivity
+
+    if (
+      (nextLevel === 0 && currentLevel !== 0) ||
+      wasSpeaking !== nowSpeaking ||
+      Math.abs(currentLevel - nextLevel) >= 0.018
+    ) {
+      voiceLevelRef.current = nextLevel
+      setVoiceLevel(nextLevel)
+    }
+  }
+
   function runVoiceMeter() {
     const analyser = voiceAnalyserRef.current
     if (!analyser) return
@@ -4065,15 +5844,14 @@ function VoiceChatStage({
 
     const tick = (time: number) => {
       const currentAnalyser = voiceAnalyserRef.current
-      if (!currentAnalyser) return
-      if (!micMeterVisibleRef.current) {
+      if (!currentAnalyser) {
         voiceFrameRef.current = null
         return
       }
 
-      if (time - lastUpdate > 55) {
+      if (time - lastUpdate > VOICE_ACTIVITY_UPDATE_MS) {
         if (voiceMutedRef.current) {
-          setVoiceWaveform(makeQuietWaveform(36))
+          commitVoiceLevel(0)
         } else {
           currentAnalyser.getByteTimeDomainData(samples)
 
@@ -4084,9 +5862,20 @@ function VoiceChatStage({
           }
 
           const rms = Math.sqrt(sum / samples.length)
-          const level = clampLevel(0.08 + rms * 5.2)
-          setVoiceLevel(level)
-          setVoiceWaveform((current) => [...current.slice(1), level])
+          const rawLevel = clampLevel(0.08 + rms * 5.2)
+          if (rawLevel > voiceSensitivity) {
+            lastVoiceActivityAtRef.current = time
+          }
+
+          const level =
+            time - lastVoiceActivityAtRef.current <= VOICE_SPEAKING_RELEASE_MS
+              ? Math.max(rawLevel, voiceSensitivity + 0.02)
+              : rawLevel
+          commitVoiceLevel(level)
+
+          if (micMeterVisibleRef.current) {
+            setVoiceWaveform((current) => [...current.slice(1), level])
+          }
         }
 
         lastUpdate = time
@@ -4119,6 +5908,11 @@ function VoiceChatStage({
   }
 
   async function joinVoice(deviceId = selectedInputId) {
+    if (interactionLocked) {
+      setVoiceError("You are banned from this chat.")
+      return
+    }
+
     if (voiceKickedUntil > Date.now()) {
       setVoiceError("You were removed from voice chat. Try again in a moment.")
       return
@@ -4136,10 +5930,13 @@ function VoiceChatStage({
     setVoiceError(null)
 
     try {
-      const audio: MediaTrackConstraints = {
+      const audio: LowLatencyMediaTrackConstraints = {
         autoGainControl: true,
+        channelCount: { ideal: 1 },
         echoCancellation: true,
+        latency: { ideal: 0.02 },
         noiseSuppression: true,
+        sampleRate: { ideal: 48000 },
       }
 
       if (deviceId) {
@@ -4153,7 +5950,8 @@ function VoiceChatStage({
       const analyser = audioContext.createAnalyser()
       const source = audioContext.createMediaStreamSource(stream)
 
-      analyser.fftSize = 512
+      analyser.fftSize = VOICE_ANALYSER_FFT_SIZE
+      analyser.smoothingTimeConstant = 0.28
       source.connect(analyser)
 
       cleanupVoiceResources()
@@ -4161,7 +5959,10 @@ function VoiceChatStage({
       voiceAudioContextRef.current = audioContext
       voiceAnalyserRef.current = analyser
       voiceMutedRef.current = false
+      voiceLevelRef.current = 0
+      lastVoiceActivityAtRef.current = 0
       voiceJoinedAtRef.current = voiceJoinedAtRef.current ?? Date.now()
+      connectedRef.current = true
       setMuted(false)
       setConnected(true)
       setSelectedInputId(stream.getAudioTracks()[0]?.getSettings().deviceId || deviceId)
@@ -4176,11 +5977,7 @@ function VoiceChatStage({
       } else {
         setVoiceError("Voice audio needs Firebase remote chat to reach other users.")
       }
-      if (micMeterVisibleRef.current) {
-        runVoiceMeter()
-      } else {
-        pauseVoiceMeter()
-      }
+      runVoiceMeter()
       startVoiceStatsPolling()
     } catch (error) {
       console.warn("Voice chat failed", error)
@@ -4195,12 +5992,14 @@ function VoiceChatStage({
   }
 
   function leaveVoice() {
+    connectedRef.current = false
     removeVoiceRemoteSession()
     cleanupVoiceResources()
     setConnected(false)
     setMuted(false)
     setDeafened(false)
     setDeviceMenuOpen(false)
+    setOutputMenuOpen(false)
     voiceJoinedAtRef.current = null
     setVoiceWaveform(makeQuietWaveform(36))
     resetVoiceStats()
@@ -4256,6 +6055,14 @@ function VoiceChatStage({
       })
   }
 
+  function moveAllOutOfVoice() {
+    if (!adminUnlocked || !remoteEnabled) return
+
+    visibleVoiceParticipants
+      .filter((participant) => !participant.isSelf)
+      .forEach((participant) => kickVoiceParticipant(participant))
+  }
+
   function changeInputDevice(deviceId: string) {
     setSelectedInputId(deviceId)
     setDeviceMenuOpen(false)
@@ -4267,6 +6074,7 @@ function VoiceChatStage({
   function changeOutputDevice(deviceId: string) {
     selectedOutputIdRef.current = deviceId
     setSelectedOutputId(deviceId)
+    setOutputMenuOpen(false)
     for (const audioElement of remoteAudioRefs.current.values()) {
       const sinkElement = audioElement as SinkAudioElement
       if (sinkElement.setSinkId && deviceId) {
@@ -4279,7 +6087,14 @@ function VoiceChatStage({
   }
 
   function toggleDeviceMenu() {
+    setOutputMenuOpen(false)
     setDeviceMenuOpen((current) => !current)
+    void refreshAudioInputs()
+  }
+
+  function toggleOutputMenu() {
+    setDeviceMenuOpen(false)
+    setOutputMenuOpen((current) => !current)
     void refreshAudioInputs()
   }
 
@@ -4332,20 +6147,62 @@ function VoiceChatStage({
             {voiceError}
           </p>
         ) : null}
-
-        <div className="voice-participant-grid" aria-label="Voice participants">
-          {visibleVoiceParticipants.map((participant) => (
-            <VoiceParticipantCard
-              adminUnlocked={adminUnlocked}
-              key={participant.id}
-              muted={Boolean(participant.muted)}
-              participant={participant}
-              speaking={participant.isSelf ? isSpeaking : Boolean(participant.speaking)}
-              onKick={kickVoiceParticipant}
-              onToggleMute={toggleVoiceParticipantMute}
-            />
-          ))}
+        <div className="voice-utility-row">
+          <Button size="sm" type="button" variant="ghost" onClick={toggleCaptions}>
+            <At data-icon="inline-start" weight="duotone" />
+            {captionsEnabled ? "Captions on" : "Captions"}
+          </Button>
+          {adminUnlocked ? (
+            <Button
+              disabled={!remoteEnabled || visibleVoiceParticipants.length <= 1}
+              size="sm"
+              type="button"
+              variant="ghost"
+              onClick={moveAllOutOfVoice}
+            >
+              <PhoneDisconnect data-icon="inline-start" weight="duotone" />
+              Move all out
+            </Button>
+          ) : null}
         </div>
+        {voiceCaption ? (
+          <div className="voice-caption-card" aria-live="polite">
+            {voiceCaption}
+          </div>
+        ) : null}
+
+        {visibleVoiceParticipants.length > 0 ? (
+          <div className="voice-participant-grid" aria-label="Voice participants">
+            {visibleVoiceParticipants.map((participant) => (
+              <VoiceParticipantCard
+                adminUnlocked={adminUnlocked}
+                key={participant.id}
+                muted={Boolean(participant.muted)}
+                participant={participant}
+                speaking={participant.isSelf ? isSpeaking : Boolean(participant.speaking)}
+                volume={voicePeerVolumes[participant.id] ?? 1}
+                onKick={kickVoiceParticipant}
+                onToggleMute={toggleVoiceParticipantMute}
+                onVolumeChange={(peerId, volume) =>
+                  setVoicePeerVolumes((current) => ({
+                    ...current,
+                    [peerId]: volume,
+                  }))
+                }
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="voice-empty-state" role="status">
+            <Microphone weight="duotone" />
+            <strong>{connected ? "Voice is connecting" : "Voice is ready"}</strong>
+            <span>
+              {connected
+                ? "Participants will appear here as soon as presence syncs."
+                : "Join from the controls below when you want to talk."}
+            </span>
+          </div>
+        )}
       </div>
 
       <div className="voice-bottom-dock">
@@ -4445,7 +6302,7 @@ function VoiceChatStage({
             ) : (
               <Button
                 className="voice-control-button mic"
-                data-tooltip="Input and output devices"
+                data-tooltip="Input devices"
                 size="icon-lg"
                 type="button"
                 variant="ghost"
@@ -4456,9 +6313,9 @@ function VoiceChatStage({
             )}
             <button
               aria-expanded={deviceMenuOpen}
-              aria-label="Choose input and output device"
+              aria-label="Choose input device"
               className={cn("voice-device-arrow", deviceMenuOpen && "active")}
-              data-tooltip="Input and output"
+              data-tooltip="Input device"
               type="button"
               onClick={toggleDeviceMenu}
             >
@@ -4475,11 +6332,11 @@ function VoiceChatStage({
                   transition={{ duration: 0.16, ease: [0.2, 0.8, 0.2, 1] }}
                 >
                   <div className="voice-device-menu-title">
-                    <strong>Voice devices</strong>
-                    <span>Choose microphone and speaker output.</span>
+                    <strong>Input device</strong>
+                    <span>Choose the microphone used for voice chat.</span>
                   </div>
                   <div className="voice-device-menu-head">
-                    <strong>Input device</strong>
+                    <strong>Microphone</strong>
                     <span>{selectedInputLabel}</span>
                   </div>
 
@@ -4511,49 +6368,6 @@ function VoiceChatStage({
                     )}
                   </div>
 
-                  <div className="voice-device-menu-head compact">
-                    <strong>Output device</strong>
-                    <span>{selectedOutputLabel}</span>
-                  </div>
-
-                  <div className="voice-device-options output-options">
-                    {audioOutputs.length > 0 ? (
-                      audioOutputs.map((device, index) => {
-                        const active = device.deviceId === selectedOutputId
-                        return (
-                          <button
-                            className={cn("voice-device-option", active && "active")}
-                            key={device.deviceId || index}
-                            type="button"
-                            onClick={() => changeOutputDevice(device.deviceId)}
-                          >
-                            <span>{device.label || `Speakers ${index + 1}`}</span>
-                            {active ? <Check weight="bold" /> : null}
-                          </button>
-                        )
-                      })
-                    ) : (
-                      <button
-                        className="voice-device-option active"
-                        type="button"
-                        onClick={() => changeOutputDevice("")}
-                      >
-                        <span>Browser default speakers</span>
-                        <Check weight="bold" />
-                      </button>
-                    )}
-                  </div>
-
-                  <button
-                    aria-pressed={deafened}
-                    className={cn("voice-device-option deafen-option", deafened && "active")}
-                    type="button"
-                    onClick={toggleSelfDeafen}
-                  >
-                    <span>{deafened ? "Undeafen" : "Deafen"}</span>
-                    {deafened ? <SpeakerSlash weight="bold" /> : <SpeakerHigh weight="bold" />}
-                  </button>
-
                   <div className={cn("voice-device-level", isSpeaking && "live")}>
                     <div>
                       <strong>Input level</strong>
@@ -4565,6 +6379,20 @@ function VoiceChatStage({
                       className="voice-device-waveform"
                     />
                   </div>
+                  <label className="voice-sensitivity-control">
+                    <span>Sensitivity {voiceSensitivity.toFixed(2)}</span>
+                    <input
+                      aria-label="Voice activity sensitivity"
+                      max="0.45"
+                      min="0.06"
+                      step="0.01"
+                      type="range"
+                      value={voiceSensitivity}
+                      onChange={(event) =>
+                        setVoiceSensitivity(Number(event.currentTarget.value))
+                      }
+                    />
+                  </label>
                 </motion.div>
               ) : null}
             </AnimatePresence>
@@ -4572,20 +6400,81 @@ function VoiceChatStage({
 
           {connected ? (
             <>
-              <Button
-                className={cn("voice-control-button deafen", deafened && "active")}
-                data-tooltip={deafened ? "Undeafen" : "Deafen"}
-                size="icon-lg"
-                type="button"
-                variant="ghost"
-                onClick={toggleSelfDeafen}
-              >
-                {deafened ? (
-                  <SpeakerSlash data-icon="inline-start" weight="duotone" />
-                ) : (
-                  <SpeakerHigh data-icon="inline-start" weight="duotone" />
-                )}
-              </Button>
+              <div className="voice-output-control">
+                <Button
+                  className={cn("voice-control-button deafen", deafened && "active")}
+                  data-tooltip={deafened ? "Undeafen" : "Deafen"}
+                  size="icon-lg"
+                  type="button"
+                  variant="ghost"
+                  onClick={toggleSelfDeafen}
+                >
+                  {deafened ? (
+                    <SpeakerSlash data-icon="inline-start" weight="duotone" />
+                  ) : (
+                    <SpeakerHigh data-icon="inline-start" weight="duotone" />
+                  )}
+                </Button>
+                <button
+                  aria-expanded={outputMenuOpen}
+                  aria-label="Choose output device"
+                  className={cn("voice-device-arrow output", outputMenuOpen && "active")}
+                  data-tooltip="Output device"
+                  type="button"
+                  onClick={toggleOutputMenu}
+                >
+                  <CaretUp weight="bold" />
+                </button>
+
+                <AnimatePresence>
+                  {outputMenuOpen ? (
+                    <motion.div
+                      animate={{ opacity: 1, y: 0, scale: 1 }}
+                      className="voice-device-menu output-menu"
+                      exit={{ opacity: 0, y: 8, scale: 0.98 }}
+                      initial={reduceMotion ? false : { opacity: 0, y: 8, scale: 0.98 }}
+                      transition={{ duration: 0.16, ease: [0.2, 0.8, 0.2, 1] }}
+                    >
+                      <div className="voice-device-menu-title">
+                        <strong>Output device</strong>
+                        <span>Choose where voice chat audio plays.</span>
+                      </div>
+                      <div className="voice-device-menu-head">
+                        <strong>Speakers</strong>
+                        <span>{selectedOutputLabel}</span>
+                      </div>
+
+                      <div className="voice-device-options output-options">
+                        {audioOutputs.length > 0 ? (
+                          audioOutputs.map((device, index) => {
+                            const active = device.deviceId === selectedOutputId
+                            return (
+                              <button
+                                className={cn("voice-device-option", active && "active")}
+                                key={device.deviceId || index}
+                                type="button"
+                                onClick={() => changeOutputDevice(device.deviceId)}
+                              >
+                                <span>{device.label || `Speakers ${index + 1}`}</span>
+                                {active ? <Check weight="bold" /> : null}
+                              </button>
+                            )
+                          })
+                        ) : (
+                          <button
+                            className="voice-device-option active"
+                            type="button"
+                            onClick={() => changeOutputDevice("")}
+                          >
+                            <span>Browser default speakers</span>
+                            <Check weight="bold" />
+                          </button>
+                        )}
+                      </div>
+                    </motion.div>
+                  ) : null}
+                </AnimatePresence>
+              </div>
               <Button
                 className="voice-control-button leave"
                 data-tooltip="Leave voice"
@@ -4618,15 +6507,19 @@ function VoiceParticipantCard({
   muted,
   onKick,
   onToggleMute,
+  onVolumeChange,
   participant,
   speaking,
+  volume,
 }: {
   adminUnlocked: boolean
   muted: boolean
   onKick: (participant: VoiceParticipant) => void
   onToggleMute: (peerId: string) => void
+  onVolumeChange: (peerId: string, volume: number) => void
   participant: VoiceParticipant
   speaking: boolean
+  volume: number
 }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const cardRef = useRef<HTMLDivElement | null>(null)
@@ -4747,6 +6640,20 @@ function VoiceParticipantCard({
               {muted ? <SpeakerHigh weight="duotone" /> : <SpeakerSlash weight="duotone" />}
               <span>{muted ? "Unmute" : "Mute"}</span>
             </button>
+            <label className="voice-participant-volume">
+              <span>Volume {Math.round(volume * 100)}%</span>
+              <input
+                aria-label={`${participant.name} volume`}
+                max="1.5"
+                min="0"
+                step="0.05"
+                type="range"
+                value={volume}
+                onChange={(event) =>
+                  onVolumeChange(participant.id, Number(event.currentTarget.value))
+                }
+              />
+            </label>
             {adminUnlocked ? (
               <button
                 className="danger"
@@ -4806,6 +6713,45 @@ function SpamBanNotice({
   )
 }
 
+function BanLockdownOverlay({
+  reason,
+  remainingMs,
+}: {
+  reason?: string
+  remainingMs: number
+}) {
+  const permanent = remainingMs > 365 * 24 * 60 * 60 * 1000
+
+  return (
+    <motion.div
+      animate={{ opacity: 1 }}
+      aria-label="Banned from chat"
+      aria-live="assertive"
+      className="ban-lockdown-overlay"
+      exit={{ opacity: 0 }}
+      initial={{ opacity: 0 }}
+      role="alertdialog"
+      transition={{ duration: 0.18 }}
+    >
+      <div className="ban-lockdown-card">
+        <span className="ban-lockdown-icon">
+          <Prohibit weight="bold" />
+        </span>
+        <strong>You are banned from this chat.</strong>
+        <p>
+          {reason || "An admin banned this account."} You cannot read messages,
+          react, download media, open links, hear sounds, or join voice chat.
+        </p>
+        <small>
+          {permanent
+            ? "An admin must clear the ban before the app unlocks again."
+            : `Access returns in ${formatRemainingTime(remainingMs)}.`}
+        </small>
+      </div>
+    </motion.div>
+  )
+}
+
 function ComposerStatusNotice({ message }: { message: string }) {
   return (
     <motion.div
@@ -4849,6 +6795,7 @@ function OnboardingOverlay({
   onSubmit: (name?: string) => Promise<boolean>
   onUsernameChange: (value: string) => void
 }) {
+  const { cacheClearing, cacheStatus, clearBrowserCache } = useCacheClearAction()
   const focusPoints = [
     {
       copy: "Reply, react, copy, download, and swipe messages on mobile.",
@@ -4950,6 +6897,27 @@ function OnboardingOverlay({
           </small>
         </form>
 
+        <div className="onboarding-cache-card">
+          <span className="setting-label">
+            <Broom weight="duotone" />
+            App cache
+          </span>
+          <Button
+            disabled={cacheClearing}
+            size="sm"
+            type="button"
+            variant="outline"
+            onClick={() => void clearBrowserCache()}
+          >
+            {cacheClearing ? "Clearing" : "Clear"}
+          </Button>
+          {cacheStatus ? (
+            <small className="onboarding-status" role="status">
+              {cacheStatus}
+            </small>
+          ) : null}
+        </div>
+
         <div className="onboarding-focus-list">
           {focusPoints.map((point) => {
             const Icon = point.icon
@@ -4977,11 +6945,14 @@ function TopLeftDock({
   authError,
   authUser,
   moderationLog,
+  moderationSettings,
   moderationUsers,
   notificationIcon: NotificationIcon,
   notifications,
   permission,
   profile,
+  remoteEnabled,
+  roomSettings,
   trustedSites,
   unread,
   usernameBusy,
@@ -4990,15 +6961,19 @@ function TopLeftDock({
   usernameError,
   usernameReady,
   voiceChatOpen,
+  voiceParticipantIds,
   onAvatarFile,
   onAdminUnlockedChange,
   onBrowserToggle,
+  onNotificationSettingsChange,
   onClearUserModeration,
   onClose,
+  onModerationSettingsChange,
   onModerateUser,
   onPanelChange,
   onProfileChange,
   onRemoveTrustedSite,
+  onRoomSettingsChange,
   onUsernameClaim,
   onUsernameDraftChange,
   onSoundKindToggle,
@@ -5010,6 +6985,7 @@ function TopLeftDock({
   onGoogleSignIn,
   onGoogleSignOut,
   onVoiceToggle,
+  onWarnUser,
 }: {
   activePanel: Panel
   adminStatus: string | null
@@ -5018,11 +6994,14 @@ function TopLeftDock({
   authError: string | null
   authUser: FirebaseAuthUser | null
   moderationLog: SpamModerationLogEntry[]
+  moderationSettings: ModerationSettings
   moderationUsers: ModerationUser[]
   notificationIcon: typeof Bell
   notifications: NotificationSettings
   permission: string
   profile: Profile
+  remoteEnabled: boolean
+  roomSettings: RoomSettings
   trustedSites: string[]
   unread: number
   usernameBusy: boolean
@@ -5031,18 +7010,31 @@ function TopLeftDock({
   usernameError: string | null
   usernameReady: boolean
   voiceChatOpen: boolean
+  voiceParticipantIds: Set<string>
   onAvatarFile: (file: File | undefined) => void
   onAdminUnlockedChange: (unlocked: boolean) => void
   onBrowserToggle: (enabled: boolean) => void
+  onNotificationSettingsChange: (
+    settings:
+      | NotificationSettings
+      | ((current: NotificationSettings) => NotificationSettings)
+  ) => void
   onClearUserModeration: (user: ModerationUser) => void | Promise<void>
   onClose: () => void
+  onModerationSettingsChange: (
+    settings:
+      | ModerationSettings
+      | ((current: ModerationSettings) => ModerationSettings)
+  ) => void
   onModerateUser: (
     user: ModerationUser,
-    action: UserModerationState["action"]
+    action: UserModerationState["action"],
+    reason?: string
   ) => void | Promise<void>
   onPanelChange: (panel: Exclude<Panel, null>) => void
   onProfileChange: (profile: Profile) => void
   onRemoveTrustedSite: (site: string) => void
+  onRoomSettingsChange: (settings: RoomSettings | ((current: RoomSettings) => RoomSettings)) => void
   onUsernameClaim: (name?: string) => Promise<boolean>
   onUsernameDraftChange: (value: string) => void
   onSoundKindToggle: (kind: SoundKind, enabled: boolean) => void
@@ -5054,33 +7046,39 @@ function TopLeftDock({
   onGoogleSignIn: () => void | Promise<void>
   onGoogleSignOut: () => void | Promise<void>
   onVoiceToggle: () => void
+  onWarnUser: (user: ModerationUser, reason?: string) => void
 }) {
   const reduceMotion = useReducedMotion()
   const [menuOpen, setMenuOpen] = useState(false)
   const [adminOpen, setAdminOpen] = useState(false)
-  const [adminUnlockOpen, setAdminUnlockOpen] = useState(false)
+  const [roomFrameOpen, setRoomFrameOpen] = useState(false)
+  const [notificationSettingsOpen, setNotificationSettingsOpen] = useState(false)
   const [adminPasswordDraft, setAdminPasswordDraft] = useState("")
   const [adminError, setAdminError] = useState<string | null>(null)
+  const { cacheClearing, cacheStatus, clearBrowserCache } = useCacheClearAction()
   const adminPassword = configuredAdminPassword()
 
   function openPanel(panel: Exclude<Panel, null>) {
     setMenuOpen(false)
     setAdminOpen(false)
-    setAdminUnlockOpen(false)
+    setRoomFrameOpen(false)
+    setNotificationSettingsOpen(false)
     onPanelChange(panel)
   }
 
-  function toggleAdminUnlock() {
+  function toggleRoomFrame() {
     setMenuOpen(false)
     setAdminOpen(false)
+    setNotificationSettingsOpen(false)
     onClose()
-    setAdminUnlockOpen((current) => !current)
+    setRoomFrameOpen((current) => !current)
     setAdminError(null)
   }
 
   function toggleAdminPanel() {
     setMenuOpen(false)
-    setAdminUnlockOpen(false)
+    setRoomFrameOpen(false)
+    setNotificationSettingsOpen(false)
     onClose()
     setAdminOpen((current) => !current)
   }
@@ -5088,7 +7086,8 @@ function TopLeftDock({
   function toggleVoiceChat() {
     setMenuOpen(false)
     setAdminOpen(false)
-    setAdminUnlockOpen(false)
+    setRoomFrameOpen(false)
+    setNotificationSettingsOpen(false)
     onClose()
     onVoiceToggle()
   }
@@ -5104,7 +7103,8 @@ function TopLeftDock({
       writeAdminUnlocked(true)
       setAdminPasswordDraft("")
       setAdminError(null)
-      setAdminUnlockOpen(false)
+      setAdminOpen(true)
+      setRoomFrameOpen(false)
       return
     }
 
@@ -5117,7 +7117,7 @@ function TopLeftDock({
     setAdminPasswordDraft("")
     setAdminError(null)
     setAdminOpen(false)
-    setAdminUnlockOpen(false)
+    setRoomFrameOpen(false)
   }
 
   const enabledSoundKinds = Object.values(notifications.soundKinds).filter(Boolean)
@@ -5130,39 +7130,75 @@ function TopLeftDock({
     <div className="top-chrome">
       <div className="room-dock">
         <button
-          aria-expanded={adminUnlockOpen}
-          aria-label="Unlock admin"
-          className={cn("room-info-pill", adminUnlockOpen && "active")}
-          data-tooltip={adminUnlocked ? "Admin unlocked" : "Unlock admin"}
+          aria-expanded={roomFrameOpen}
+          aria-label="Open room overview"
+          className={cn("room-info-pill", roomFrameOpen && "active")}
+          data-tooltip="Room overview"
           type="button"
-          onClick={toggleAdminUnlock}
+          onClick={toggleRoomFrame}
         >
           <strong>Main Chat</strong>
         </button>
 
         <AnimatePresence>
-          {adminUnlockOpen ? (
+          {roomFrameOpen ? (
             <motion.section
               animate={{ opacity: 1, y: 0, scale: 1 }}
-              className="admin-panel admin-unlock-panel"
+              className="admin-panel room-frame-panel"
               exit={{ opacity: 0, y: -8, scale: 0.98 }}
               initial={reduceMotion ? false : { opacity: 0, y: -8, scale: 0.98 }}
               transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
             >
-              <AdminGatePanel
-                adminError={adminError}
-                isConfigured={adminPassword.length > 0}
-                isUnlocked={adminUnlocked}
-                passwordDraft={adminPasswordDraft}
-                onClose={() => setAdminUnlockOpen(false)}
-                onLock={lockAdmin}
-                onOpenAdmin={toggleAdminPanel}
-                onPasswordDraftChange={(value) => {
-                  setAdminPasswordDraft(value)
-                  setAdminError(null)
-                }}
-                onUnlock={unlockAdmin}
-              />
+              <div className="room-frame-card">
+                <div className="room-frame-title">
+                  <GlobeSimple weight="duotone" />
+                  <div>
+                    <strong>{roomSettings.topic || "Main Chat"}</strong>
+                    <span>Single room mode · {roomSettings.role}</span>
+                  </div>
+                </div>
+                <div className="room-frame-grid" aria-label="Room status">
+                  <span>
+                    <strong>{moderationUsers.length}</strong>
+                    <small>People seen</small>
+                  </span>
+                  <span>
+                    <strong>{unread}</strong>
+                    <small>Unread</small>
+                  </span>
+                  <span>
+                    <strong>{voiceParticipantIds.size}</strong>
+                    <small>In voice</small>
+                  </span>
+                  <span>
+                    <strong>{remoteEnabled ? "Live" : "Local"}</strong>
+                    <small>Firebase</small>
+                  </span>
+                </div>
+                <div className="room-future-rail" aria-label="Future room frame">
+                  <button className="active" type="button">
+                    Main Chat
+                  </button>
+                  <button disabled type="button">
+                    Future rooms
+                  </button>
+                  <button disabled type="button">
+                    Invite links
+                  </button>
+                </div>
+                <p>
+                  Room editing, announcements, and moderation now live in the admin modal.
+                </p>
+                <Button
+                  size="sm"
+                  type="button"
+                  variant="outline"
+                  onClick={toggleAdminPanel}
+                >
+                  <ShieldCheck data-icon="inline-start" weight="duotone" />
+                  {adminUnlocked ? "Open admin" : "Unlock admin"}
+                </Button>
+              </div>
             </motion.section>
           ) : null}
         </AnimatePresence>
@@ -5170,22 +7206,20 @@ function TopLeftDock({
 
       <div className="dock">
         <div className="dock-buttons" aria-label="Chat controls">
-          {adminUnlocked ? (
-            <Button
-              aria-expanded={adminOpen}
-              aria-label="Admin panel"
-              className={cn("dock-button", adminOpen && "active")}
-              data-tooltip="Admin panel"
-              size="icon"
-              type="button"
-              variant="ghost"
-              onClick={toggleAdminPanel}
-            >
-              <span className="icon-motion">
-                <ShieldCheck data-icon="inline-start" weight="duotone" />
-              </span>
-            </Button>
-          ) : null}
+          <Button
+            aria-expanded={adminOpen}
+            aria-label={adminUnlocked ? "Admin panel" : "Admin unlock"}
+            className={cn("dock-button", adminOpen && "active")}
+            data-tooltip={adminUnlocked ? "Admin panel" : "Admin unlock"}
+            size="icon"
+            type="button"
+            variant="ghost"
+            onClick={toggleAdminPanel}
+          >
+            <span className="icon-motion">
+              <ShieldCheck data-icon="inline-start" weight="duotone" />
+            </span>
+          </Button>
           <Button
             aria-expanded={voiceChatOpen}
             aria-label={voiceChatOpen ? "Close voice chat" : "Open voice chat"}
@@ -5229,7 +7263,8 @@ function TopLeftDock({
             onClick={() => {
               setMenuOpen((current) => !current)
               setAdminOpen(false)
-              setAdminUnlockOpen(false)
+              setRoomFrameOpen(false)
+              setNotificationSettingsOpen(false)
               if (activePanel) onClose()
             }}
           >
@@ -5239,27 +7274,86 @@ function TopLeftDock({
           </Button>
         </div>
 
-        <AnimatePresence>
-          {adminOpen && adminUnlocked ? (
-            <motion.section
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              className="admin-panel dock-admin-panel"
-              exit={{ opacity: 0, y: -8, scale: 0.98 }}
-              initial={reduceMotion ? false : { opacity: 0, y: -8, scale: 0.98 }}
-              transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
-            >
+        <Modal
+          ariaLabel={adminUnlocked ? "Admin panel" : "Admin unlock"}
+          className="admin-modal"
+          isOpen={adminOpen}
+          onClose={() => setAdminOpen(false)}
+        >
+          {adminUnlocked ? (
               <AdminPanel
                 adminStatus={adminStatus}
                 moderationLog={moderationLog}
+                moderationSettings={moderationSettings}
                 moderationUsers={moderationUsers}
+                remoteEnabled={remoteEnabled}
+                roomSettings={roomSettings}
+                unread={unread}
+                voiceParticipantIds={voiceParticipantIds}
                 onClose={() => setAdminOpen(false)}
                 onClearUserModeration={onClearUserModeration}
+                onExportModerationLog={exportModerationLog}
                 onLock={lockAdmin}
+                onModerationSettingsChange={onModerationSettingsChange}
                 onModerateUser={onModerateUser}
+                onRoomSettingsChange={onRoomSettingsChange}
+                onWarnUser={onWarnUser}
               />
-            </motion.section>
-          ) : null}
-        </AnimatePresence>
+          ) : (
+            <AdminGatePanel
+              adminError={adminError}
+              isConfigured={adminPassword.length > 0}
+              isUnlocked={adminUnlocked}
+              passwordDraft={adminPasswordDraft}
+              onClose={() => setAdminOpen(false)}
+              onLock={lockAdmin}
+              onOpenAdmin={() => setAdminOpen(true)}
+              onPasswordDraftChange={(value) => {
+                setAdminPasswordDraft(value)
+                setAdminError(null)
+              }}
+              onUnlock={unlockAdmin}
+            />
+          )}
+        </Modal>
+
+        <Modal
+          ariaLabel="Notification settings"
+          className="notification-settings-modal"
+          isOpen={notificationSettingsOpen}
+          onClose={() => setNotificationSettingsOpen(false)}
+        >
+          <div className="notification-settings-modal-inner">
+            <div className="panel-head">
+              <div className="panel-title-with-icon">
+                <BellRinging weight="duotone" />
+                <strong>Notification settings</strong>
+              </div>
+              <Button
+                aria-label="Close notification settings"
+                data-tooltip="Close"
+                size="icon-sm"
+                type="button"
+                variant="ghost"
+                onClick={() => setNotificationSettingsOpen(false)}
+              >
+                <X data-icon="inline-start" />
+              </Button>
+            </div>
+            <NotificationsPanel
+              notifications={notifications}
+              permission={permission}
+              onBrowserToggle={onBrowserToggle}
+              onNotificationSettingsChange={onNotificationSettingsChange}
+              onSoundKindToggle={onSoundKindToggle}
+              onSoundToggle={onSoundToggle}
+              onUiSoundKindChange={onUiSoundKindChange}
+              onUiCuePreview={onUiCuePreview}
+              onUiSoundPreview={onUiSoundPreview}
+              onUiSoundToggle={onUiSoundToggle}
+            />
+          </div>
+        </Modal>
 
         <AnimatePresence>
           {menuOpen ? (
@@ -5308,6 +7402,23 @@ function TopLeftDock({
                 <span>Trusted sites</span>
                 <small>{trustedSites.length}</small>
               </button>
+
+              <button
+                className="quick-menu-row"
+                disabled={cacheClearing}
+                type="button"
+                onClick={() => void clearBrowserCache()}
+              >
+                <Broom weight="duotone" />
+                <span>{cacheClearing ? "Clearing cache" : "Clear cache"}</span>
+                <small>Reload</small>
+              </button>
+
+              {cacheStatus ? (
+                <p className="quick-menu-status" role="status">
+                  {cacheStatus}
+                </p>
+              ) : null}
             </motion.section>
           ) : null}
         </AnimatePresence>
@@ -5316,7 +7427,11 @@ function TopLeftDock({
           {activePanel ? (
             <motion.section
               animate={{ opacity: 1, y: 0, scale: 1 }}
-              className="control-panel"
+              className={cn(
+                "control-panel",
+                activePanel === "profile" && "profile-control-panel",
+                activePanel === "notifications" && "notifications-control-panel"
+              )}
               exit={{ opacity: 0, y: -8, scale: 0.98 }}
               initial={reduceMotion ? false : { opacity: 0, y: -8, scale: 0.98 }}
               transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
@@ -5375,9 +7490,12 @@ function TopLeftDock({
                 />
               ) : (
                 <NotificationsPanel
+                  compact
                   notifications={notifications}
                   permission={permission}
+                  onOpenFullSettings={() => setNotificationSettingsOpen(true)}
                   onBrowserToggle={onBrowserToggle}
+                  onNotificationSettingsChange={onNotificationSettingsChange}
                   onSoundKindToggle={onSoundKindToggle}
                   onSoundToggle={onSoundToggle}
                   onUiSoundKindChange={onUiSoundKindChange}
@@ -5488,25 +7606,52 @@ function AdminGatePanel({
 function AdminPanel({
   adminStatus,
   moderationLog,
+  moderationSettings,
   moderationUsers,
+  remoteEnabled,
+  roomSettings,
+  unread,
+  voiceParticipantIds,
   onClose,
   onClearUserModeration,
+  onExportModerationLog,
   onLock,
+  onModerationSettingsChange,
   onModerateUser,
+  onRoomSettingsChange,
+  onWarnUser,
 }: {
   adminStatus: string | null
   moderationLog: SpamModerationLogEntry[]
+  moderationSettings: ModerationSettings
   moderationUsers: ModerationUser[]
+  remoteEnabled: boolean
+  roomSettings: RoomSettings
+  unread: number
+  voiceParticipantIds: Set<string>
   onClose: () => void
   onClearUserModeration: (user: ModerationUser) => void | Promise<void>
+  onExportModerationLog: (
+    log: SpamModerationLogEntry[],
+    format: "csv" | "json"
+  ) => void
   onLock: () => void
+  onModerationSettingsChange: (
+    settings:
+      | ModerationSettings
+      | ((current: ModerationSettings) => ModerationSettings)
+  ) => void
   onModerateUser: (
     user: ModerationUser,
-    action: UserModerationState["action"]
+    action: UserModerationState["action"],
+    reason?: string
   ) => void | Promise<void>
+  onRoomSettingsChange: (settings: RoomSettings | ((current: RoomSettings) => RoomSettings)) => void
+  onWarnUser: (user: ModerationUser, reason?: string) => void
 }) {
   const [peopleExpanded, setPeopleExpanded] = useState(true)
   const [logExpanded, setLogExpanded] = useState(true)
+  const [settingsExpanded, setSettingsExpanded] = useState(true)
 
   return (
     <div className="admin-panel-inner">
@@ -5534,20 +7679,47 @@ function AdminPanel({
         </span>
         <strong>{moderationLog.length}</strong>
       </div>
+      <div className="admin-cache-diagnostics">
+        <strong>Client cache diagnostics</strong>
+        <span>
+          {typeof window === "undefined" ? 0 : window.localStorage.length} local keys ·{" "}
+          {moderationUsers.length} known users
+        </span>
+      </div>
 
       {adminStatus ? <p className="admin-panel-status">{adminStatus}</p> : null}
 
+      <RoomSettingsAdminPanel
+        moderationUsers={moderationUsers}
+        remoteEnabled={remoteEnabled}
+        roomSettings={roomSettings}
+        unread={unread}
+        voiceParticipantIds={voiceParticipantIds}
+        onRoomSettingsChange={onRoomSettingsChange}
+      />
+
+      <ModerationSettingsPanel
+        expanded={settingsExpanded}
+        settings={moderationSettings}
+        onSettingsChange={onModerationSettingsChange}
+        onToggleExpanded={() => setSettingsExpanded((current) => !current)}
+      />
+
       <AdminUserModeration
         expanded={peopleExpanded}
+        moderationReason={moderationSettings.reasonPreset}
         users={moderationUsers}
+        voiceParticipantIds={voiceParticipantIds}
         onClearUserModeration={onClearUserModeration}
         onToggleExpanded={() => setPeopleExpanded((current) => !current)}
         onModerateUser={onModerateUser}
+        onWarnUser={onWarnUser}
       />
 
       <ModerationLogView
         expanded={logExpanded}
         moderationLog={moderationLog}
+        onExportModerationLog={onExportModerationLog}
         onToggleExpanded={() => setLogExpanded((current) => !current)}
       />
 
@@ -5561,21 +7733,301 @@ function AdminPanel({
   )
 }
 
+function RoomSettingsAdminPanel({
+  moderationUsers,
+  remoteEnabled,
+  roomSettings,
+  unread,
+  voiceParticipantIds,
+  onRoomSettingsChange,
+}: {
+  moderationUsers: ModerationUser[]
+  remoteEnabled: boolean
+  roomSettings: RoomSettings
+  unread: number
+  voiceParticipantIds: Set<string>
+  onRoomSettingsChange: (settings: RoomSettings | ((current: RoomSettings) => RoomSettings)) => void
+}) {
+  return (
+    <section className="admin-room-settings">
+      <div className="admin-room-head">
+        <div className="room-frame-title">
+          <GlobeSimple weight="duotone" />
+          <div>
+            <strong>{roomSettings.topic || "Main Chat"}</strong>
+            <span>Single room frame · {roomSettings.role}</span>
+          </div>
+        </div>
+        <Badge variant="outline">{remoteEnabled ? "Firebase live" : "Local only"}</Badge>
+      </div>
+
+      <div className="room-frame-grid" aria-label="Room status">
+        <span>
+          <strong>{moderationUsers.length}</strong>
+          <small>People seen</small>
+        </span>
+        <span>
+          <strong>{unread}</strong>
+          <small>Unread</small>
+        </span>
+        <span>
+          <strong>{voiceParticipantIds.size}</strong>
+          <small>In voice</small>
+        </span>
+        <span>
+          <strong>{remoteEnabled ? "Live" : "Local"}</strong>
+          <small>Firebase</small>
+        </span>
+      </div>
+
+      <div className="room-frame-fields">
+        <label>
+          <span>Topic</span>
+          <Input
+            value={roomSettings.topic}
+            onChange={(event) => {
+              const topic = event.currentTarget.value
+              onRoomSettingsChange((current) => ({
+                ...current,
+                topic,
+              }))
+            }}
+          />
+        </label>
+        <label>
+          <span>Announcement</span>
+          <Textarea
+            rows={4}
+            value={roomSettings.announcement}
+            onChange={(event) => {
+              const announcement = event.currentTarget.value
+              onRoomSettingsChange((current) => ({
+                ...current,
+                announcement,
+              }))
+            }}
+          />
+        </label>
+      </div>
+
+      <div className="room-frame-switches">
+        <label>
+          <Switch
+            checked={roomSettings.compactMode}
+            onCheckedChange={(checked) =>
+              onRoomSettingsChange((current) => ({
+                ...current,
+                compactMode: checked,
+              }))
+            }
+          />
+          <span>Compact mode</span>
+        </label>
+        <label>
+          <Switch
+            checked={roomSettings.reducedData}
+            onCheckedChange={(checked) =>
+              onRoomSettingsChange((current) => ({
+                ...current,
+                reducedData: checked,
+              }))
+            }
+          />
+          <span>Reduced data</span>
+        </label>
+        <label>
+          <Switch
+            checked={roomSettings.archived}
+            onCheckedChange={(checked) =>
+              onRoomSettingsChange((current) => ({
+                ...current,
+                archived: checked,
+              }))
+            }
+          />
+          <span>Archive frame</span>
+        </label>
+      </div>
+
+      <div className="room-future-rail" aria-label="Future room frame">
+        <button className="active" type="button">
+          Main Chat
+        </button>
+        <button disabled type="button">
+          Future rooms
+        </button>
+        <button disabled type="button">
+          Invite links
+        </button>
+      </div>
+      <p>
+        Multi-room navigation is framed here, but group/channel creation stays hidden while
+        Sechat remains a single-room app.
+      </p>
+    </section>
+  )
+}
+
+function ModerationSettingsPanel({
+  expanded,
+  settings,
+  onSettingsChange,
+  onToggleExpanded,
+}: {
+  expanded: boolean
+  settings: ModerationSettings
+  onSettingsChange: (
+    settings:
+      | ModerationSettings
+      | ((current: ModerationSettings) => ModerationSettings)
+  ) => void
+  onToggleExpanded: () => void
+}) {
+  return (
+    <div className={cn("admin-user-panel", !expanded && "collapsed")}>
+      <button
+        aria-expanded={expanded}
+        className="admin-section-toggle"
+        type="button"
+        onClick={onToggleExpanded}
+      >
+        <span className="setting-label">
+          <ShieldCheck weight="duotone" />
+          Safety settings
+        </span>
+        <span className="admin-section-meta">
+          {settings.slowModeSeconds > 0 ? `${settings.slowModeSeconds}s slow` : "Live"}
+          <CaretUp className={cn(!expanded && "collapsed")} weight="bold" />
+        </span>
+      </button>
+      <AnimatePresence initial={false}>
+        {expanded ? (
+          <motion.div
+            animate={{ height: "auto", opacity: 1 }}
+            className="admin-section-content moderation-settings-panel"
+            exit={{ height: 0, opacity: 0 }}
+            initial={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
+          >
+            <div className="reason-preset-grid">
+              {moderationReasonPresets.map((reason) => (
+                <button
+                  aria-pressed={settings.reasonPreset === reason}
+                  className={cn(settings.reasonPreset === reason && "active")}
+                  key={reason}
+                  type="button"
+                  onClick={() =>
+                    onSettingsChange((current) => ({
+                      ...current,
+                      reasonPreset: reason,
+                    }))
+                  }
+                >
+                  {reason}
+                </button>
+              ))}
+            </div>
+            <label className="admin-range-row">
+              <span>Warning expires after {settings.warningExpiresMinutes}m</span>
+              <input
+                aria-label="Warning expiration minutes"
+                max="60"
+                min="1"
+                type="range"
+                value={settings.warningExpiresMinutes}
+                onChange={(event) => {
+                  const warningExpiresMinutes = Number(event.currentTarget.value)
+                  onSettingsChange((current) => ({
+                    ...current,
+                    warningExpiresMinutes,
+                  }))
+                }}
+              />
+            </label>
+            <label className="admin-range-row">
+              <span>Slow mode {settings.slowModeSeconds}s</span>
+              <input
+                aria-label="Slow mode seconds"
+                max="120"
+                min="0"
+                step="5"
+                type="range"
+                value={settings.slowModeSeconds}
+                onChange={(event) => {
+                  const slowModeSeconds = Number(event.currentTarget.value)
+                  onSettingsChange((current) => ({
+                    ...current,
+                    slowModeSeconds,
+                  }))
+                }}
+              />
+            </label>
+            <div className="word-filter-settings">
+              <div className="ui-sound-options">
+                {(["off", "warn", "block"] as const).map((mode) => (
+                  <button
+                    aria-pressed={settings.wordFilterMode === mode}
+                    className={cn(settings.wordFilterMode === mode && "active")}
+                    key={mode}
+                    type="button"
+                    onClick={() =>
+                      onSettingsChange((current) => ({
+                        ...current,
+                        wordFilterMode: mode,
+                      }))
+                    }
+                  >
+                    {mode}
+                  </button>
+                ))}
+              </div>
+              <Textarea
+                aria-label="Word filter list"
+                placeholder="one blocked word per line"
+                rows={3}
+                value={settings.wordFilterWords.join("\n")}
+                onChange={(event) => {
+                  const wordFilterWords = event.currentTarget.value
+                    .split(/\n|,/)
+                    .map((item) => item.trim().toLowerCase())
+                    .filter(Boolean)
+
+                  onSettingsChange((current) => ({
+                    ...current,
+                    wordFilterWords,
+                  }))
+                }}
+              />
+            </div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+    </div>
+  )
+}
+
 function AdminUserModeration({
   expanded,
+  moderationReason,
   users,
+  voiceParticipantIds,
   onClearUserModeration,
   onToggleExpanded,
   onModerateUser,
+  onWarnUser,
 }: {
   expanded: boolean
+  moderationReason: string
   users: ModerationUser[]
+  voiceParticipantIds: Set<string>
   onClearUserModeration: (user: ModerationUser) => void | Promise<void>
   onToggleExpanded: () => void
   onModerateUser: (
     user: ModerationUser,
-    action: UserModerationState["action"]
+    action: UserModerationState["action"],
+    reason?: string
   ) => void | Promise<void>
+  onWarnUser: (user: ModerationUser, reason?: string) => void
 }) {
   return (
     <div className={cn("admin-user-panel", !expanded && "collapsed")}>
@@ -5605,50 +8057,112 @@ function AdminUserModeration({
           >
             {users.length > 0 ? (
               <div className="admin-user-list">
-                {users.slice(0, 10).map((user) => (
-                  <div className="admin-user-row" key={user.id}>
-                    <ChatAvatar name={user.name} size="sm" src={user.avatar} />
-                    <span>
-                      <strong>{user.isSelf ? `${user.name} (you)` : user.name}</strong>
-                      <small>
-                        {user.messageCount} message{user.messageCount === 1 ? "" : "s"} ·{" "}
-                        {formatTime(user.lastSeenAt)}
-                      </small>
-                    </span>
-                    <div className="admin-user-actions">
-                      <Button
-                        data-tooltip="Timeout for 15 minutes"
-                        disabled={user.isSelf}
-                        size="icon-sm"
-                        type="button"
-                        variant="ghost"
-                        onClick={() => void onModerateUser(user, "timeout")}
-                      >
-                        <Clock data-icon="inline-start" weight="duotone" />
-                      </Button>
-                      <Button
-                        data-tooltip="Ban"
-                        disabled={user.isSelf}
-                        size="icon-sm"
-                        type="button"
-                        variant="ghost"
-                        onClick={() => void onModerateUser(user, "ban")}
-                      >
-                        <Prohibit data-icon="inline-start" weight="duotone" />
-                      </Button>
-                      <Button
-                        data-tooltip="Clear timeout or ban"
-                        disabled={user.isSelf}
-                        size="icon-sm"
-                        type="button"
-                        variant="ghost"
-                        onClick={() => void onClearUserModeration(user)}
-                      >
-                        <ShieldCheck data-icon="inline-start" weight="duotone" />
-                      </Button>
+                {users.slice(0, 10).map((user) => {
+                  const restriction = user.moderation
+                  const restricted = Boolean(restriction)
+                  const restrictionLabel =
+                    restriction?.action === "ban"
+                      ? "Banned"
+                      : restriction
+                        ? `Muted · ${formatRemainingTime(
+                            restriction.bannedUntil - Date.now()
+                          )}`
+                        : ""
+
+                  return (
+                    <div
+                      className={cn(
+                        "admin-user-row",
+                        restriction?.action === "ban" && "is-banned",
+                        restriction?.action === "timeout" && "is-muted"
+                      )}
+                      key={user.id}
+                    >
+                      <ChatAvatar name={user.name} size="sm" src={user.avatar} />
+                      <span className="admin-user-main">
+                        <span className="admin-user-name-line">
+                          <strong>{user.isSelf ? `${user.name} (you)` : user.name}</strong>
+                          {restriction ? (
+                            <span
+                              className={cn(
+                                "admin-user-status",
+                                restriction.action === "ban" ? "banned" : "muted"
+                              )}
+                            >
+                              {restriction.action === "ban" ? (
+                                <Prohibit weight="bold" />
+                              ) : (
+                                <Clock weight="bold" />
+                              )}
+                              {restrictionLabel}
+                            </span>
+                          ) : null}
+                        </span>
+                        <small>
+                          {user.messageCount} message{user.messageCount === 1 ? "" : "s"} ·{" "}
+                          {formatTime(user.lastSeenAt)}
+                          {voiceParticipantIds.has(user.id) ? " · in voice" : ""}
+                        </small>
+                      </span>
+                      <div className="admin-user-actions">
+                        {restricted ? (
+                          <Button
+                            aria-label={`Clear restrictions for ${user.name}`}
+                            className="admin-user-clear-button"
+                            data-tooltip="Clear timeout or ban"
+                            disabled={user.isSelf}
+                            size="icon-sm"
+                            type="button"
+                            variant="ghost"
+                            onClick={() => void onClearUserModeration(user)}
+                          >
+                            <ShieldCheck data-icon="inline-start" weight="duotone" />
+                          </Button>
+                        ) : (
+                          <>
+                            <Button
+                              aria-label={`Warn ${user.name}`}
+                              data-tooltip="Warn"
+                              disabled={user.isSelf}
+                              size="icon-sm"
+                              type="button"
+                              variant="ghost"
+                              onClick={() => onWarnUser(user, moderationReason)}
+                            >
+                              <BellRinging data-icon="inline-start" weight="duotone" />
+                            </Button>
+                            <Button
+                              aria-label={`Mute ${user.name} for 15 minutes`}
+                              data-tooltip="Mute for 15 minutes"
+                              disabled={user.isSelf}
+                              size="icon-sm"
+                              type="button"
+                              variant="ghost"
+                              onClick={() =>
+                                void onModerateUser(user, "timeout", moderationReason)
+                              }
+                            >
+                              <Clock data-icon="inline-start" weight="duotone" />
+                            </Button>
+                            <Button
+                              aria-label={`Ban ${user.name}`}
+                              data-tooltip="Ban"
+                              disabled={user.isSelf}
+                              size="icon-sm"
+                              type="button"
+                              variant="ghost"
+                              onClick={() =>
+                                void onModerateUser(user, "ban", moderationReason)
+                              }
+                            >
+                              <Prohibit data-icon="inline-start" weight="duotone" />
+                            </Button>
+                          </>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
             ) : (
               <p className="moderation-empty">No people to moderate yet.</p>
@@ -5663,10 +8177,15 @@ function AdminUserModeration({
 function ModerationLogView({
   expanded,
   moderationLog,
+  onExportModerationLog,
   onToggleExpanded,
 }: {
   expanded: boolean
   moderationLog: SpamModerationLogEntry[]
+  onExportModerationLog: (
+    log: SpamModerationLogEntry[],
+    format: "csv" | "json"
+  ) => void
   onToggleExpanded: () => void
 }) {
   return (
@@ -5696,20 +8215,43 @@ function ModerationLogView({
             transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
           >
             {moderationLog.length > 0 ? (
-              <div className="moderation-log-list">
-                {moderationLog.slice(0, 20).map((entry) => (
-                  <div className="moderation-log-entry" key={entry.id}>
-                    <strong>{moderationActionLabel(entry.action)}</strong>
-                    <span>{entry.reason}</span>
-                    <small>
-                      {formatTime(entry.at)}
-                      {entry.strikes > 0
-                        ? ` - strike ${entry.strikes}/${SPAM_BAN_TRIGGER_COUNT}`
-                        : ""}
-                    </small>
-                  </div>
-                ))}
-              </div>
+              <>
+                <div className="moderation-export-actions">
+                  <Button
+                    size="sm"
+                    type="button"
+                    variant="ghost"
+                    onClick={() => onExportModerationLog(moderationLog, "json")}
+                  >
+                    JSON
+                  </Button>
+                  <Button
+                    size="sm"
+                    type="button"
+                    variant="ghost"
+                    onClick={() => onExportModerationLog(moderationLog, "csv")}
+                  >
+                    CSV
+                  </Button>
+                </div>
+                <div className="moderation-log-list">
+                  {moderationLog.slice(0, 40).map((entry) => (
+                    <div className="moderation-log-entry" key={entry.id}>
+                      <strong>{moderationActionLabel(entry.action)}</strong>
+                      <span>{entry.reason}</span>
+                      <small>
+                        {formatTime(entry.at)}
+                        {entry.bannedUntil && entry.action === "warn"
+                          ? ` · expires ${formatRemainingTime(entry.bannedUntil - Date.now())}`
+                          : ""}
+                        {entry.strikes > 0
+                          ? ` - strike ${entry.strikes}/${SPAM_BAN_TRIGGER_COUNT}`
+                          : ""}
+                      </small>
+                    </div>
+                  ))}
+                </div>
+              </>
             ) : (
               <p className="moderation-empty">No spam actions yet.</p>
             )}
@@ -5761,7 +8303,7 @@ function ProfilePanel({
 
   return (
     <div className="profile-form">
-      <div className="profile-card">
+      <div className="profile-card profile-hero-card">
         <ChatAvatar name={profile.name} src={profile.avatar} size="lg" />
         <form
           className="field-stack profile-username-form"
@@ -5795,6 +8337,34 @@ function ProfilePanel({
                 : "Required before chatting.")}
           </small>
         </form>
+      </div>
+
+      <div className="profile-detail-grid profile-preference-grid">
+        <label>
+          <span>Custom status</span>
+          <Input
+            maxLength={80}
+            placeholder="Available, busy, building..."
+            value={profile.statusText ?? ""}
+            onChange={(event) =>
+              onProfileChange({ ...profile, statusText: event.target.value })
+            }
+          />
+        </label>
+        <label>
+          <span>Accent color</span>
+          <input
+            aria-label="Profile accent color"
+            type="color"
+            value={profile.accentColor ?? defaultProfile.accentColor}
+            onChange={(event) =>
+              onProfileChange({ ...profile, accentColor: event.target.value })
+            }
+          />
+        </label>
+        <span className="profile-joined-at">
+          Joined {formatTime(profile.joinedAt ?? Date.now())}
+        </span>
       </div>
 
       <div className="auth-card profile-auth-card">
@@ -5885,9 +8455,12 @@ function ProfilePanel({
 }
 
 function NotificationsPanel({
+  compact = false,
   notifications,
   permission,
+  onOpenFullSettings,
   onBrowserToggle,
+  onNotificationSettingsChange,
   onSoundKindToggle,
   onSoundToggle,
   onUiSoundKindChange,
@@ -5895,9 +8468,16 @@ function NotificationsPanel({
   onUiSoundPreview,
   onUiSoundToggle,
 }: {
+  compact?: boolean
   notifications: NotificationSettings
   permission: string
+  onOpenFullSettings?: () => void
   onBrowserToggle: (enabled: boolean) => void
+  onNotificationSettingsChange: (
+    settings:
+      | NotificationSettings
+      | ((current: NotificationSettings) => NotificationSettings)
+  ) => void
   onSoundKindToggle: (kind: SoundKind, enabled: boolean) => void
   onSoundToggle: (enabled: boolean) => void
   onUiSoundKindChange: (kind: UiSoundKind) => void
@@ -5918,7 +8498,27 @@ function NotificationsPanel({
           : "Permission needed."
 
   return (
-    <div className="settings-stack">
+    <div className={cn("settings-stack", compact && "settings-stack-compact")}>
+      <div className="settings-row">
+        <div>
+          <span className="setting-label">
+            <GlobeSimple weight="duotone" />
+            Main Chat notifications
+          </span>
+          <p>Per-room switch for this single-room frame.</p>
+        </div>
+        <Switch
+          aria-label="Toggle Main Chat notifications"
+          checked={notifications.roomEnabled ?? true}
+          onCheckedChange={(checked) =>
+            onNotificationSettingsChange((current) => ({
+              ...current,
+              roomEnabled: checked,
+            }))
+          }
+        />
+      </div>
+
       <div className="settings-row">
         <div>
           <span className="setting-label">
@@ -6024,101 +8624,204 @@ function NotificationsPanel({
         ) : null}
       </AnimatePresence>
 
-      <div className="settings-row">
-        <div>
-          <span className="setting-label">
-            {notifications.uiSoundsEnabled ? (
-              <SpeakerHigh weight="duotone" />
-            ) : (
-              <SpeakerSlash weight="duotone" />
-            )}
-            Button sounds
-          </span>
-          <p>Short confirmation cues for send, discard, and file actions.</p>
-        </div>
-        <Switch
-          aria-label="Toggle button confirmation sounds"
-          checked={notifications.uiSoundsEnabled}
-          onCheckedChange={onUiSoundToggle}
-        />
-      </div>
-
-      <AnimatePresence initial={false}>
-        {notifications.uiSoundsEnabled ? (
-          <motion.div
-            animate={{ height: "auto", opacity: 1, x: 0 }}
-            className="ui-sound-picker"
-            exit={{
-              borderWidth: 0,
-              height: 0,
-              opacity: 0,
-              paddingBottom: 0,
-              paddingTop: 0,
-              x: -20,
-            }}
-            initial={
-              reduceMotion
-                ? false
-                : {
-                    borderWidth: 0,
-                    height: 0,
-                    opacity: 0,
-                    paddingBottom: 0,
-                    paddingTop: 0,
-                    x: -20,
-                  }
-            }
-            key="ui-sound-picker"
-            transition={{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }}
+      {compact ? (
+        <>
+          <Button
+            className="notification-more-button"
+            size="sm"
+            type="button"
+            variant="outline"
+            onClick={onOpenFullSettings}
           >
-            <div className="ui-sound-picker-head">
-              <div>
-                <span>Confirmation tone</span>
-                <small>General button feedback is louder now.</small>
-              </div>
+            <BellRinging data-icon="inline-start" weight="duotone" />
+            More settings
+          </Button>
+          <p className="status-copy compact-status-copy">
+            Keywords, previews, button sounds, and tone previews are in the full
+            notification modal.
+          </p>
+        </>
+      ) : (
+        <>
+          <div className="settings-row stacked-setting-row">
+            <div>
+              <span className="setting-label">
+                <At weight="duotone" />
+                Keyword alerts
+              </span>
+              <p>Comma-separated words that should behave like mentions.</p>
             </div>
-            <div className="ui-sound-options">
-              {uiSoundOptions.map((option) => (
-                <button
-                  aria-pressed={notifications.uiSound === option.kind}
-                  className={cn(
-                    "ui-sound-option",
-                    notifications.uiSound === option.kind && "active"
-                  )}
-                  key={option.kind}
-                  type="button"
-                  onClick={() => onUiSoundKindChange(option.kind)}
-                >
-                  {option.label}
-                </button>
-              ))}
-            </div>
-            <div className="ui-cue-preview-row">
-              <Button size="sm" type="button" variant="ghost" onClick={onUiSoundPreview}>
-                <Play data-icon="inline-start" weight="fill" />
-                General
-              </Button>
-              {uiCuePreviewOptions.map((option) => (
-                <Button
-                  key={option.kind}
-                  size="sm"
-                  type="button"
-                  variant="ghost"
-                  onClick={() => onUiCuePreview(option.kind)}
-                >
-                  <Play data-icon="inline-start" weight="fill" />
-                  {option.label}
-                </Button>
-              ))}
-            </div>
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
+            <Input
+              aria-label="Keyword alerts"
+              placeholder="build, urgent, mailo"
+              value={(notifications.keywordAlerts ?? []).join(", ")}
+              onChange={(event) => {
+                const keywordAlerts = event.currentTarget.value
+                  .split(",")
+                  .map((item) => item.trim())
+                  .filter(Boolean)
+                  .slice(0, 20)
 
-      <p className="status-copy">
-        Browser alerts only appear after permission is granted. Sound playback may
-        start after your first click in this tab.
-      </p>
+                onNotificationSettingsChange((current) => ({
+                  ...current,
+                  keywordAlerts,
+                }))
+              }}
+            />
+          </div>
+
+          <div className="sound-kind-list notification-preview-list">
+            <div className="sound-kind-head">
+              <strong>Notification previews</strong>
+              <span>Attachment and voice details in Chrome notifications.</span>
+            </div>
+            <div className="sound-kind-row">
+              <span className="setting-label">
+                <Paperclip weight="duotone" />
+                Attachment previews
+              </span>
+              <Switch
+                aria-label="Toggle attachment notification previews"
+                checked={notifications.attachmentPreviews ?? true}
+                onCheckedChange={(checked) =>
+                  onNotificationSettingsChange((current) => ({
+                    ...current,
+                    attachmentPreviews: checked,
+                  }))
+                }
+              />
+            </div>
+            <div className="sound-kind-row">
+              <span className="setting-label">
+                <Microphone weight="duotone" />
+                Voice previews
+              </span>
+              <Switch
+                aria-label="Toggle voice notification previews"
+                checked={notifications.voicePreviews ?? true}
+                onCheckedChange={(checked) =>
+                  onNotificationSettingsChange((current) => ({
+                    ...current,
+                    voicePreviews: checked,
+                  }))
+                }
+              />
+            </div>
+            <div className="sound-kind-row">
+              <span className="setting-label">
+                <BellRinging weight="duotone" />
+                Mention summary
+              </span>
+              <Switch
+                aria-label="Toggle mention summary"
+                checked={notifications.mentionSummary ?? true}
+                onCheckedChange={(checked) =>
+                  onNotificationSettingsChange((current) => ({
+                    ...current,
+                    mentionSummary: checked,
+                  }))
+                }
+              />
+            </div>
+          </div>
+
+          <div className="settings-row">
+            <div>
+              <span className="setting-label">
+                {notifications.uiSoundsEnabled ? (
+                  <SpeakerHigh weight="duotone" />
+                ) : (
+                  <SpeakerSlash weight="duotone" />
+                )}
+                Button sounds
+              </span>
+              <p>Short confirmation cues for send, discard, and file actions.</p>
+            </div>
+            <Switch
+              aria-label="Toggle button confirmation sounds"
+              checked={notifications.uiSoundsEnabled}
+              onCheckedChange={onUiSoundToggle}
+            />
+          </div>
+
+          <AnimatePresence initial={false}>
+            {notifications.uiSoundsEnabled ? (
+              <motion.div
+                animate={{ height: "auto", opacity: 1, x: 0 }}
+                className="ui-sound-picker"
+                exit={{
+                  borderWidth: 0,
+                  height: 0,
+                  opacity: 0,
+                  paddingBottom: 0,
+                  paddingTop: 0,
+                  x: -20,
+                }}
+                initial={
+                  reduceMotion
+                    ? false
+                    : {
+                        borderWidth: 0,
+                        height: 0,
+                        opacity: 0,
+                        paddingBottom: 0,
+                        paddingTop: 0,
+                        x: -20,
+                      }
+                }
+                key="ui-sound-picker"
+                transition={{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }}
+              >
+                <div className="ui-sound-picker-head">
+                  <div>
+                    <span>Confirmation tone</span>
+                    <small>General button feedback is louder now.</small>
+                  </div>
+                </div>
+                <div className="ui-sound-options">
+                  {uiSoundOptions.map((option) => (
+                    <button
+                      aria-pressed={notifications.uiSound === option.kind}
+                      className={cn(
+                        "ui-sound-option",
+                        notifications.uiSound === option.kind && "active"
+                      )}
+                      key={option.kind}
+                      type="button"
+                      onClick={() => onUiSoundKindChange(option.kind)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="ui-cue-preview-row">
+                  <Button size="sm" type="button" variant="ghost" onClick={onUiSoundPreview}>
+                    <Play data-icon="inline-start" weight="fill" />
+                    General
+                  </Button>
+                  {uiCuePreviewOptions.map((option) => (
+                    <Button
+                      key={option.kind}
+                      size="sm"
+                      type="button"
+                      variant="ghost"
+                      onClick={() => onUiCuePreview(option.kind)}
+                    >
+                      <Play data-icon="inline-start" weight="fill" />
+                      {option.label}
+                    </Button>
+                  ))}
+                </div>
+              </motion.div>
+            ) : null}
+          </AnimatePresence>
+
+          <p className="status-copy">
+            Browser alerts only appear after permission is granted. Sound playback may
+            start after your first click in this tab.
+          </p>
+        </>
+      )}
     </div>
   )
 }
@@ -6256,27 +8959,223 @@ function ExternalLinkDialog({
   )
 }
 
+function ThreadPanelDialog({
+  messages,
+  profile,
+  rootId,
+  onClose,
+  onJumpToMessage,
+}: {
+  messages: ChatMessage[]
+  profile: Profile
+  rootId: string
+  onClose: () => void
+  onJumpToMessage: (messageId: string) => void
+}) {
+  return (
+    <Modal
+      ariaLabel="Thread"
+      className="thread-panel-dialog"
+      isOpen
+      onClose={onClose}
+    >
+      <div className="thread-panel-shell">
+        <div className="thread-panel-head">
+          <div>
+            <strong>Thread</strong>
+            <span>{messages.length} messages in this chain</span>
+          </div>
+          <Badge variant="outline">Main Chat</Badge>
+        </div>
+        <div className="thread-message-list">
+          {messages.map((message) => (
+            <button
+              className={cn("thread-message-row", message.id === rootId && "root")}
+              key={message.id}
+              type="button"
+              onClick={() => onJumpToMessage(message.id)}
+            >
+              <ChatAvatar
+                name={message.authorName || profile.name}
+                size="sm"
+                src={message.avatar}
+              />
+              <span>
+                <strong>{message.authorName}</strong>
+                <small>{formatTime(message.createdAt)}</small>
+                <em>{messagePreview(message)}</em>
+              </span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </Modal>
+  )
+}
+
+function MessageEditDialog({
+  body,
+  message,
+  onBodyChange,
+  onCancel,
+  onSave,
+}: {
+  body: string
+  message: ChatMessage
+  onBodyChange: (body: string) => void
+  onCancel: () => void
+  onSave: () => void
+}) {
+  return (
+    <Modal
+      ariaLabel="Edit message"
+      className="message-edit-dialog"
+      isOpen
+      onClose={onCancel}
+    >
+      <div className="message-edit-shell">
+        <div className="message-edit-head">
+          <strong>Edit message</strong>
+          <span>
+            {message.editHistory?.length
+              ? `${message.editHistory.length} previous version(s)`
+              : "First edit"}
+          </span>
+        </div>
+        <Textarea
+          autoFocus
+          aria-label="Edited message"
+          rows={5}
+          value={body}
+          onChange={(event) => onBodyChange(event.currentTarget.value)}
+        />
+        <div className="message-edit-actions">
+          <Button type="button" variant="ghost" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button disabled={!body.trim()} type="button" onClick={onSave}>
+            Save edit
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  )
+}
+
+function AvatarCropDialog({
+  crop,
+  onApply,
+  onCancel,
+  onZoomChange,
+}: {
+  crop: AvatarCropState
+  onApply: () => void
+  onCancel: () => void
+  onZoomChange: (zoom: number) => void
+}) {
+  return (
+    <Modal
+      ariaLabel="Crop profile picture"
+      className="avatar-crop-dialog"
+      isOpen
+      onClose={onCancel}
+    >
+      <div className="avatar-crop-shell">
+        <div className="message-edit-head">
+          <strong>Crop profile picture</strong>
+          <span>Zoom before saving.</span>
+        </div>
+        <div className="avatar-crop-preview">
+          <img
+            alt="Profile crop preview"
+            src={crop.dataUrl}
+            style={{ transform: `scale(${crop.zoom})` }}
+          />
+        </div>
+        <label className="avatar-crop-slider">
+          <span>Zoom {crop.zoom.toFixed(1)}x</span>
+          <input
+            aria-label="Avatar zoom"
+            max="2.5"
+            min="1"
+            step="0.05"
+            type="range"
+            value={crop.zoom}
+            onChange={(event) => onZoomChange(Number(event.currentTarget.value))}
+          />
+        </label>
+        <div className="message-edit-actions">
+          <Button type="button" variant="ghost" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button type="button" onClick={onApply}>
+            Save picture
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  )
+}
+
 function AttachmentPreview({
   attachment,
+  dragging = false,
+  dropBefore = false,
+  onDragEnd,
+  onDragEnter,
+  onDragStart,
   onRemove,
 }: {
   attachment: MessageAttachment
+  dragging?: boolean
+  dropBefore?: boolean
+  onDragEnd?: () => void
+  onDragEnter?: () => void
+  onDragStart?: () => void
   onRemove: () => void
 }) {
   return (
-    <div className="attachment-preview">
+    <div
+      className={cn("attachment-preview", dragging && "dragging", dropBefore && "drop-before")}
+      draggable
+      onDragEnd={onDragEnd}
+      onDragEnter={(event) => {
+        event.preventDefault()
+        onDragEnter?.()
+      }}
+      onDragOver={(event) => event.preventDefault()}
+      onDragStart={(event) => {
+        event.dataTransfer.effectAllowed = "move"
+        onDragStart?.()
+      }}
+    >
       <div className="attachment-preview-thumb">
         {attachment.kind === "image" ? (
           <img alt="" src={attachment.dataUrl} />
         ) : attachment.kind === "video" ? (
-          <video aria-hidden="true" muted playsInline preload="metadata" src={attachment.dataUrl} />
+          attachment.thumbnailUrl ? (
+            <img alt="" src={attachment.thumbnailUrl} />
+          ) : (
+            <video
+              aria-hidden="true"
+              muted
+              playsInline
+              preload="metadata"
+              src={attachment.dataUrl}
+            />
+          )
         ) : (
           <FileIcon weight="duotone" />
         )}
       </div>
       <div>
         <strong>{attachment.name}</strong>
-        <span>{formatFileSize(attachment.size)}</span>
+        <span>
+          {formatFileSize(attachment.size)}
+          {attachment.originalSize && attachment.originalSize !== attachment.size
+            ? ` from ${formatFileSize(attachment.originalSize)}`
+            : ""}
+        </span>
       </div>
       <button
         aria-label={`Remove ${attachment.name}`}
@@ -6355,6 +9254,90 @@ function isGifAttachment(attachment: MessageAttachment) {
   )
 }
 
+function isStorageMediaSource(source: string) {
+  if (
+    source.startsWith("data:") ||
+    source.startsWith("blob:") ||
+    typeof window === "undefined"
+  ) {
+    return false
+  }
+
+  try {
+    const url = new URL(source, window.location.href)
+    return (
+      url.hostname === "firebasestorage.googleapis.com" ||
+      url.hostname === "storage.googleapis.com" ||
+      url.hostname.endsWith(".firebasestorage.app")
+    )
+  } catch {
+    return false
+  }
+}
+
+function withStorageMediaCacheBypass(source: string, retryKey: string) {
+  if (!retryKey || !isStorageMediaSource(source)) return source
+
+  try {
+    const url = new URL(source, window.location.href)
+    url.searchParams.set("_sechat_media_retry", retryKey)
+    return url.toString()
+  } catch {
+    return source
+  }
+}
+
+function StorageSafeVideo({
+  autoPlay,
+  className,
+  controls,
+  muted,
+  playsInline,
+  poster,
+  preload = "metadata",
+  source,
+  ariaHidden,
+}: {
+  autoPlay?: boolean
+  className?: string
+  controls?: boolean
+  muted?: boolean
+  playsInline?: boolean
+  poster?: string
+  preload?: "none" | "metadata" | "auto"
+  source: string
+  ariaHidden?: boolean
+}) {
+  const [retryKey, setRetryKey] = useState("")
+  const videoSource = withStorageMediaCacheBypass(source, retryKey)
+
+  useEffect(() => {
+    setRetryKey("")
+  }, [source])
+
+  function retryWithoutCachedMedia(event: ReactSyntheticEvent<HTMLVideoElement>) {
+    if (retryKey || !isStorageMediaSource(source)) return
+
+    event.currentTarget.removeAttribute("src")
+    setRetryKey(`${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`)
+  }
+
+  return (
+    <video
+      aria-hidden={ariaHidden}
+      autoPlay={autoPlay}
+      className={className}
+      controls={controls}
+      muted={muted}
+      playsInline={playsInline}
+      poster={poster}
+      preload={preload}
+      src={videoSource}
+      onError={retryWithoutCachedMedia}
+    />
+  )
+}
+
 function getMessageDownloads(message: ChatMessage): DownloadItem[] {
   const downloads: DownloadItem[] = []
 
@@ -6380,6 +9363,32 @@ function getMessageDownloads(message: ChatMessage): DownloadItem[] {
 
 function downloadItems(items: DownloadItem[]) {
   items.forEach((item) => downloadUrl(item.url, item.filename))
+}
+
+function exportModerationLog(log: SpamModerationLogEntry[], format: "csv" | "json") {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
+  if (format === "json") {
+    const blob = new Blob([JSON.stringify(log, null, 2)], {
+      type: "application/json",
+    })
+    downloadUrl(URL.createObjectURL(blob), `sechat-moderation-${timestamp}.json`)
+    return
+  }
+
+  const header = ["action", "at", "target", "reason", "strikes"].join(",")
+  const rows = log.map((entry) =>
+    [
+      entry.action,
+      new Date(entry.at).toISOString(),
+      entry.targetAuthorName ?? "",
+      entry.reason,
+      entry.strikes.toString(),
+    ]
+      .map((value) => `"${value.replace(/"/g, '""')}"`)
+      .join(",")
+  )
+  const blob = new Blob([[header, ...rows].join("\n")], { type: "text/csv" })
+  downloadUrl(URL.createObjectURL(blob), `sechat-moderation-${timestamp}.csv`)
 }
 
 function messageElementId(messageId: string) {
@@ -6432,41 +9441,49 @@ function MediaViewerDialog({
   onClose: () => void
 }) {
   const isVideo = isVideoAttachment(attachment)
+  const isGif = isGifAttachment(attachment)
+  const mediaKind = isVideo ? "Video" : isGif ? "GIF" : "Image"
 
   return (
     <Modal
       ariaLabel="Media viewer"
-      className="media-viewer-dialog"
+      className={cn("media-viewer-dialog", isVideo ? "video-viewer" : "image-viewer")}
       isOpen
       onClose={onClose}
     >
-      <div className="media-viewer-head">
-        <div>
-          <strong id="media-viewer-title">{attachment.name}</strong>
-          <span>{formatFileSize(attachment.size)}</span>
+      <div className="media-viewer-shell">
+        <div className="media-viewer-head">
+          <div className="media-viewer-meta">
+            <span className="media-viewer-type">{mediaKind}</span>
+            <strong id="media-viewer-title">{attachment.name}</strong>
+            <span>{formatFileSize(attachment.size)}</span>
+          </div>
+          <div className="media-viewer-actions">
+            <button
+              aria-label={`Download ${attachment.name}`}
+              className="media-viewer-download"
+              data-tooltip={`Download ${attachment.name}`}
+              type="button"
+              onClick={() => downloadAttachment(attachment)}
+            >
+              <DownloadSimple weight="bold" />
+            </button>
+          </div>
         </div>
-        <button
-          aria-label={`Download ${attachment.name}`}
-          className="media-viewer-download"
-          data-tooltip={`Download ${attachment.name}`}
-          type="button"
-          onClick={() => downloadAttachment(attachment)}
-        >
-          <DownloadSimple weight="bold" />
-        </button>
-      </div>
-      <div className="media-viewer-body">
-        {isVideo ? (
-          <video
-            autoPlay
-            controls
-            playsInline
-            preload="metadata"
-            src={attachment.dataUrl}
-          />
-        ) : (
-          <img alt={attachment.name} src={attachment.dataUrl} />
-        )}
+        <div className={cn("media-viewer-body", isVideo ? "video" : "image")}>
+          {isVideo ? (
+            <StorageSafeVideo
+              autoPlay
+              controls
+              playsInline
+              poster={attachment.thumbnailUrl}
+              preload="metadata"
+              source={attachment.dataUrl}
+            />
+          ) : (
+            <img alt={attachment.name} src={attachment.dataUrl} />
+          )}
+        </div>
       </div>
     </Modal>
   )
@@ -6474,9 +9491,11 @@ function MediaViewerDialog({
 
 function MessageAttachments({
   attachments,
+  reducedData,
   onOpenMedia,
 }: {
   attachments?: MessageAttachment[]
+  reducedData: boolean
   onOpenMedia: (state: MediaViewerState) => void
 }) {
   if (!attachments?.length) return null
@@ -6522,13 +9541,34 @@ function MessageAttachments({
                 type="button"
                 onClick={() => onOpenMedia({ attachment })}
               >
-                <video
-                  aria-hidden="true"
-                  muted
-                  playsInline
-                  preload="metadata"
-                  src={attachment.dataUrl}
-                />
+                {attachment.thumbnailUrl ? (
+                  <img
+                    alt=""
+                    className="message-video-thumbnail"
+                    src={attachment.thumbnailUrl}
+                  />
+                ) : (
+                  <StorageSafeVideo
+                    ariaHidden
+                    muted
+                    playsInline
+                    poster={attachment.thumbnailUrl}
+                    preload={reducedData ? "none" : "metadata"}
+                    source={attachment.dataUrl}
+                  />
+                )}
+                {!reducedData ? (
+                  <StorageSafeVideo
+                    ariaHidden
+                    autoPlay
+                    className="message-video-hover-preview"
+                    muted
+                    playsInline
+                    poster={attachment.thumbnailUrl}
+                    preload="metadata"
+                    source={attachment.dataUrl}
+                  />
+                ) : null}
                 <span className="message-video-play">
                   <Play weight="fill" />
                 </span>
@@ -6553,6 +9593,7 @@ function MessageAttachments({
                 <AudioMessagePlayer
                   ariaLabel={`${attachment.name} progress`}
                   source={attachment.dataUrl}
+                  waveform={attachment.waveform}
                 />
               </div>
             </div>
@@ -6584,6 +9625,48 @@ function MessageAttachments({
           </div>
         )
       })}
+    </div>
+  )
+}
+
+function TenorGifEmbeds({
+  previews,
+  onExternalLink,
+}: {
+  previews: TenorGifPreview[]
+  onExternalLink: (url: string, displayUrl: string) => void
+}) {
+  if (previews.length === 0) return null
+
+  return (
+    <div className="message-tenor-embeds" data-ignore-long-press="true">
+      {previews.map((preview) => (
+        <div className="tenor-gif-card" key={preview.id}>
+          <div className="tenor-gif-frame-wrap">
+            <iframe
+              allowFullScreen
+              className="tenor-gif-frame"
+              loading="lazy"
+              referrerPolicy="no-referrer-when-downgrade"
+              sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+              src={preview.embedUrl}
+              title="Tenor GIF"
+            />
+          </div>
+          <div className="tenor-gif-footer">
+            <span>Tenor GIF</span>
+            <button
+              className="tenor-gif-open"
+              data-tooltip="Open on Tenor"
+              type="button"
+              onClick={() => onExternalLink(preview.sourceUrl, preview.displayUrl)}
+            >
+              Open
+              <ArrowSquareOut weight="bold" />
+            </button>
+          </div>
+        </div>
+      ))}
     </div>
   )
 }
@@ -6669,30 +9752,55 @@ function MessageBlock({
   group,
   highlightedMessageId,
   mobileReplyGesture,
-  onExternalLink,
-  onOpenMedia,
+  onAskAi,
   onDeleteMessage,
+  onEditMessage,
+  onExternalLink,
+  onForwardMessage,
   onJumpToMessage,
+  onOpenMedia,
+  onPinMessage,
+  onReportMessage,
+  onRetryMessage,
   onReact,
   onReply,
+  onSelectMessage,
+  onStarMessage,
+  onTranslateMessage,
   profile,
   quoteFor,
+  reducedData,
+  selectedMessageIds,
+  translatedMessageIds,
 }: {
   adminUnlocked: boolean
   authorId: string
   group: MessageGroup
   highlightedMessageId: string | null
   mobileReplyGesture: boolean
-  onExternalLink: (url: string, displayUrl: string) => void
-  onOpenMedia: (state: MediaViewerState) => void
+  onAskAi: (message: ChatMessage) => void
   onDeleteMessage: (message: ChatMessage) => void | Promise<void>
+  onEditMessage: (message: ChatMessage) => void
+  onExternalLink: (url: string, displayUrl: string) => void
+  onForwardMessage: (message: ChatMessage) => void
   onJumpToMessage: (messageId: string) => void
+  onOpenMedia: (state: MediaViewerState) => void
+  onPinMessage: (message: ChatMessage) => void
+  onReportMessage: (message: ChatMessage) => void
+  onRetryMessage: (message: ChatMessage) => void | Promise<void>
   onReact: (messageId: string, emoji: string) => void
   onReply: (messageId: string) => void
+  onSelectMessage: (message: ChatMessage) => void
+  onStarMessage: (message: ChatMessage) => void
+  onTranslateMessage: (message: ChatMessage) => void
   profile: Profile
   quoteFor: (message: ChatMessage) => ChatMessage | undefined
+  reducedData: boolean
+  selectedMessageIds: Set<string>
+  translatedMessageIds: Set<string>
 }) {
   const reduceMotion = useReducedMotion()
+  const [profileOpen, setProfileOpen] = useState(false)
   const firstMessage = group.messages[0]
   if (!firstMessage) return null
 
@@ -6708,14 +9816,52 @@ function MessageBlock({
       layout
       transition={{ duration: 0.22, ease: [0.2, 0.8, 0.2, 1] }}
     >
-      {!own ? <ChatAvatar name={displayName} src={avatar} /> : null}
+      {!own ? (
+        <button
+          aria-expanded={profileOpen}
+          aria-label={`Open ${displayName} profile`}
+          className="message-avatar-button"
+          type="button"
+          onClick={() => setProfileOpen((current) => !current)}
+        >
+          <ChatAvatar name={displayName} src={avatar} />
+        </button>
+      ) : null}
       <div className="message-core">
         <div className="message-meta">
-          <strong>{displayName}</strong>
+          <button
+            aria-expanded={profileOpen}
+            className="message-author-button"
+            type="button"
+            onClick={() => setProfileOpen((current) => !current)}
+          >
+            <strong>{displayName}</strong>
+          </button>
           <time dateTime={new Date(firstMessage.createdAt).toISOString()}>
             {formatTime(firstMessage.createdAt)}
           </time>
         </div>
+        <AnimatePresence>
+          {profileOpen ? (
+            <motion.div
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              className="user-profile-popover"
+              exit={{ opacity: 0, y: 4, scale: 0.98 }}
+              initial={reduceMotion ? false : { opacity: 0, y: 4, scale: 0.98 }}
+              transition={{ duration: 0.15 }}
+            >
+              <ChatAvatar name={displayName} src={avatar} size="lg" />
+              <div>
+                <strong>{displayName}</strong>
+                <span>{own ? profile.statusText || "You" : "Recent room participant"}</span>
+                <small>
+                  Joined {formatTime(own ? profile.joinedAt ?? firstMessage.createdAt : firstMessage.createdAt)}
+                  {" "}· last active {formatTime(group.messages.at(-1)?.createdAt ?? firstMessage.createdAt)}
+                </small>
+              </div>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
         <div className="message-bubbles">
           {group.messages.map((message, index) => (
             <MessageBubble
@@ -6729,12 +9875,24 @@ function MessageBlock({
               message={message}
               profile={profile}
               quote={quoteFor(message)}
+              reducedData={reducedData}
+              selected={selectedMessageIds.has(message.id)}
+              translated={translatedMessageIds.has(message.id)}
+              onAskAi={() => onAskAi(message)}
               onDelete={() => void onDeleteMessage(message)}
+              onEdit={() => onEditMessage(message)}
               onExternalLink={onExternalLink}
+              onForward={() => onForwardMessage(message)}
               onJumpToMessage={onJumpToMessage}
               onOpenMedia={onOpenMedia}
+              onPin={() => onPinMessage(message)}
+              onReport={() => onReportMessage(message)}
+              onRetry={() => void onRetryMessage(message)}
               onReact={onReact}
               onReply={() => onReply(message.id)}
+              onSelect={() => onSelectMessage(message)}
+              onStar={() => onStarMessage(message)}
+              onTranslate={() => onTranslateMessage(message)}
             />
           ))}
         </div>
@@ -6751,14 +9909,26 @@ function MessageBubble({
   highlighted,
   mobileReplyGesture,
   message,
+  selected,
+  translated,
+  onAskAi,
   onDelete,
+  onEdit,
   onExternalLink,
+  onForward,
   onJumpToMessage,
   onOpenMedia,
+  onPin,
+  onReport,
+  onRetry,
   onReact,
   onReply,
+  onSelect,
+  onStar,
+  onTranslate,
   profile,
   quote,
+  reducedData,
 }: {
   adminUnlocked: boolean
   authorId: string
@@ -6767,16 +9937,29 @@ function MessageBubble({
   highlighted: boolean
   mobileReplyGesture: boolean
   message: ChatMessage
+  selected: boolean
+  translated: boolean
+  onAskAi: () => void
   onDelete: () => void
+  onEdit: () => void
   onExternalLink: (url: string, displayUrl: string) => void
+  onForward: () => void
   onJumpToMessage: (messageId: string) => void
   onOpenMedia: (state: MediaViewerState) => void
+  onPin: () => void
+  onReport: () => void
+  onRetry: () => void
   onReact: (messageId: string, emoji: string) => void
   onReply: () => void
+  onSelect: () => void
+  onStar: () => void
+  onTranslate: () => void
   profile: Profile
   quote?: ChatMessage
+  reducedData: boolean
 }) {
   const [actionMenuOpen, setActionMenuOpen] = useState(false)
+  const [actionSheetOpen, setActionSheetOpen] = useState(false)
   const [actionFeedback, setActionFeedback] = useState<
     "reply" | "copy" | "download" | "reaction" | "delete" | "link" | null
   >(null)
@@ -6789,20 +9972,28 @@ function MessageBubble({
   const longPressStartRef = useRef<{ x: number; y: number } | null>(null)
   const blockNextClickRef = useRef(false)
   const isPending = message.sendStatus === "sending"
+  const isFailed = message.sendStatus === "failed"
   const hasAttachments = Boolean(message.attachments?.length)
   const hasText = message.body.trim().length > 0
+  const tenorPreviews = useMemo(() => getTenorGifPreviews(message.body), [message.body])
+  const isOnlyTenorLinks =
+    hasText &&
+    tenorPreviews.length > 0 &&
+    textWithoutTenorLinks(message.body).trim().length === 0
+  const hasRenderableText = hasText && !isOnlyTenorLinks
   const hasPendingMedia =
     message.messageType === "audio" || Boolean(message.attachments?.length)
   const showTextBubble =
-    isPending || message.messageType === "audio" || Boolean(quote) || hasText
+    isPending || message.messageType === "audio" || Boolean(quote) || hasRenderableText
   const downloads = getMessageDownloads(message)
   const canDownload = !isPending && downloads.length > 0
   const canCopy = !isPending && message.messageType !== "audio" && hasText
   const canDelete = adminUnlocked && !isPending
+  const canEdit = !isPending && message.messageType !== "audio" && hasText
   const canCopyLink = !isPending
   const canReply = !isPending
   const canReact = !isPending
-  const hasActionMenu = canCopy || canDownload || canDelete || canCopyLink
+  const hasActionMenu = !isPending
 
   useEffect(() => {
     return () => {
@@ -6874,6 +10065,7 @@ function MessageBubble({
     if (!canCopyLink) return
     triggerActionFeedback("link")
     navigator.clipboard?.writeText(messageLinkFor(message.id)).catch(() => undefined)
+    setActionSheetOpen(false)
     setActionMenuOpen(false)
     setReactionMenuOpen(false)
   }
@@ -6882,23 +10074,27 @@ function MessageBubble({
     if (!canReact) return
     triggerActionFeedback("reaction")
     onReact(message.id, emoji)
+    setActionSheetOpen(false)
     setActionMenuOpen(false)
     setReactionMenuOpen(false)
   }
 
   function copyAndCloseMenu() {
     copyMessage()
+    setActionSheetOpen(false)
     setActionMenuOpen(false)
   }
 
   function replyAndCloseMenu() {
     replyMessage()
+    setActionSheetOpen(false)
     setActionMenuOpen(false)
   }
 
   function downloadMessage() {
     triggerActionFeedback("download")
     downloadItems(downloads)
+    setActionSheetOpen(false)
     setActionMenuOpen(false)
   }
 
@@ -6906,13 +10102,34 @@ function MessageBubble({
     if (!canDelete) return
     triggerActionFeedback("delete")
     onDelete()
+    setActionSheetOpen(false)
     setActionMenuOpen(false)
     setReactionMenuOpen(false)
+  }
+
+  function runActionAndClose(action: () => void) {
+    action()
+    setActionSheetOpen(false)
+    setActionMenuOpen(false)
+    setReactionMenuOpen(false)
+  }
+
+  function openReactionPicker() {
+    setActionSheetOpen(false)
+    setActionMenuOpen(false)
+    setReactionMenuOpen(true)
+  }
+
+  function openFullActionSheet() {
+    setActionMenuOpen(false)
+    setReactionMenuOpen(false)
+    setActionSheetOpen(true)
   }
 
   function openActionMenu() {
     setSwipeIntent(null)
     setSwipeProgress(0)
+    setActionSheetOpen(false)
     setReactionMenuOpen(false)
     setActionMenuOpen(true)
     navigator.vibrate?.(12)
@@ -7002,6 +10219,7 @@ function MessageBubble({
 
   function handleDragStart() {
     clearLongPressTimer()
+    setActionSheetOpen(false)
     setActionMenuOpen(false)
     setReactionMenuOpen(false)
   }
@@ -7031,6 +10249,155 @@ function MessageBubble({
     }
   }
 
+  function renderQuickReactions(className = "message-menu-reactions") {
+    if (!canReact) return null
+
+    return (
+      <div className={className} aria-label="Quick reactions">
+        {REACTION_OPTIONS.map((emoji) => (
+          <ReactionActionButton
+            active={hasReaction(message.reactions, emoji, authorId)}
+            emoji={emoji}
+            key={emoji}
+            onClick={() => reactToMessage(emoji)}
+          />
+        ))}
+        <button
+          aria-label="More reactions"
+          className="message-menu-add-reaction"
+          type="button"
+          onClick={openReactionPicker}
+        >
+          <Plus weight="bold" />
+        </button>
+      </div>
+    )
+  }
+
+  function renderActionRows(showFullMenuButton: boolean) {
+    return (
+      <div className="message-menu-actions">
+        {canReply ? (
+          <button className="message-menu-action-row" type="button" onClick={replyAndCloseMenu}>
+            <ArrowBendUpLeft weight="bold" />
+            <span>Reply</span>
+          </button>
+        ) : null}
+        {canCopy ? (
+          <button className="message-menu-action-row" type="button" onClick={copyAndCloseMenu}>
+            <CopySimple weight="bold" />
+            <span>Copy</span>
+          </button>
+        ) : null}
+        {canEdit ? (
+          <button
+            className="message-menu-action-row"
+            type="button"
+            onClick={() => runActionAndClose(onEdit)}
+          >
+            <PencilSimple weight="bold" />
+            <span>Edit</span>
+          </button>
+        ) : null}
+        <button
+          className="message-menu-action-row"
+          type="button"
+          onClick={() => runActionAndClose(onForward)}
+        >
+          <ShareFat weight="bold" />
+          <span>Forward</span>
+        </button>
+        <button
+          className={cn("message-menu-action-row", message.pinnedAt && "active")}
+          type="button"
+          onClick={() => runActionAndClose(onPin)}
+        >
+          <PushPinSimple weight="bold" />
+          <span>{message.pinnedAt ? "Unpin" : "Pin"}</span>
+        </button>
+        <button
+          className="message-menu-action-row"
+          type="button"
+          onClick={() => runActionAndClose(onAskAi)}
+        >
+          <At weight="bold" />
+          <span>Ask AI</span>
+        </button>
+        <button
+          className={cn("message-menu-action-row", message.starredBy?.includes(authorId) && "active")}
+          type="button"
+          onClick={() => runActionAndClose(onStar)}
+        >
+          <Star weight="bold" />
+          <span>{message.starredBy?.includes(authorId) ? "Unstar" : "Star"}</span>
+        </button>
+        <span className="message-menu-divider" />
+        <button
+          className={cn("message-menu-action-row", selected && "active")}
+          type="button"
+          onClick={() => runActionAndClose(onSelect)}
+        >
+          <Check weight="bold" />
+          <span>{selected ? "Unselect" : "Select"}</span>
+        </button>
+        {canCopy ? (
+          <button
+            className={cn("message-menu-action-row", translated && "active")}
+            type="button"
+            onClick={() => runActionAndClose(onTranslate)}
+          >
+            <GlobeSimple weight="bold" />
+            <span>{translated ? "Hide translation" : "Translate"}</span>
+          </button>
+        ) : null}
+        {canCopyLink ? (
+          <button className="message-menu-action-row" type="button" onClick={copyMessageLink}>
+            <LinkSimple weight="bold" />
+            <span>Link</span>
+          </button>
+        ) : null}
+        {canDownload ? (
+          <button className="message-menu-action-row" type="button" onClick={downloadMessage}>
+            <DownloadSimple weight="bold" />
+            <span>Download</span>
+          </button>
+        ) : null}
+        <span className="message-menu-divider" />
+        <button
+          className="message-menu-action-row"
+          type="button"
+          onClick={() => runActionAndClose(onReport)}
+        >
+          <Flag weight="bold" />
+          <span>Report</span>
+        </button>
+        {canDelete ? (
+          <button
+            className="message-menu-action-row danger-menu-action"
+            type="button"
+            onClick={deleteAndCloseMenu}
+          >
+            <Trash weight="bold" />
+            <span>Delete</span>
+          </button>
+        ) : null}
+        {showFullMenuButton ? (
+          <>
+            <span className="message-menu-divider" />
+            <button
+              className="message-menu-action-row full-menu-action"
+              type="button"
+              onClick={openFullActionSheet}
+            >
+              <ArrowSquareOut weight="bold" />
+              <span>Open full actions</span>
+            </button>
+          </>
+        ) : null}
+      </div>
+    )
+  }
+
   return (
     <motion.div
       ref={bubbleLineRef}
@@ -7039,6 +10406,9 @@ function MessageBubble({
         "bubble-line",
         message.messageType === "audio" && "audio-bubble",
         isPending && "pending-bubble-line",
+        isFailed && "failed-bubble-line",
+        selected && "selected-message",
+        message.pinnedAt && "pinned-message",
         mobileReplyGesture && "swipe-reply",
         highlighted && "linked-message",
         compact && "compact"
@@ -7085,57 +10455,8 @@ function MessageBubble({
             initial={{ opacity: 0, y: 4, scale: 0.96 }}
             transition={{ duration: 0.14 }}
           >
-            {canReact ? (
-              <div className="message-menu-reactions">
-                {REACTION_OPTIONS.map((emoji) => (
-                  <ReactionActionButton
-                    active={hasReaction(message.reactions, emoji, authorId)}
-                    emoji={emoji}
-                    key={emoji}
-                    onClick={() => reactToMessage(emoji)}
-                  />
-                ))}
-              </div>
-            ) : null}
-            {canReply ? (
-              <button data-tooltip="Reply" type="button" onClick={replyAndCloseMenu}>
-                <ArrowBendUpLeft weight="bold" />
-                Reply
-              </button>
-            ) : null}
-            {canCopy ? (
-              <button data-tooltip="Copy message" type="button" onClick={copyAndCloseMenu}>
-                <CopySimple weight="bold" />
-                Copy
-              </button>
-            ) : null}
-            {canCopyLink ? (
-              <button
-                data-tooltip="Copy message link"
-                type="button"
-                onClick={copyMessageLink}
-              >
-                <LinkSimple weight="bold" />
-                Link
-              </button>
-            ) : null}
-            {canDownload ? (
-              <button data-tooltip="Download" type="button" onClick={downloadMessage}>
-                <DownloadSimple weight="bold" />
-                Download
-              </button>
-            ) : null}
-            {canDelete ? (
-              <button
-                className="danger-menu-action"
-                data-tooltip="Delete message"
-                type="button"
-                onClick={deleteAndCloseMenu}
-              >
-                <Trash weight="bold" />
-                Delete
-              </button>
-            ) : null}
+            {renderQuickReactions()}
+            {renderActionRows(true)}
           </motion.div>
         ) : null}
       </AnimatePresence>
@@ -7143,6 +10464,7 @@ function MessageBubble({
         {message.messageType !== "audio" && hasAttachments && !isPending ? (
           <MessageAttachments
             attachments={message.attachments}
+            reducedData={reducedData}
             onOpenMedia={onOpenMedia}
           />
         ) : null}
@@ -7150,6 +10472,18 @@ function MessageBubble({
         {showTextBubble ? (
           <div className="bubble">
             <div className="bubble-inner">
+              {!isPending && message.forwardedFrom ? (
+                <span className="message-state-note">
+                  <ShareFat weight="bold" />
+                  Forwarded from {message.forwardedFrom}
+                </span>
+              ) : null}
+              {!isPending && message.pinnedAt ? (
+                <span className="message-state-note">
+                  <PushPinSimple weight="bold" />
+                  Pinned
+                </span>
+              ) : null}
               {isPending ? (
                 <PendingMessageSkeleton
                   hasMedia={hasPendingMedia}
@@ -7171,13 +10505,49 @@ function MessageBubble({
               ) : null}
               {!isPending && message.messageType === "audio" && message.audioUrl ? (
                 <AudioMessage message={message} />
-              ) : !isPending && hasText ? (
-                <p className="rich-text">
-                  {renderRichText(message.body, profile.name, onExternalLink)}
-                </p>
+              ) : !isPending && hasRenderableText ? (
+                <>
+                  <p className="rich-text">
+                    {renderRichText(message.body, profile.name, onExternalLink)}
+                  </p>
+                  {translated ? (
+                    <div className="message-translation">
+                      <GlobeSimple weight="bold" />
+                      <span>{translateMessagePreview(message.body)}</span>
+                    </div>
+                  ) : null}
+                </>
+              ) : null}
+              {!isPending && message.aiNote ? (
+                <div className="message-ai-note">
+                  <At weight="bold" />
+                  <span>{message.aiNote}</span>
+                </div>
+              ) : null}
+              {!isPending && (message.editedAt || message.starredBy?.includes(authorId)) ? (
+                <div className="message-meta-flags">
+                  {message.editedAt ? <span>edited</span> : null}
+                  {message.starredBy?.includes(authorId) ? (
+                    <span>
+                      <Star weight="fill" />
+                      starred
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
+              {isFailed ? (
+                <div className="message-failed-row">
+                  <span>Upload failed</span>
+                  <button type="button" onClick={onRetry}>
+                    Retry
+                  </button>
+                </div>
               ) : null}
             </div>
           </div>
+        ) : null}
+        {!isPending && tenorPreviews.length > 0 ? (
+          <TenorGifEmbeds previews={tenorPreviews} onExternalLink={onExternalLink} />
         ) : null}
         {!isPending ? (
           <MessageReactionStrip
@@ -7286,6 +10656,21 @@ function MessageBubble({
           </Tooltip>
         ) : null}
       </div>
+      <Modal
+        ariaLabel="Message actions"
+        className="message-action-sheet"
+        isOpen={actionSheetOpen}
+        onClose={() => setActionSheetOpen(false)}
+      >
+        <div className="message-action-sheet-shell">
+          <div className="message-action-sheet-head">
+            <strong>Message actions</strong>
+            <span>{displayName}</span>
+          </div>
+          {renderQuickReactions("message-sheet-reactions")}
+          {renderActionRows(false)}
+        </div>
+      </Modal>
     </motion.div>
   )
 }
@@ -7433,7 +10818,7 @@ function AudioMessagePlayer({
   ariaLabel,
   durationMs = 0,
   source,
-  waveform = [],
+  waveform,
 }: {
   ariaLabel: string
   durationMs?: number
@@ -7443,11 +10828,18 @@ function AudioMessagePlayer({
   const [playing, setPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [durationSeconds, setDurationSeconds] = useState(durationMs / 1000)
+  const [sourceWaveform, setSourceWaveform] = useState<number[]>([])
   const [volume, setVolume] = useState(1)
+  const [playbackRate, setPlaybackRate] = useState(1)
   const [volumeMenuOpen, setVolumeMenuOpen] = useState(false)
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const progressFrameRef = useRef<number | null>(null)
-  const bars = compactWaveform(waveform, MESSAGE_AUDIO_BAR_COUNT)
+  const providedWaveform = waveform ?? []
+  const hasProvidedWaveform = providedWaveform.length > 0
+  const bars = compactWaveform(
+    hasProvidedWaveform ? providedWaveform : sourceWaveform,
+    MESSAGE_AUDIO_BAR_COUNT
+  )
   const progress =
     durationSeconds > 0 ? Math.min(1, currentTime / durationSeconds) : 0
 
@@ -7489,6 +10881,29 @@ function AudioMessagePlayer({
       audioRef.current.volume = volume
     }
   }, [volume])
+
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.playbackRate = playbackRate
+    }
+  }, [playbackRate])
+
+  useEffect(() => {
+    let cancelled = false
+
+    setSourceWaveform([])
+    if (hasProvidedWaveform) return
+
+    getAudioSourceWaveform(source).then((nextWaveform) => {
+      if (!cancelled && nextWaveform?.length) {
+        setSourceWaveform(nextWaveform)
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [hasProvidedWaveform, source])
 
   function togglePlayback() {
     const audio = audioRef.current
@@ -7578,11 +10993,13 @@ function AudioMessagePlayer({
         </button>
         <AnimatePresence>
           {volumeMenuOpen ? (
-            <motion.label
+            <motion.div
               animate={{ opacity: 1, y: 0, scale: 1 }}
               className="audio-volume-popover"
               exit={{ opacity: 0, y: 4, scale: 0.96 }}
               initial={{ opacity: 0, y: 4, scale: 0.96 }}
+              role="group"
+              aria-label="Audio playback controls"
               transition={{ duration: 0.14 }}
             >
               <span>Volume</span>
@@ -7597,7 +11014,21 @@ function AudioMessagePlayer({
                   updateVolume(Number(event.currentTarget.value))
                 }
               />
-            </motion.label>
+              <span>Speed</span>
+              <div className="audio-speed-options">
+                {[0.75, 1, 1.25, 1.5, 2].map((rate) => (
+                  <button
+                    aria-pressed={playbackRate === rate}
+                    className={cn(playbackRate === rate && "active")}
+                    key={rate}
+                    type="button"
+                    onClick={() => setPlaybackRate(rate)}
+                  >
+                    {rate}x
+                  </button>
+                ))}
+              </div>
+            </motion.div>
           ) : null}
         </AnimatePresence>
       </div>
@@ -7706,6 +11137,62 @@ function messagePreview(message: ChatMessage) {
   return firstAttachment.kind === "image" ? "Photo" : firstAttachment.name
 }
 
+function createLocalAiNote(message: ChatMessage) {
+  const preview = messagePreview(message)
+  if (!preview) return "AI note: media-only message, no text to summarize."
+
+  const words = preview.split(/\s+/).filter(Boolean)
+  const summary = words.slice(0, 18).join(" ")
+  const attachmentText = message.attachments?.length
+    ? ` Includes ${message.attachments.length} attachment${message.attachments.length === 1 ? "" : "s"}.`
+    : ""
+  return `AI note: ${summary}${words.length > 18 ? "..." : ""}.${attachmentText}`
+}
+
+function translateMessagePreview(body: string) {
+  const dictionary: Array<[RegExp, string]> = [
+    [/\bhallo\b/gi, "hello"],
+    [/\bdanke\b/gi, "thanks"],
+    [/\bbitte\b/gi, "please"],
+    [/\bja\b/gi, "yes"],
+    [/\bnein\b/gi, "no"],
+    [/\bich\b/gi, "I"],
+    [/\bdu\b/gi, "you"],
+    [/\bkannst\b/gi, "can"],
+    [/\bmachen\b/gi, "do"],
+    [/\bfixe?\b/gi, "fix"],
+    [/\bnachricht(en)?\b/gi, "message$1"],
+    [/\bdatei(en)?\b/gi, "file$1"],
+  ]
+
+  const translated = dictionary.reduce(
+    (current, [pattern, replacement]) => current.replace(pattern, replacement),
+    body
+  )
+  return translated === body
+    ? "Translation preview: no offline dictionary match. Original text is shown below."
+    : translated
+}
+
+function replyChainFor(messages: ChatMessage[], messageId: string) {
+  const byId = new Map(messages.map((message) => [message.id, message]))
+  const chain: ChatMessage[] = []
+  let current = byId.get(messageId)
+  const seen = new Set<string>()
+
+  while (current && !seen.has(current.id)) {
+    chain.unshift(current)
+    seen.add(current.id)
+    current = current.replyToId ? byId.get(current.replyToId) : undefined
+  }
+
+  return chain
+}
+
+function replyRootIdFor(messages: ChatMessage[], messageId: string) {
+  return replyChainFor(messages, messageId)[0]?.id ?? messageId
+}
+
 function groupMessages(messages: ChatMessage[]) {
   const groups: MessageGroup[] = []
 
@@ -7769,6 +11256,60 @@ function renderRichText(
   }
 
   return parts.length ? parts : body
+}
+
+function getTenorGifPreviews(body: string) {
+  const urlPattern = /(?:https?:\/\/[^\s<]+|www\.[^\s<]+)/gi
+  const previews: TenorGifPreview[] = []
+  const seen = new Set<string>()
+
+  body.replace(urlPattern, (match) => {
+    const { displayUrl, url } = normalizeUrlToken(match)
+    const preview = url ? tenorGifPreviewFromUrl(url, displayUrl) : null
+    if (preview && !seen.has(preview.id)) {
+      seen.add(preview.id)
+      previews.push(preview)
+    }
+    return match
+  })
+
+  return previews.slice(0, 4)
+}
+
+function textWithoutTenorLinks(body: string) {
+  const urlPattern = /(?:https?:\/\/[^\s<]+|www\.[^\s<]+)/gi
+
+  return body.replace(urlPattern, (match) => {
+    const { trailing, url } = normalizeUrlToken(match)
+    return url && tenorGifPreviewFromUrl(url, match) ? trailing : match
+  })
+}
+
+function tenorGifPreviewFromUrl(url: string, displayUrl: string) {
+  try {
+    const parsed = new URL(url)
+    const hostname = parsed.hostname.toLowerCase().replace(/^www\./, "")
+    if (hostname !== "tenor.com") return null
+
+    const segments = parsed.pathname.split("/").filter(Boolean)
+    if (!segments.includes("view")) return null
+
+    const lastSegment = segments.at(-1) ?? ""
+    const idMatch =
+      lastSegment.match(/(?:^|-)gif-(\d{6,})$/i) ??
+      lastSegment.match(/(?:^|-)(\d{6,})$/)
+    const id = idMatch?.[1]
+    if (!id) return null
+
+    return {
+      displayUrl,
+      embedUrl: `https://tenor.com/embed/${id}`,
+      id,
+      sourceUrl: parsed.toString(),
+    }
+  } catch {
+    return null
+  }
 }
 
 function renderInlineRichText(text: string, ownName: string, keyPrefix: string) {

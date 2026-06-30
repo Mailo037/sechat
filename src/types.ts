@@ -10,12 +10,18 @@ export type MessageAttachment = {
   kind: "image" | "file" | "video"
   mimeType: string
   name: string
+  originalSize?: number
   size: number
+  thumbnailUrl?: string
+  waveform?: number[]
 }
 
 export type Profile = {
+  accentColor?: string
   name: string
   avatar: string
+  joinedAt?: number
+  statusText?: string
 }
 
 export type UsernameClaim = {
@@ -33,10 +39,34 @@ export type ChatUser = {
 
 export type NotificationSettings = {
   browserEnabled: boolean
+  attachmentPreviews?: boolean
+  keywordAlerts?: string[]
+  mentionSummary?: boolean
+  roomEnabled?: boolean
   soundsEnabled: boolean
   soundKinds: Record<SoundKind, boolean>
   uiSoundsEnabled: boolean
   uiSound: UiSoundKind
+  voicePreviews?: boolean
+}
+
+export type RoomSettings = {
+  announcement: string
+  archived: boolean
+  audioPlaybackRate: number
+  compactMode: boolean
+  imageCompressionQuality: number
+  reducedData: boolean
+  role: "owner" | "admin" | "trusted" | "guest"
+  topic: string
+}
+
+export type ModerationSettings = {
+  reasonPreset: string
+  slowModeSeconds: number
+  warningExpiresMinutes: number
+  wordFilterMode: "off" | "warn" | "block"
+  wordFilterWords: string[]
 }
 
 export type SpamGuardState = {
@@ -50,7 +80,14 @@ export type SpamGuardState = {
 
 export type SpamModerationLogEntry = {
   id: string
-  action: "ban" | "clear" | "delete" | "timeout" | "warn"
+  action:
+    | "ban"
+    | "clear"
+    | "delete"
+    | "report"
+    | "timeout"
+    | "warn"
+    | "word-filter"
   at: number
   bannedUntil?: number
   reason: string
@@ -65,6 +102,7 @@ export type ModerationUser = {
   isSelf: boolean
   lastSeenAt: number
   messageCount: number
+  moderation?: UserModerationState
   name: string
 }
 
@@ -127,9 +165,16 @@ export type ChatMessage = {
   audioUrl?: string
   audioMimeType?: string
   audioDurationMs?: number
+  aiNote?: string
   attachments?: MessageAttachment[]
+  editHistory?: Array<{ at: number; body: string }>
+  editedAt?: number
+  forwardedFrom?: string
+  pinnedAt?: number
+  reports?: Array<{ at: number; authorId: AuthorId; authorName: string; reason: string }>
   reactions?: MessageReaction[]
   sendStatus?: "sending" | "failed"
+  starredBy?: AuthorId[]
   uploadProgress?: number
   waveform?: number[]
 }
@@ -139,7 +184,19 @@ export type PersistedChatState = {
   profile: Profile
   usernameClaim?: UsernameClaim | null
   notifications: NotificationSettings
+  moderationSettings: ModerationSettings
+  roomSettings: RoomSettings
   spamGuard: SpamGuardState
   trustedSites: string[]
   messages: ChatMessage[]
+}
+
+export type UserPreferences = {
+  version: number
+  profile: Profile
+  usernameClaim?: UsernameClaim | null
+  notifications: NotificationSettings
+  moderationSettings: ModerationSettings
+  roomSettings: RoomSettings
+  trustedSites: string[]
 }

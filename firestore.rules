@@ -11,6 +11,12 @@ service cloud.firestore {
         || get(/databases/$(database)/documents/rooms/$(roomId)/moderation/$(request.auth.uid)).data.bannedUntil <= request.time.toMillis();
     }
 
+    function notBanned(roomId) {
+      return !exists(/databases/$(database)/documents/rooms/$(roomId)/moderation/$(request.auth.uid))
+        || get(/databases/$(database)/documents/rooms/$(roomId)/moderation/$(request.auth.uid)).data.action != "ban"
+        || get(/databases/$(database)/documents/rooms/$(roomId)/moderation/$(request.auth.uid)).data.bannedUntil <= request.time.toMillis();
+    }
+
     function claimedUsernameMatches(roomId, usernameKey, displayName) {
       return usernameKey is string
         && usernameKey.matches('[a-z0-9][a-z0-9_-]{2,23}')
@@ -154,6 +160,80 @@ service cloud.firestore {
         && request.resource.data.usernameKey.matches('[a-z0-9][a-z0-9_-]{2,23}');
     }
 
+    function validStoredUsernameClaim(userId) {
+      return request.resource.data.usernameClaim == null
+        || (
+          request.resource.data.usernameClaim is map
+          && request.resource.data.usernameClaim.keys().hasOnly([
+            "authorId",
+            "key",
+            "name"
+          ])
+          && request.resource.data.usernameClaim.authorId == userId
+          && request.resource.data.usernameClaim.key is string
+          && request.resource.data.usernameClaim.key.matches('[a-z0-9][a-z0-9_-]{2,23}')
+          && request.resource.data.usernameClaim.name is string
+          && request.resource.data.usernameClaim.name.size() >= 3
+          && request.resource.data.usernameClaim.name.size() <= 40
+          && request.resource.data.usernameClaim.name.matches('[A-Za-z0-9 _-]{3,40}')
+        );
+    }
+
+    function validUserPreferencesPayload(userId) {
+      return userId == request.auth.uid
+        && request.resource.data.keys().hasOnly([
+          "clientUpdatedAt",
+          "notifications",
+          "profile",
+          "trustedSites",
+          "updatedAt",
+          "usernameClaim",
+          "version"
+        ])
+        && request.resource.data.clientUpdatedAt is number
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.version is number
+        && request.resource.data.profile is map
+        && request.resource.data.profile.keys().hasOnly(["avatar", "name"])
+        && request.resource.data.profile.name is string
+        && request.resource.data.profile.name.size() > 0
+        && request.resource.data.profile.name.size() <= 80
+        && request.resource.data.profile.avatar is string
+        && request.resource.data.profile.avatar.size() <= 800000
+        && request.resource.data.notifications is map
+        && request.resource.data.notifications.keys().hasOnly([
+          "browserEnabled",
+          "soundKinds",
+          "soundsEnabled",
+          "uiSound",
+          "uiSoundsEnabled"
+        ])
+        && request.resource.data.notifications.browserEnabled is bool
+        && request.resource.data.notifications.soundsEnabled is bool
+        && request.resource.data.notifications.uiSoundsEnabled is bool
+        && request.resource.data.notifications.uiSound is string
+        && request.resource.data.notifications.uiSound in [
+          "click",
+          "deafen",
+          "done",
+          "mute",
+          "pop",
+          "soft"
+        ]
+        && request.resource.data.notifications.soundKinds is map
+        && request.resource.data.notifications.soundKinds.keys().hasOnly([
+          "message",
+          "ping",
+          "reply"
+        ])
+        && request.resource.data.notifications.soundKinds.message is bool
+        && request.resource.data.notifications.soundKinds.ping is bool
+        && request.resource.data.notifications.soundKinds.reply is bool
+        && request.resource.data.trustedSites is list
+        && request.resource.data.trustedSites.size() <= 50
+        && validStoredUsernameClaim(userId);
+    }
+
     function validVoicePresencePayload(roomId) {
       return request.resource.data.keys().hasOnly([
           "authorId",
@@ -240,19 +320,25 @@ service cloud.firestore {
         && request.resource.data.reason.size() <= 180;
     }
 
+    match /users/{userId} {
+      allow read: if signedIn() && userId == request.auth.uid;
+      allow create, update: if signedIn() && validUserPreferencesPayload(userId);
+      allow delete: if signedIn() && userId == request.auth.uid;
+    }
+
     match /rooms/{roomId} {
       allow read: if signedIn();
       allow write: if false;
 
       match /messages/{messageId} {
-        allow read: if signedIn();
+        allow read: if signedIn() && notBanned(roomId);
         allow create: if signedIn() && notModerated(roomId) && validMessagePayload(roomId);
         allow update: if false;
         allow delete: if signedIn();
       }
 
       match /reactions/{reactionId} {
-        allow read: if signedIn();
+        allow read: if signedIn() && notBanned(roomId);
         allow create: if signedIn() && notModerated(roomId) && validReactionPayload(roomId);
         allow update: if signedIn()
           && resource.data.authorId == request.auth.uid
@@ -278,7 +364,7 @@ service cloud.firestore {
       }
 
       match /voiceParticipants/{authorId} {
-        allow read: if signedIn();
+        allow read: if signedIn() && notBanned(roomId);
         allow create, update: if signedIn()
           && authorId == request.auth.uid
           && notModerated(roomId)
@@ -296,6 +382,7 @@ service cloud.firestore {
 
       match /voiceSignals/{signalId} {
         allow read: if signedIn()
+          && notBanned(roomId)
           && (resource.data.to == request.auth.uid || resource.data.from == request.auth.uid);
         allow create: if signedIn() && notModerated(roomId) && validVoiceSignalPayload();
         allow update: if false;
@@ -303,12 +390,12 @@ service cloud.firestore {
       }
 
       match /files/{fileId} {
-        allow read: if signedIn();
+        allow read: if signedIn() && notBanned(roomId);
         allow create: if false;
         allow update, delete: if false;
 
         match /chunks/{chunkId} {
-          allow read: if signedIn();
+          allow read: if signedIn() && notBanned(roomId);
           allow create: if false;
           allow update, delete: if false;
         }
