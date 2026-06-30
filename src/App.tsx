@@ -2416,7 +2416,7 @@ function App() {
       return
     }
 
-    if (!remoteEnabled) return
+    if (!remoteEnabled || !remoteIdentityReady) return
 
     const unsubscribeMessages = listenToRemoteMessages(
       (nextMessages) => {
@@ -2428,10 +2428,10 @@ function App() {
     )
 
     return () => unsubscribeMessages?.()
-  }, [activeAdminBan, remoteEnabled])
+  }, [activeAdminBan, remoteEnabled, remoteIdentityReady])
 
   useEffect(() => {
-    if (!remoteEnabled) {
+    if (!remoteEnabled || !remoteIdentityReady) {
       setRemoteUsers([])
       return
     }
@@ -2444,10 +2444,10 @@ function App() {
     )
 
     return () => unsubscribeUsers?.()
-  }, [remoteEnabled])
+  }, [remoteEnabled, remoteIdentityReady])
 
   useEffect(() => {
-    if (!remoteEnabled || !adminUnlocked) {
+    if (!remoteEnabled || !remoteIdentityReady || !adminUnlocked) {
       setRemoteModerations([])
       return
     }
@@ -2460,10 +2460,10 @@ function App() {
     )
 
     return () => unsubscribeModerations?.()
-  }, [adminUnlocked, remoteEnabled])
+  }, [adminUnlocked, remoteEnabled, remoteIdentityReady])
 
   useEffect(() => {
-    if (!remoteEnabled || authorId === "me") return
+    if (!remoteEnabled || !remoteIdentityReady || authorId === "me") return
 
     setRemoteModerationReady(false)
     const unsubscribeModeration = listenToRemoteModeration(
@@ -2478,7 +2478,7 @@ function App() {
     )
 
     return () => unsubscribeModeration?.()
-  }, [authorId, remoteEnabled])
+  }, [authorId, remoteEnabled, remoteIdentityReady])
 
   useEffect(() => {
     if (!remoteEnabled) {
@@ -5201,7 +5201,7 @@ function VoiceChatStage({
   })
 
   useEffect(() => {
-    if (!remoteEnabled) return
+    if (!remoteEnabled || authorId === "me") return
 
     const unsubscribe = listenToRemoteVoiceParticipants(
       setRemoteVoiceParticipants,
@@ -5212,10 +5212,10 @@ function VoiceChatStage({
     )
 
     return () => unsubscribe?.()
-  }, [remoteEnabled])
+  }, [authorId, remoteEnabled])
 
   useEffect(() => {
-    if (!remoteEnabled || !authorId) return
+    if (!remoteEnabled || authorId === "me") return
 
     const unsubscribe = listenToRemoteVoiceKick(
       authorId,
@@ -5237,7 +5237,7 @@ function VoiceChatStage({
   }, [authorId, remoteEnabled])
 
   useEffect(() => {
-    if (!remoteEnabled || !authorId) return
+    if (!remoteEnabled || authorId === "me") return
 
     const unsubscribe = listenToRemoteVoiceSignals(
       authorId,

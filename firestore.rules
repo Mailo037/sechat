@@ -179,12 +179,133 @@ service cloud.firestore {
         );
     }
 
+    function validPreferenceProfile(profile) {
+      return profile is map
+        && profile.keys().hasOnly([
+          "accentColor",
+          "avatar",
+          "joinedAt",
+          "name",
+          "statusText"
+        ])
+        && profile.name is string
+        && profile.name.size() > 0
+        && profile.name.size() <= 80
+        && profile.avatar is string
+        && profile.avatar.size() <= 800000
+        && profile.accentColor is string
+        && profile.accentColor.matches('#[0-9A-Fa-f]{6}')
+        && profile.joinedAt is number
+        && profile.statusText is string
+        && profile.statusText.size() <= 80;
+    }
+
+    function validPreferenceNotifications(notifications) {
+      return notifications is map
+        && notifications.keys().hasOnly([
+          "attachmentPreviews",
+          "browserEnabled",
+          "keywordAlerts",
+          "mentionSummary",
+          "roomEnabled",
+          "soundKinds",
+          "soundsEnabled",
+          "uiSound",
+          "uiSoundsEnabled",
+          "voicePreviews"
+        ])
+        && notifications.attachmentPreviews is bool
+        && notifications.browserEnabled is bool
+        && notifications.keywordAlerts is list
+        && notifications.keywordAlerts.size() <= 20
+        && notifications.mentionSummary is bool
+        && notifications.roomEnabled is bool
+        && notifications.soundsEnabled is bool
+        && notifications.uiSoundsEnabled is bool
+        && notifications.uiSound is string
+        && notifications.uiSound in [
+          "click",
+          "deafen",
+          "done",
+          "mute",
+          "pop",
+          "soft"
+        ]
+        && notifications.voicePreviews is bool
+        && notifications.soundKinds is map
+        && notifications.soundKinds.keys().hasOnly([
+          "message",
+          "ping",
+          "reply"
+        ])
+        && notifications.soundKinds.message is bool
+        && notifications.soundKinds.ping is bool
+        && notifications.soundKinds.reply is bool;
+    }
+
+    function validPreferenceRoomSettings(roomSettings) {
+      return roomSettings is map
+        && roomSettings.keys().hasOnly([
+          "announcement",
+          "archived",
+          "audioPlaybackRate",
+          "compactMode",
+          "imageCompressionQuality",
+          "reducedData",
+          "role",
+          "topic"
+        ])
+        && roomSettings.announcement is string
+        && roomSettings.announcement.size() <= 220
+        && roomSettings.archived is bool
+        && roomSettings.audioPlaybackRate is number
+        && roomSettings.audioPlaybackRate >= 0.5
+        && roomSettings.audioPlaybackRate <= 2
+        && roomSettings.compactMode is bool
+        && roomSettings.imageCompressionQuality is number
+        && roomSettings.imageCompressionQuality >= 0.45
+        && roomSettings.imageCompressionQuality <= 0.95
+        && roomSettings.reducedData is bool
+        && roomSettings.role is string
+        && roomSettings.role in ["owner", "admin", "trusted", "guest"]
+        && roomSettings.topic is string
+        && roomSettings.topic.size() > 0
+        && roomSettings.topic.size() <= 90;
+    }
+
+    function validPreferenceModerationSettings(moderationSettings) {
+      return moderationSettings is map
+        && moderationSettings.keys().hasOnly([
+          "reasonPreset",
+          "slowModeSeconds",
+          "warningExpiresMinutes",
+          "wordFilterMode",
+          "wordFilterWords"
+        ])
+        && moderationSettings.reasonPreset is string
+        && moderationSettings.reasonPreset.size() > 0
+        && moderationSettings.reasonPreset.size() <= 120
+        && moderationSettings.slowModeSeconds is number
+        && moderationSettings.slowModeSeconds >= 0
+        && moderationSettings.slowModeSeconds <= 120
+        && moderationSettings.warningExpiresMinutes is number
+        && moderationSettings.warningExpiresMinutes >= 1
+        && moderationSettings.warningExpiresMinutes <= 60
+        && moderationSettings.wordFilterMode is string
+        && moderationSettings.wordFilterMode in ["off", "warn", "block"]
+        && moderationSettings.wordFilterWords is list
+        && moderationSettings.wordFilterWords.size() <= 50;
+    }
+
     function validUserPreferencesPayload(userId) {
       return userId == request.auth.uid
         && request.resource.data.keys().hasOnly([
           "clientUpdatedAt",
+          "moderationSettings",
           "notifications",
           "profile",
+          "roomSettings",
+          "starredMessageIds",
           "trustedSites",
           "updatedAt",
           "usernameClaim",
@@ -193,42 +314,12 @@ service cloud.firestore {
         && request.resource.data.clientUpdatedAt is number
         && request.resource.data.updatedAt == request.time
         && request.resource.data.version is number
-        && request.resource.data.profile is map
-        && request.resource.data.profile.keys().hasOnly(["avatar", "name"])
-        && request.resource.data.profile.name is string
-        && request.resource.data.profile.name.size() > 0
-        && request.resource.data.profile.name.size() <= 80
-        && request.resource.data.profile.avatar is string
-        && request.resource.data.profile.avatar.size() <= 800000
-        && request.resource.data.notifications is map
-        && request.resource.data.notifications.keys().hasOnly([
-          "browserEnabled",
-          "soundKinds",
-          "soundsEnabled",
-          "uiSound",
-          "uiSoundsEnabled"
-        ])
-        && request.resource.data.notifications.browserEnabled is bool
-        && request.resource.data.notifications.soundsEnabled is bool
-        && request.resource.data.notifications.uiSoundsEnabled is bool
-        && request.resource.data.notifications.uiSound is string
-        && request.resource.data.notifications.uiSound in [
-          "click",
-          "deafen",
-          "done",
-          "mute",
-          "pop",
-          "soft"
-        ]
-        && request.resource.data.notifications.soundKinds is map
-        && request.resource.data.notifications.soundKinds.keys().hasOnly([
-          "message",
-          "ping",
-          "reply"
-        ])
-        && request.resource.data.notifications.soundKinds.message is bool
-        && request.resource.data.notifications.soundKinds.ping is bool
-        && request.resource.data.notifications.soundKinds.reply is bool
+        && validPreferenceProfile(request.resource.data.profile)
+        && validPreferenceNotifications(request.resource.data.notifications)
+        && validPreferenceRoomSettings(request.resource.data.roomSettings)
+        && validPreferenceModerationSettings(request.resource.data.moderationSettings)
+        && request.resource.data.starredMessageIds is list
+        && request.resource.data.starredMessageIds.size() <= 500
         && request.resource.data.trustedSites is list
         && request.resource.data.trustedSites.size() <= 50
         && validStoredUsernameClaim(userId);
