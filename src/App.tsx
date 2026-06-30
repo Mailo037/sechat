@@ -3,6 +3,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useLayoutEffect,
   type ClipboardEvent as ReactClipboardEvent,
   type CSSProperties,
   type DragEvent as ReactDragEvent,
@@ -508,6 +509,7 @@ function createInitialState(): PersistedChatState {
     roomSettings: defaultRoomSettings,
     spamGuard: defaultSpamGuard,
     trustedSites: [],
+    starredMessageIds: [],
     messages: [],
   }
 }
@@ -528,6 +530,7 @@ function normalizeStoredState(stored: PersistedChatState | undefined) {
       roomSettings: normalizeRoomSettings(stored.roomSettings),
       spamGuard: normalizeSpamGuard(stored.spamGuard),
       trustedSites: normalizeTrustedSites(stored.trustedSites),
+      starredMessageIds: normalizeStarredMessageIds(stored.starredMessageIds),
     }
   }
 
@@ -543,6 +546,7 @@ function normalizeStoredState(stored: PersistedChatState | undefined) {
     roomSettings: normalizeRoomSettings(stored.roomSettings),
     spamGuard: normalizeSpamGuard(stored.spamGuard),
     trustedSites: normalizeTrustedSites(stored.trustedSites),
+    starredMessageIds: normalizeStarredMessageIds(stored.starredMessageIds),
     messages: stored.messages.filter((message) => !isLegacyMessage(message)),
   }
 }
@@ -556,6 +560,7 @@ function preferencesFromState(state: PersistedChatState): UserPreferences {
     moderationSettings: state.moderationSettings,
     roomSettings: state.roomSettings,
     trustedSites: state.trustedSites,
+    starredMessageIds: state.starredMessageIds,
   }
 }
 
@@ -568,6 +573,7 @@ function stateWithPreferences(
     ...preferences,
     messages: state.messages,
     spamGuard: state.spamGuard,
+    starredMessageIds: preferences.starredMessageIds,
   })
 
   return {
@@ -578,6 +584,7 @@ function stateWithPreferences(
     moderationSettings: normalized.moderationSettings,
     roomSettings: normalized.roomSettings,
     trustedSites: normalized.trustedSites,
+    starredMessageIds: normalized.starredMessageIds,
   }
 }
 
@@ -765,6 +772,19 @@ function normalizeTrustedSites(value: unknown) {
         .filter(Boolean)
     )
   )
+}
+
+function normalizeStarredMessageIds(value: unknown) {
+  if (!Array.isArray(value)) return []
+
+  return Array.from(
+    new Set(
+      value
+        .filter((id): id is string => typeof id === "string")
+        .map((id) => id.trim())
+        .filter(Boolean)
+    )
+  ).slice(0, 500)
 }
 
 function cleanUsernameDisplayName(value: string) {
@@ -1770,6 +1790,9 @@ function App() {
   const [translatedMessageIds, setTranslatedMessageIds] = useState<Set<string>>(
     () => new Set()
   )
+  const [starredMessageIds, setStarredMessageIds] = useState<Set<string>>(
+    () => new Set()
+  )
   const [editTarget, setEditTarget] = useState<MessageEditState | null>(null)
   const [avatarCrop, setAvatarCrop] = useState<AvatarCropState | null>(null)
   const [draggedAttachmentId, setDraggedAttachmentId] = useState<string | null>(null)
@@ -2148,6 +2171,7 @@ function App() {
       roomSettings,
       spamGuard,
       trustedSites,
+      starredMessageIds: Array.from(starredMessageIds),
       messages,
     }),
     [
@@ -2158,6 +2182,7 @@ function App() {
       roomSettings,
       spamGuard,
       trustedSites,
+      starredMessageIds,
       messages,
     ]
   )
@@ -2179,6 +2204,7 @@ function App() {
     setSpamGuard(nextSpamGuard)
     writeCachedSpamGuard(nextSpamGuard, storageKey)
     setTrustedSites(next.trustedSites)
+    setStarredMessageIds(new Set(next.starredMessageIds))
     setMessages(next.messages)
   }
 
@@ -3332,14 +3358,14 @@ function App() {
 
   function toggleMessageStar(message: ChatMessage) {
     if (activeAdminBan) return
-    updateLocalMessage(message.id, (current) => {
-      const starredBy = new Set(current.starredBy ?? [])
-      if (starredBy.has(authorId)) {
-        starredBy.delete(authorId)
+    setStarredMessageIds((current) => {
+      const next = new Set(current)
+      if (next.has(message.id)) {
+        next.delete(message.id)
       } else {
-        starredBy.add(authorId)
+        next.add(message.id)
       }
-      return { ...current, starredBy: Array.from(starredBy) }
+      return next
     })
     playConfirmationSound("pop")
   }
@@ -4576,6 +4602,7 @@ function App() {
                     onStarMessage={toggleMessageStar}
                     onTranslateMessage={toggleMessageTranslation}
                     selectedMessageIds={selectedMessageIds}
+                    starredMessageIds={starredMessageIds}
                     translatedMessageIds={translatedMessageIds}
                   />
                 ))
@@ -9771,6 +9798,7 @@ function MessageBlock({
   quoteFor,
   reducedData,
   selectedMessageIds,
+  starredMessageIds,
   translatedMessageIds,
 }: {
   adminUnlocked: boolean
@@ -9797,6 +9825,7 @@ function MessageBlock({
   quoteFor: (message: ChatMessage) => ChatMessage | undefined
   reducedData: boolean
   selectedMessageIds: Set<string>
+  starredMessageIds: Set<string>
   translatedMessageIds: Set<string>
 }) {
   const reduceMotion = useReducedMotion()
@@ -9877,6 +9906,7 @@ function MessageBlock({
               quote={quoteFor(message)}
               reducedData={reducedData}
               selected={selectedMessageIds.has(message.id)}
+              starred={starredMessageIds.has(message.id)}
               translated={translatedMessageIds.has(message.id)}
               onAskAi={() => onAskAi(message)}
               onDelete={() => void onDeleteMessage(message)}
@@ -9910,6 +9940,7 @@ function MessageBubble({
   mobileReplyGesture,
   message,
   selected,
+  starred,
   translated,
   onAskAi,
   onDelete,
@@ -9938,6 +9969,7 @@ function MessageBubble({
   mobileReplyGesture: boolean
   message: ChatMessage
   selected: boolean
+  starred: boolean
   translated: boolean
   onAskAi: () => void
   onDelete: () => void
@@ -9960,6 +9992,11 @@ function MessageBubble({
 }) {
   const [actionMenuOpen, setActionMenuOpen] = useState(false)
   const [actionSheetOpen, setActionSheetOpen] = useState(false)
+  const [actionMenuPlacement, setActionMenuPlacement] = useState({
+    maxHeight: 0,
+    x: 0,
+    y: 0,
+  })
   const [actionFeedback, setActionFeedback] = useState<
     "reply" | "copy" | "download" | "reaction" | "delete" | "link" | null
   >(null)
@@ -9967,6 +10004,7 @@ function MessageBubble({
   const [swipeIntent, setSwipeIntent] = useState<"reply" | "copy" | null>(null)
   const [swipeProgress, setSwipeProgress] = useState(0)
   const bubbleLineRef = useRef<HTMLDivElement | null>(null)
+  const actionMenuRef = useRef<HTMLDivElement | null>(null)
   const longPressTimeoutRef = useRef<number | null>(null)
   const actionFeedbackTimeoutRef = useRef<number | null>(null)
   const longPressStartRef = useRef<{ x: number; y: number } | null>(null)
@@ -9989,7 +10027,9 @@ function MessageBubble({
   const canDownload = !isPending && downloads.length > 0
   const canCopy = !isPending && message.messageType !== "audio" && hasText
   const canDelete = adminUnlocked && !isPending
-  const canEdit = !isPending && message.messageType !== "audio" && hasText
+  const canEdit = adminUnlocked && !isPending && message.messageType !== "audio" && hasText
+  const canPin = adminUnlocked && !isPending
+  const canReport = adminUnlocked && !isPending
   const canCopyLink = !isPending
   const canReply = !isPending
   const canReact = !isPending
@@ -10022,6 +10062,46 @@ function MessageBubble({
       document.removeEventListener("pointerdown", closeFromOutside, true)
     }
   }, [actionMenuOpen, reactionMenuOpen])
+
+  useLayoutEffect(() => {
+    if (!actionMenuOpen) {
+      setActionMenuPlacement({ maxHeight: 0, x: 0, y: 0 })
+      return undefined
+    }
+
+    function clampActionMenu() {
+      const menu = actionMenuRef.current
+      if (!menu) return
+
+      const padding = 8
+      const rect = menu.getBoundingClientRect()
+      let x = 0
+      let y = 0
+
+      if (rect.right > window.innerWidth - padding) {
+        x = window.innerWidth - padding - rect.right
+      }
+      if (rect.left + x < padding) {
+        x += padding - (rect.left + x)
+      }
+      if (rect.top < padding) {
+        y = padding - rect.top
+      }
+
+      setActionMenuPlacement({
+        maxHeight: Math.max(180, window.innerHeight - padding * 2),
+        x: Math.round(x),
+        y: Math.round(y),
+      })
+    }
+
+    clampActionMenu()
+    window.addEventListener("resize", clampActionMenu)
+
+    return () => {
+      window.removeEventListener("resize", clampActionMenu)
+    }
+  }, [actionMenuOpen])
 
   function clearLongPressTimer() {
     if (longPressTimeoutRef.current !== null) {
@@ -10131,6 +10211,7 @@ function MessageBubble({
     setSwipeProgress(0)
     setActionSheetOpen(false)
     setReactionMenuOpen(false)
+    setActionMenuPlacement({ maxHeight: 0, x: 0, y: 0 })
     setActionMenuOpen(true)
     navigator.vibrate?.(12)
   }
@@ -10307,14 +10388,16 @@ function MessageBubble({
           <ShareFat weight="bold" />
           <span>Forward</span>
         </button>
-        <button
-          className={cn("message-menu-action-row", message.pinnedAt && "active")}
-          type="button"
-          onClick={() => runActionAndClose(onPin)}
-        >
-          <PushPinSimple weight="bold" />
-          <span>{message.pinnedAt ? "Unpin" : "Pin"}</span>
-        </button>
+        {canPin ? (
+          <button
+            className={cn("message-menu-action-row", message.pinnedAt && "active")}
+            type="button"
+            onClick={() => runActionAndClose(onPin)}
+          >
+            <PushPinSimple weight="bold" />
+            <span>{message.pinnedAt ? "Unpin" : "Pin"}</span>
+          </button>
+        ) : null}
         <button
           className="message-menu-action-row"
           type="button"
@@ -10324,12 +10407,12 @@ function MessageBubble({
           <span>Ask AI</span>
         </button>
         <button
-          className={cn("message-menu-action-row", message.starredBy?.includes(authorId) && "active")}
+          className={cn("message-menu-action-row", starred && "active")}
           type="button"
           onClick={() => runActionAndClose(onStar)}
         >
           <Star weight="bold" />
-          <span>{message.starredBy?.includes(authorId) ? "Unstar" : "Star"}</span>
+          <span>{starred ? "Unstar" : "Star"}</span>
         </button>
         <span className="message-menu-divider" />
         <button
@@ -10362,15 +10445,17 @@ function MessageBubble({
             <span>Download</span>
           </button>
         ) : null}
-        <span className="message-menu-divider" />
-        <button
-          className="message-menu-action-row"
-          type="button"
-          onClick={() => runActionAndClose(onReport)}
-        >
-          <Flag weight="bold" />
-          <span>Report</span>
-        </button>
+        {canReport || canDelete ? <span className="message-menu-divider" /> : null}
+        {canReport ? (
+          <button
+            className="message-menu-action-row"
+            type="button"
+            onClick={() => runActionAndClose(onReport)}
+          >
+            <Flag weight="bold" />
+            <span>Report</span>
+          </button>
+        ) : null}
         {canDelete ? (
           <button
             className="message-menu-action-row danger-menu-action"
@@ -10449,10 +10534,20 @@ function MessageBubble({
       <AnimatePresence>
         {actionMenuOpen ? (
           <motion.div
+            ref={actionMenuRef}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             className="message-action-menu"
             exit={{ opacity: 0, y: 4, scale: 0.96 }}
             initial={{ opacity: 0, y: 4, scale: 0.96 }}
+            style={
+              {
+                "--message-menu-max-height": actionMenuPlacement.maxHeight
+                  ? `${actionMenuPlacement.maxHeight}px`
+                  : "calc(100dvh - 16px)",
+                "--message-menu-shift-x": `${actionMenuPlacement.x}px`,
+                "--message-menu-shift-y": `${actionMenuPlacement.y}px`,
+              } as CSSProperties
+            }
             transition={{ duration: 0.14 }}
           >
             {renderQuickReactions()}
@@ -10524,10 +10619,10 @@ function MessageBubble({
                   <span>{message.aiNote}</span>
                 </div>
               ) : null}
-              {!isPending && (message.editedAt || message.starredBy?.includes(authorId)) ? (
+              {!isPending && (message.editedAt || starred) ? (
                 <div className="message-meta-flags">
                   {message.editedAt ? <span>edited</span> : null}
-                  {message.starredBy?.includes(authorId) ? (
+                  {starred ? (
                     <span>
                       <Star weight="fill" />
                       starred

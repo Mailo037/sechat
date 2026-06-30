@@ -2197,6 +2197,7 @@ body,
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   width: min(236px, calc(100vw - 24px));
+  max-height: var(--message-menu-max-height, calc(100dvh - 16px));
   box-sizing: border-box;
   justify-items: stretch;
   gap: 6px;
@@ -2205,7 +2206,13 @@ body,
   border-radius: 16px;
   background: rgba(20, 20, 22, 0.98);
   box-shadow: 0 14px 32px rgba(0, 0, 0, 0.42);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   transform-origin: bottom left;
+  translate: var(--message-menu-shift-x, 0) var(--message-menu-shift-y, 0);
+  scrollbar-color: rgba(161, 161, 170, 0.48) transparent;
+  scrollbar-width: thin;
   backdrop-filter: blur(18px) saturate(112%);
   -webkit-backdrop-filter: blur(18px) saturate(112%);
 }
@@ -2398,7 +2405,6 @@ body,
 .thread-suggestion-banner,
 .pinned-message-bar {
   display: flex;
-  width: min(720px, calc(100% - 24px));
   align-items: center;
   gap: 10px;
   margin: 8px auto 0;
@@ -2407,6 +2413,31 @@ body,
   border-radius: 14px;
   background: rgba(20, 20, 22, 0.92);
   color: #f4f4f5;
+}
+
+.room-announcement-banner {
+  width: fit-content;
+  min-width: 0;
+  max-width: min(430px, calc(100% - 24px));
+  min-height: 42px;
+  padding: 0 12px;
+  border-radius: 999px;
+}
+
+.thread-suggestion-banner,
+.pinned-message-bar {
+  width: min(720px, calc(100% - 24px));
+}
+
+.room-announcement-banner .inline-flex {
+  min-width: 0;
+  max-width: 86px;
+  height: 22px;
+  justify-content: center;
+  padding: 0 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chat-window > :is(.room-announcement-banner, .thread-suggestion-banner, .pinned-message-bar):first-child {

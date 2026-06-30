@@ -195,6 +195,7 @@ export async function saveRemoteUserPreferences(input: UserPreferences) {
       notifications: sanitizeNotificationSettings(input.notifications),
       profile: sanitizeProfile(input.profile),
       roomSettings: sanitizeRoomSettings(input.roomSettings),
+      starredMessageIds: sanitizeStringList(input.starredMessageIds, 500),
       trustedSites: sanitizeTrustedSites(input.trustedSites),
       updatedAt: serverTimestamp(),
       usernameClaim:
@@ -1180,6 +1181,7 @@ function toUserPreferences(data: DocumentData): UserPreferences | null {
     notifications,
     moderationSettings: toModerationSettings(data.moderationSettings),
     roomSettings: toRoomSettings(data.roomSettings),
+    starredMessageIds: sanitizeStringList(data.starredMessageIds, 500),
     trustedSites: sanitizeTrustedSites(data.trustedSites),
   }
 }
