@@ -3398,39 +3398,6 @@ function App() {
     playConfirmationSound("soft")
   }
 
-  function askMessageAi(message: ChatMessage) {
-    if (activeAdminBan) return
-    const note = createLocalAiNote(message)
-    updateLocalMessage(message.id, (current) => ({
-      ...current,
-      aiNote: note,
-    }))
-    setSpamWarning(note)
-    playConfirmationSound("done")
-  }
-
-  function forwardMessage(message: ChatMessage) {
-    if (activeAdminBan) return
-    const forwarded: ChatMessage = {
-      id: makeId("me"),
-      authorId,
-      authorName: profile.name,
-      usernameKey: usernameClaim?.key ?? profileUsernameKey,
-      avatar: profile.avatar,
-      body: message.body || messagePreview(message),
-      createdAt: Date.now(),
-      attachments: message.attachments,
-      audioDurationMs: message.audioDurationMs,
-      audioMimeType: message.audioMimeType,
-      audioUrl: message.audioUrl,
-      forwardedFrom: message.authorName,
-      messageType: message.messageType,
-      waveform: message.waveform,
-    }
-    setMessages((current) => [...current, forwarded])
-    playConfirmationSound("done")
-  }
-
   function reportMessage(message: ChatMessage) {
     if (activeAdminBan) return
     const reason = `Reported message from ${message.authorName || "User"}`
@@ -4379,7 +4346,11 @@ function App() {
       <TooltipLayer />
       <div
         aria-hidden={activeAdminBan}
-        className={cn("chat-shell", voiceChatOpen && !activeAdminBan && "voice-active")}
+        className={cn(
+          "chat-shell",
+          voiceChatOpen && !activeAdminBan && "voice-active",
+          shouldShowOnboarding && "onboarding-active"
+        )}
         inert={activeAdminBan ? true : undefined}
         style={chatShellStyle}
       >
@@ -4512,12 +4483,12 @@ function App() {
 
         <section className={cn("chat-window", roomSettings.compactMode && "compact-chat")} aria-label="Chat">
           {(roomSettings.topic || roomSettings.announcement) ? (
-            <div className="room-announcement-banner">
-              <div>
+            <div className="room-announcement-banner" aria-label="Room announcement">
+              <div className="room-announcement-copy">
                 <strong>{roomSettings.topic || "Main Chat"}</strong>
                 {roomSettings.announcement ? <span>{roomSettings.announcement}</span> : null}
               </div>
-              <Badge variant="outline">{roomSettings.role}</Badge>
+              <Badge className="room-announcement-role" variant="outline">{roomSettings.role}</Badge>
             </div>
           ) : null}
           {pinnedMessages.length > 0 ? (
@@ -4590,9 +4561,7 @@ function App() {
                     onOpenMedia={setMediaViewer}
                     onDeleteMessage={deleteMessageAsAdmin}
                     onEditMessage={openMessageEdit}
-                    onForwardMessage={forwardMessage}
                     onJumpToMessage={jumpToMessage}
-                    onAskAi={askMessageAi}
                     onPinMessage={toggleMessagePin}
                     onReportMessage={reportMessage}
                     onRetryMessage={retryFailedMessage}
@@ -4610,6 +4579,22 @@ function App() {
                 <div className="empty-chat-state" role="status">
                   <strong>{roomSettings.topic || "Main Chat"}</strong>
                   <span>No messages yet. Start the room from the composer below.</span>
+                  {hasUniqueUsername ? (
+                    <div className="empty-chat-hints" aria-label="Available chat tools">
+                      <span>
+                        <Paperclip weight="bold" />
+                        Attach
+                      </span>
+                      <span>
+                        <Microphone weight="bold" />
+                        Voice note
+                      </span>
+                      <span>
+                        <PhoneCall weight="bold" />
+                        Voice chat
+                      </span>
+                    </div>
+                  ) : null}
                 </div>
               )}
             </div>
@@ -6174,12 +6159,9 @@ function VoiceChatStage({
             {voiceError}
           </p>
         ) : null}
-        <div className="voice-utility-row">
-          <Button size="sm" type="button" variant="ghost" onClick={toggleCaptions}>
-            <At data-icon="inline-start" weight="duotone" />
-            {captionsEnabled ? "Captions on" : "Captions"}
-          </Button>
-          {adminUnlocked ? (
+
+        {adminUnlocked ? (
+          <div className="voice-utility-row">
             <Button
               disabled={!remoteEnabled || visibleVoiceParticipants.length <= 1}
               size="sm"
@@ -6190,8 +6172,9 @@ function VoiceChatStage({
               <PhoneDisconnect data-icon="inline-start" weight="duotone" />
               Move all out
             </Button>
-          ) : null}
-        </div>
+          </div>
+        ) : null}
+
         {voiceCaption ? (
           <div className="voice-caption-card" aria-live="polite">
             {voiceCaption}
@@ -6424,6 +6407,18 @@ function VoiceChatStage({
               ) : null}
             </AnimatePresence>
           </div>
+
+          <Button
+            aria-label={captionsEnabled ? "Turn captions off" : "Turn captions on"}
+            className={cn("voice-control-button captions", captionsEnabled && "active")}
+            data-tooltip={captionsEnabled ? "Captions on" : "Captions"}
+            size="icon-lg"
+            type="button"
+            variant="ghost"
+            onClick={toggleCaptions}
+          >
+            <At data-icon="inline-start" weight="duotone" />
+          </Button>
 
           {connected ? (
             <>
@@ -6823,28 +6818,6 @@ function OnboardingOverlay({
   onUsernameChange: (value: string) => void
 }) {
   const { cacheClearing, cacheStatus, clearBrowserCache } = useCacheClearAction()
-  const focusPoints = [
-    {
-      copy: "Reply, react, copy, download, and swipe messages on mobile.",
-      icon: ArrowBendUpLeft,
-      title: "Messages",
-    },
-    {
-      copy: "Attach images, GIFs, files, or record voice notes.",
-      icon: Paperclip,
-      title: "Media",
-    },
-    {
-      copy: "Use separate sounds for messages, replies, mentions, and buttons.",
-      icon: Bell,
-      title: "Alerts",
-    },
-    {
-      copy: "Open voice chat and keep the text chat beside it.",
-      icon: PhoneCall,
-      title: "Voice",
-    },
-  ]
 
   return (
     <motion.div
@@ -6857,45 +6830,19 @@ function OnboardingOverlay({
       <motion.section
         animate={{ opacity: 1, y: 0, scale: 1 }}
         aria-label="Chat onboarding"
+        aria-modal="true"
         className="onboarding-card"
         exit={{ opacity: 0, y: 10, scale: 0.98 }}
         initial={reduceMotion ? false : { opacity: 0, y: 14, scale: 0.98 }}
+        role="dialog"
         transition={{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }}
       >
         <div className="onboarding-title">
           <ShieldCheck weight="duotone" />
           <div>
-            <strong>Set up Sechat</strong>
-            <span>Pick a unique username before joining the room.</span>
+            <strong>Join Main Chat</strong>
+            <span>Pick a name. Everything else can wait.</span>
           </div>
-        </div>
-
-        <div className="auth-card">
-          <div>
-            <span className="setting-label">
-              <GlobeSimple weight="duotone" />
-              Google account
-            </span>
-            <p>
-              {authUser && !authUser.isAnonymous
-                ? authUser.email || authUser.displayName || "Google connected."
-                : "Optional. Use Google to keep the same identity across devices."}
-            </p>
-            {authError ? <small className="auth-error">{authError}</small> : null}
-          </div>
-          <Button
-            disabled={authBusy || !remoteEnabled || Boolean(authUser && !authUser.isAnonymous)}
-            size="sm"
-            type="button"
-            variant="outline"
-            onClick={() => void onGoogleSignIn()}
-          >
-            {authBusy
-              ? "Opening"
-              : authUser && !authUser.isAnonymous
-                ? "Connected"
-                : "Google"}
-          </Button>
         </div>
 
         <form
@@ -6924,40 +6871,55 @@ function OnboardingOverlay({
           </small>
         </form>
 
-        <div className="onboarding-cache-card">
-          <span className="setting-label">
-            <Broom weight="duotone" />
-            App cache
-          </span>
-          <Button
-            disabled={cacheClearing}
-            size="sm"
-            type="button"
-            variant="outline"
-            onClick={() => void clearBrowserCache()}
-          >
-            {cacheClearing ? "Clearing" : "Clear"}
-          </Button>
-          {cacheStatus ? (
-            <small className="onboarding-status" role="status">
-              {cacheStatus}
-            </small>
-          ) : null}
-        </div>
+        <div className="onboarding-secondary-actions">
+          <div className="auth-card">
+            <div>
+              <span className="setting-label">
+                <GlobeSimple weight="duotone" />
+                Google account
+              </span>
+              <p>
+                {authUser && !authUser.isAnonymous
+                  ? authUser.email || authUser.displayName || "Connected."
+                  : "Optional. Keep this identity on other devices."}
+              </p>
+              {authError ? <small className="auth-error">{authError}</small> : null}
+            </div>
+            <Button
+              disabled={authBusy || !remoteEnabled || Boolean(authUser && !authUser.isAnonymous)}
+              size="sm"
+              type="button"
+              variant="outline"
+              onClick={() => void onGoogleSignIn()}
+            >
+              {authBusy
+                ? "Opening"
+                : authUser && !authUser.isAnonymous
+                  ? "Connected"
+                  : "Google"}
+            </Button>
+          </div>
 
-        <div className="onboarding-focus-list">
-          {focusPoints.map((point) => {
-            const Icon = point.icon
-            return (
-              <div className="onboarding-focus-item" key={point.title}>
-                <Icon weight="duotone" />
-                <div>
-                  <strong>{point.title}</strong>
-                  <span>{point.copy}</span>
-                </div>
-              </div>
-            )
-          })}
+          <div className="onboarding-cache-card">
+            <span className="setting-label">
+              <Broom weight="duotone" />
+              App cache
+            </span>
+            <Button
+              disabled={cacheClearing}
+              size="sm"
+              type="button"
+              variant="outline"
+              onClick={() => void clearBrowserCache()}
+            >
+              {cacheClearing ? "Clearing" : "Clear"}
+            </Button>
+            {cacheStatus ? (
+              <small className="onboarding-status" role="status">
+                {cacheStatus}
+              </small>
+            ) : null}
+          </div>
         </div>
       </motion.section>
     </motion.div>
@@ -7233,20 +7195,22 @@ function TopLeftDock({
 
       <div className="dock">
         <div className="dock-buttons" aria-label="Chat controls">
-          <Button
-            aria-expanded={adminOpen}
-            aria-label={adminUnlocked ? "Admin panel" : "Admin unlock"}
-            className={cn("dock-button", adminOpen && "active")}
-            data-tooltip={adminUnlocked ? "Admin panel" : "Admin unlock"}
-            size="icon"
-            type="button"
-            variant="ghost"
-            onClick={toggleAdminPanel}
-          >
-            <span className="icon-motion">
-              <ShieldCheck data-icon="inline-start" weight="duotone" />
-            </span>
-          </Button>
+          {adminUnlocked ? (
+            <Button
+              aria-expanded={adminOpen}
+              aria-label="Admin panel"
+              className={cn("dock-button", adminOpen && "active")}
+              data-tooltip="Admin panel"
+              size="icon"
+              type="button"
+              variant="ghost"
+              onClick={toggleAdminPanel}
+            >
+              <span className="icon-motion">
+                <ShieldCheck data-icon="inline-start" weight="duotone" />
+              </span>
+            </Button>
+          ) : null}
           <Button
             aria-expanded={voiceChatOpen}
             aria-label={voiceChatOpen ? "Close voice chat" : "Open voice chat"}
@@ -7609,13 +7573,14 @@ function AdminGatePanel({
       ) : (
         <form className="admin-panel-form" onSubmit={submitAdminUnlock}>
           <div className="admin-panel-copy">
-            <strong>Enter WEB_PASSWORD.</strong>
-            <span>Moderation logs are hidden until this session is unlocked.</span>
+            <strong>Enter admin password.</strong>
+            <span>Moderation tools stay locked until this session is unlocked.</span>
           </div>
           <Input
             autoComplete="current-password"
             autoFocus
-            placeholder="WEB_PASSWORD"
+            aria-label="Admin password"
+            placeholder="Password"
             type="password"
             value={passwordDraft}
             onChange={(event) => onPasswordDraftChange(event.target.value)}
@@ -7677,8 +7642,8 @@ function AdminPanel({
   onWarnUser: (user: ModerationUser, reason?: string) => void
 }) {
   const [peopleExpanded, setPeopleExpanded] = useState(true)
-  const [logExpanded, setLogExpanded] = useState(true)
-  const [settingsExpanded, setSettingsExpanded] = useState(true)
+  const [logExpanded, setLogExpanded] = useState(false)
+  const [settingsExpanded, setSettingsExpanded] = useState(false)
 
   return (
     <div className="admin-panel-inner">
@@ -7699,18 +7664,22 @@ function AdminPanel({
         </Button>
       </div>
 
-      <div className="admin-stat-row">
+      <div className="admin-summary-grid" aria-label="Admin status summary">
         <span>
-          <ShieldCheck weight="duotone" />
-          Moderation actions
+          <strong>{moderationLog.length}</strong>
+          <small>Actions</small>
         </span>
-        <strong>{moderationLog.length}</strong>
-      </div>
-      <div className="admin-cache-diagnostics">
-        <strong>Client cache diagnostics</strong>
         <span>
-          {typeof window === "undefined" ? 0 : window.localStorage.length} local keys ·{" "}
-          {moderationUsers.length} known users
+          <strong>{moderationUsers.length}</strong>
+          <small>People</small>
+        </span>
+        <span>
+          <strong>{unread}</strong>
+          <small>Unread</small>
+        </span>
+        <span>
+          <strong>{remoteEnabled ? "Live" : "Local"}</strong>
+          <small>Sync</small>
         </span>
       </div>
 
@@ -8056,6 +8025,11 @@ function AdminUserModeration({
   ) => void | Promise<void>
   onWarnUser: (user: ModerationUser, reason?: string) => void
 }) {
+  const [pendingModeration, setPendingModeration] = useState<{
+    action: Extract<UserModerationState["action"], "ban" | "timeout">
+    userId: string
+  } | null>(null)
+
   return (
     <div className={cn("admin-user-panel", !expanded && "collapsed")}>
       <button
@@ -8087,6 +8061,10 @@ function AdminUserModeration({
                 {users.slice(0, 10).map((user) => {
                   const restriction = user.moderation
                   const restricted = Boolean(restriction)
+                  const pendingAction =
+                    pendingModeration?.userId === user.id
+                      ? pendingModeration.action
+                      : null
                   const restrictionLabel =
                     restriction?.action === "ban"
                       ? "Banned"
@@ -8158,32 +8136,61 @@ function AdminUserModeration({
                             >
                               <BellRinging data-icon="inline-start" weight="duotone" />
                             </Button>
-                            <Button
-                              aria-label={`Mute ${user.name} for 15 minutes`}
-                              data-tooltip="Mute for 15 minutes"
-                              disabled={user.isSelf}
-                              size="icon-sm"
-                              type="button"
-                              variant="ghost"
-                              onClick={() =>
-                                void onModerateUser(user, "timeout", moderationReason)
-                              }
-                            >
-                              <Clock data-icon="inline-start" weight="duotone" />
-                            </Button>
-                            <Button
-                              aria-label={`Ban ${user.name}`}
-                              data-tooltip="Ban"
-                              disabled={user.isSelf}
-                              size="icon-sm"
-                              type="button"
-                              variant="ghost"
-                              onClick={() =>
-                                void onModerateUser(user, "ban", moderationReason)
-                              }
-                            >
-                              <Prohibit data-icon="inline-start" weight="duotone" />
-                            </Button>
+                            {pendingAction ? (
+                              <span className="admin-user-confirm-actions" role="group" aria-label={`Confirm ${pendingAction === "ban" ? "ban" : "mute"} for ${user.name}`}>
+                                <Button
+                                  disabled={user.isSelf}
+                                  size="xs"
+                                  type="button"
+                                  variant={pendingAction === "ban" ? "destructive" : "outline"}
+                                  onClick={() => {
+                                    void onModerateUser(user, pendingAction, moderationReason)
+                                    setPendingModeration(null)
+                                  }}
+                                >
+                                  {pendingAction === "ban" ? "Ban" : "Mute"}
+                                </Button>
+                                <Button
+                                  aria-label="Cancel moderation action"
+                                  data-tooltip="Cancel"
+                                  size="icon-xs"
+                                  type="button"
+                                  variant="ghost"
+                                  onClick={() => setPendingModeration(null)}
+                                >
+                                  <X data-icon="inline-start" />
+                                </Button>
+                              </span>
+                            ) : (
+                              <>
+                                <Button
+                                  aria-label={`Mute ${user.name} for 15 minutes`}
+                                  data-tooltip="Mute for 15 minutes"
+                                  disabled={user.isSelf}
+                                  size="icon-sm"
+                                  type="button"
+                                  variant="ghost"
+                                  onClick={() =>
+                                    setPendingModeration({ action: "timeout", userId: user.id })
+                                  }
+                                >
+                                  <Clock data-icon="inline-start" weight="duotone" />
+                                </Button>
+                                <Button
+                                  aria-label={`Ban ${user.name}`}
+                                  data-tooltip="Ban"
+                                  disabled={user.isSelf}
+                                  size="icon-sm"
+                                  type="button"
+                                  variant="ghost"
+                                  onClick={() =>
+                                    setPendingModeration({ action: "ban", userId: user.id })
+                                  }
+                                >
+                                  <Prohibit data-icon="inline-start" weight="duotone" />
+                                </Button>
+                              </>
+                            )}
                           </>
                         )}
                       </div>
@@ -9672,12 +9679,12 @@ function TenorGifEmbeds({
           <div className="tenor-gif-frame-wrap">
             <iframe
               allowFullScreen
+              aria-label="Tenor GIF preview"
               className="tenor-gif-frame"
               loading="lazy"
               referrerPolicy="no-referrer-when-downgrade"
               sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
               src={preview.embedUrl}
-              title="Tenor GIF"
             />
           </div>
           <div className="tenor-gif-footer">
@@ -9779,11 +9786,9 @@ function MessageBlock({
   group,
   highlightedMessageId,
   mobileReplyGesture,
-  onAskAi,
   onDeleteMessage,
   onEditMessage,
   onExternalLink,
-  onForwardMessage,
   onJumpToMessage,
   onOpenMedia,
   onPinMessage,
@@ -9806,11 +9811,9 @@ function MessageBlock({
   group: MessageGroup
   highlightedMessageId: string | null
   mobileReplyGesture: boolean
-  onAskAi: (message: ChatMessage) => void
   onDeleteMessage: (message: ChatMessage) => void | Promise<void>
   onEditMessage: (message: ChatMessage) => void
   onExternalLink: (url: string, displayUrl: string) => void
-  onForwardMessage: (message: ChatMessage) => void
   onJumpToMessage: (messageId: string) => void
   onOpenMedia: (state: MediaViewerState) => void
   onPinMessage: (message: ChatMessage) => void
@@ -9908,11 +9911,9 @@ function MessageBlock({
               selected={selectedMessageIds.has(message.id)}
               starred={starredMessageIds.has(message.id)}
               translated={translatedMessageIds.has(message.id)}
-              onAskAi={() => onAskAi(message)}
               onDelete={() => void onDeleteMessage(message)}
               onEdit={() => onEditMessage(message)}
               onExternalLink={onExternalLink}
-              onForward={() => onForwardMessage(message)}
               onJumpToMessage={onJumpToMessage}
               onOpenMedia={onOpenMedia}
               onPin={() => onPinMessage(message)}
@@ -9942,11 +9943,9 @@ function MessageBubble({
   selected,
   starred,
   translated,
-  onAskAi,
   onDelete,
   onEdit,
   onExternalLink,
-  onForward,
   onJumpToMessage,
   onOpenMedia,
   onPin,
@@ -9971,11 +9970,9 @@ function MessageBubble({
   selected: boolean
   starred: boolean
   translated: boolean
-  onAskAi: () => void
   onDelete: () => void
   onEdit: () => void
   onExternalLink: (url: string, displayUrl: string) => void
-  onForward: () => void
   onJumpToMessage: (messageId: string) => void
   onOpenMedia: (state: MediaViewerState) => void
   onPin: () => void
@@ -10073,7 +10070,8 @@ function MessageBubble({
       const menu = actionMenuRef.current
       if (!menu) return
 
-      const padding = 8
+      const padding = 10
+      const viewportHeight = window.visualViewport?.height ?? window.innerHeight
       const rect = menu.getBoundingClientRect()
       let x = 0
       let y = 0
@@ -10087,9 +10085,15 @@ function MessageBubble({
       if (rect.top < padding) {
         y = padding - rect.top
       }
+      if (rect.bottom + y > viewportHeight - padding) {
+        y += viewportHeight - padding - (rect.bottom + y)
+      }
+      if (rect.top + y < padding) {
+        y += padding - (rect.top + y)
+      }
 
       setActionMenuPlacement({
-        maxHeight: Math.max(180, window.innerHeight - padding * 2),
+        maxHeight: Math.max(220, viewportHeight - padding * 2),
         x: Math.round(x),
         y: Math.round(y),
       })
@@ -10198,12 +10202,6 @@ function MessageBubble({
     setActionSheetOpen(false)
     setActionMenuOpen(false)
     setReactionMenuOpen(true)
-  }
-
-  function openFullActionSheet() {
-    setActionMenuOpen(false)
-    setReactionMenuOpen(false)
-    setActionSheetOpen(true)
   }
 
   function openActionMenu() {
@@ -10355,7 +10353,7 @@ function MessageBubble({
     )
   }
 
-  function renderActionRows(showFullMenuButton: boolean) {
+  function renderActionRows() {
     return (
       <div className="message-menu-actions">
         {canReply ? (
@@ -10380,14 +10378,6 @@ function MessageBubble({
             <span>Edit</span>
           </button>
         ) : null}
-        <button
-          className="message-menu-action-row"
-          type="button"
-          onClick={() => runActionAndClose(onForward)}
-        >
-          <ShareFat weight="bold" />
-          <span>Forward</span>
-        </button>
         {canPin ? (
           <button
             className={cn("message-menu-action-row", message.pinnedAt && "active")}
@@ -10398,14 +10388,6 @@ function MessageBubble({
             <span>{message.pinnedAt ? "Unpin" : "Pin"}</span>
           </button>
         ) : null}
-        <button
-          className="message-menu-action-row"
-          type="button"
-          onClick={() => runActionAndClose(onAskAi)}
-        >
-          <At weight="bold" />
-          <span>Ask AI</span>
-        </button>
         <button
           className={cn("message-menu-action-row", starred && "active")}
           type="button"
@@ -10465,19 +10447,6 @@ function MessageBubble({
             <Trash weight="bold" />
             <span>Delete</span>
           </button>
-        ) : null}
-        {showFullMenuButton ? (
-          <>
-            <span className="message-menu-divider" />
-            <button
-              className="message-menu-action-row full-menu-action"
-              type="button"
-              onClick={openFullActionSheet}
-            >
-              <ArrowSquareOut weight="bold" />
-              <span>Open full actions</span>
-            </button>
-          </>
         ) : null}
       </div>
     )
@@ -10551,7 +10520,7 @@ function MessageBubble({
             transition={{ duration: 0.14 }}
           >
             {renderQuickReactions()}
-            {renderActionRows(true)}
+            {renderActionRows()}
           </motion.div>
         ) : null}
       </AnimatePresence>
@@ -10585,6 +10554,7 @@ function MessageBubble({
                   progress={message.uploadProgress ?? 0}
                 />
               ) : quote ? (
+
                 <button
                   className="quote-button"
                   data-ignore-long-press="true"
@@ -10597,6 +10567,7 @@ function MessageBubble({
                   </strong>
                   <span>{messagePreview(quote)}</span>
                 </button>
+
               ) : null}
               {!isPending && message.messageType === "audio" && message.audioUrl ? (
                 <AudioMessage message={message} />
@@ -10652,6 +10623,7 @@ function MessageBubble({
           />
         ) : null}
       </div>
+
       <div className="message-actions">
         {canReact ? (
           <div className={cn("message-reaction-actions", reactionMenuOpen && "menu-open")}>
@@ -10751,6 +10723,7 @@ function MessageBubble({
           </Tooltip>
         ) : null}
       </div>
+
       <Modal
         ariaLabel="Message actions"
         className="message-action-sheet"
@@ -10763,7 +10736,7 @@ function MessageBubble({
             <span>{displayName}</span>
           </div>
           {renderQuickReactions("message-sheet-reactions")}
-          {renderActionRows(false)}
+          {renderActionRows()}
         </div>
       </Modal>
     </motion.div>
@@ -11230,18 +11203,6 @@ function messagePreview(message: ChatMessage) {
   if (!firstAttachment) return ""
 
   return firstAttachment.kind === "image" ? "Photo" : firstAttachment.name
-}
-
-function createLocalAiNote(message: ChatMessage) {
-  const preview = messagePreview(message)
-  if (!preview) return "AI note: media-only message, no text to summarize."
-
-  const words = preview.split(/\s+/).filter(Boolean)
-  const summary = words.slice(0, 18).join(" ")
-  const attachmentText = message.attachments?.length
-    ? ` Includes ${message.attachments.length} attachment${message.attachments.length === 1 ? "" : "s"}.`
-    : ""
-  return `AI note: ${summary}${words.length > 18 ? "..." : ""}.${attachmentText}`
 }
 
 function translateMessagePreview(body: string) {
