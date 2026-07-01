@@ -25,6 +25,7 @@ export function TopLeftDock({
   authBusy,
   authError,
   authUser,
+  blockedUsers,
   moderationLog,
   moderationSettings,
   moderationUsers,
@@ -45,6 +46,7 @@ export function TopLeftDock({
   voiceParticipantIds,
   onAvatarFile,
   onAdminUnlockedChange,
+  onBlockUserToggle,
   onBrowserToggle,
   onNotificationSettingsChange,
   onClearUserModeration,
@@ -74,6 +76,7 @@ export function TopLeftDock({
   authBusy: boolean
   authError: string | null
   authUser: FirebaseAuthUser | null
+  blockedUsers: ModerationUser[]
   moderationLog: SpamModerationLogEntry[]
   moderationSettings: ModerationSettings
   moderationUsers: ModerationUser[]
@@ -94,6 +97,7 @@ export function TopLeftDock({
   voiceParticipantIds: Set<string>
   onAvatarFile: (file: File | undefined) => void
   onAdminUnlockedChange: (unlocked: boolean) => void
+  onBlockUserToggle: (user: { id: string; name: string }) => void
   onBrowserToggle: (enabled: boolean) => void
   onNotificationSettingsChange: (
     settings:
@@ -556,6 +560,7 @@ export function TopLeftDock({
                   authBusy={authBusy}
                   authError={authError}
                   authUser={authUser}
+                  blockedUsers={blockedUsers}
                   profile={profile}
                   usernameBusy={usernameBusy}
                   usernameClaim={usernameClaim}
@@ -565,6 +570,7 @@ export function TopLeftDock({
                   onAvatarFile={onAvatarFile}
                   onGoogleSignIn={onGoogleSignIn}
                   onGoogleSignOut={onGoogleSignOut}
+                  onBlockUserToggle={onBlockUserToggle}
                   onProfileChange={onProfileChange}
                   onUsernameClaim={onUsernameClaim}
                   onUsernameDraftChange={onUsernameDraftChange}
@@ -1392,6 +1398,7 @@ export function ProfilePanel({
   authBusy,
   authError,
   authUser,
+  blockedUsers,
   profile,
   usernameBusy,
   usernameClaim,
@@ -1399,6 +1406,7 @@ export function ProfilePanel({
   usernameError,
   usernameReady,
   onAvatarFile,
+  onBlockUserToggle,
   onGoogleSignIn,
   onGoogleSignOut,
   onProfileChange,
@@ -1408,6 +1416,7 @@ export function ProfilePanel({
   authBusy: boolean
   authError: string | null
   authUser: FirebaseAuthUser | null
+  blockedUsers: ModerationUser[]
   profile: Profile
   usernameBusy: boolean
   usernameClaim: UsernameClaim | null
@@ -1415,6 +1424,7 @@ export function ProfilePanel({
   usernameError: string | null
   usernameReady: boolean
   onAvatarFile: (file: File | undefined) => void
+  onBlockUserToggle: (user: { id: string; name: string }) => void
   onGoogleSignIn: () => void | Promise<void>
   onGoogleSignOut: () => void | Promise<void>
   onProfileChange: (profile: Profile) => void
@@ -1515,6 +1525,39 @@ export function ProfilePanel({
         >
           {authBusy ? "Working" : googleConnected ? "Sign out" : "Google"}
         </Button>
+      </div>
+
+      <div className="profile-blocked-panel">
+        <div className="profile-blocked-head">
+          <span className="setting-label">
+            <Prohibit weight="duotone" />
+            Blocked users
+          </span>
+          <small>{blockedUsers.length}</small>
+        </div>
+        {blockedUsers.length > 0 ? (
+          <div className="profile-blocked-list">
+            {blockedUsers.map((user) => (
+              <div className="profile-blocked-row" key={user.id}>
+                <ChatAvatar name={user.name} size="sm" src={user.avatar} />
+                <span>
+                  <strong>{user.name}</strong>
+                  <small>Messages hidden</small>
+                </span>
+                <Button
+                  size="xs"
+                  type="button"
+                  variant="ghost"
+                  onClick={() => onBlockUserToggle(user)}
+                >
+                  Unblock
+                </Button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <small className="profile-blocked-empty">No blocked users.</small>
+        )}
       </div>
 
       {hasAvatar ? (

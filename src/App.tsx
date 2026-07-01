@@ -1,15 +1,15 @@
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { TooltipLayer } from "@/components/ui/tooltip"
-import { claimRemoteUsername, clearRemoteUserModeration, deleteRemoteMessage, listenToRemoteMessages, listenToRemoteModeration, listenToRemoteModerations, listenToRemoteUsers, loadRemoteUserPreferences, prepareRemoteChat, remoteChatAvailable, saveRemoteUserPreferences, sendRemoteMessage, sendRemoteReaction, setRemoteUserModeration } from "@/lib/firebase/chatRepository"
+import { claimRemoteUsername, clearRemoteUserModeration, deleteRemoteMessage, listenToRemoteMessages, listenToRemoteModeration, listenToRemoteModerations, listenToRemoteUsers, loadRemoteUserPreferences, prepareRemoteChat, remoteChatAvailable, saveRemoteUserPreferences, sendRemoteMessage, sendRemoteReaction, setRemoteMessagePin, setRemoteUserModeration } from "@/lib/firebase/chatRepository"
 import { listenToFirebaseAuth, signInWithGoogleAccount, signOutToAnonymousUser } from "@/lib/firebase/client"
 import type { FirebaseAuthUser } from "@/lib/firebase/client"
 import { getNotificationPermission, playNotificationSound, playUiSound, requestNotificationPermission, showBrowserNotification, unlockAudio } from "@/lib/notificationAudio"
 import { chatStateKeyForUserId, deleteChatState, loadChatState, LOCAL_CHAT_STATE_KEY, saveChatState } from "@/lib/storage"
 import { cn } from "@/lib/utils"
 import type { ChatMessage, ChatUser, MessageAttachment, ModerationSettings, ModerationUser, NotificationSettings, PersistedChatState, Profile, RoomSettings, SoundKind, SpamGuardState, SpamModerationLogEntry, UiSoundKind, UserModerationState, UsernameClaim, UserPreferences } from "@/types"
-import { Bell, BellRinging, BellSlash, Microphone, Paperclip, PhoneCall, PushPinSimple } from "@phosphor-icons/react"
-import { AnimatePresence, useReducedMotion } from "motion/react"
+import { Bell, BellRinging, BellSlash, CaretDown, Microphone, Paperclip, PhoneCall, PushPinSimple } from "@phosphor-icons/react"
+import { AnimatePresence, motion, useDragControls, useReducedMotion } from "motion/react"
 import { useEffect, useMemo, useRef, useState } from "react"
 import type { CSSProperties, ClipboardEvent as ReactClipboardEvent, DragEvent as ReactDragEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react"
 import { ADMIN_BAN_MS, ADMIN_TIMEOUT_MS, ATTACHMENT_LIMITS, CURRENT_DATA_VERSION, LEGACY_DEFAULT_NAME, MAX_ATTACHMENT_COUNT, MAX_RECORDING_MS, SPAM_BAN_MS, SPAM_BAN_TRIGGER_COUNT, SPAM_BURST_LIMIT, SPAM_BURST_WINDOW_MS, SPAM_DUPLICATE_WINDOW_MS, SPAM_FAST_SEND_MS, SPAM_STRIKE_RESET_MS, defaultModerationSettings, defaultNotifications, defaultProfile, defaultRoomSettings } from "@/components/chat/chat-constants"
@@ -55,6 +55,7 @@ function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [remoteUsers, setRemoteUsers] = useState<ChatUser[]>([])
   const [remoteModerations, setRemoteModerations] = useState<UserModerationState[]>([])
+  const [remoteMessagesReady, setRemoteMessagesReady] = useState(false)
   const [pendingMessages, setPendingMessages] = useState<ChatMessage[]>([])
   const [authorId, setAuthorId] = useState("me")
   const [draft, setDraft] = useState("")
@@ -83,6 +84,9 @@ function App() {
   const [starredMessageIds, setStarredMessageIds] = useState<Set<string>>(
     () => new Set()
   )
+  const [blockedUserIds, setBlockedUserIds] = useState<Set<string>>(
+    () => new Set()
+  )
   const [editTarget, setEditTarget] = useState<MessageEditState | null>(null)
   const [avatarCrop, setAvatarCrop] = useState<AvatarCropState | null>(null)
   const [draggedAttachmentId, setDraggedAttachmentId] = useState<string | null>(null)
@@ -103,6 +107,7 @@ function App() {
   const [permission, setPermission] = useState(getNotificationPermission())
   const [unread, setUnread] = useState(0)
   const [voiceChatOpen, setVoiceChatOpen] = useState(false)
+  const [mobileChatPopoverOpen, setMobileChatPopoverOpen] = useState(false)
   const [voiceChatWidth, setVoiceChatWidth] = useState(420)
   const [voiceStageHeight, setVoiceStageHeight] = useState(340)
   const [visibleMessageLimit, setVisibleMessageLimit] = useState(80)
@@ -140,6 +145,7 @@ function App() {
     ? chatStateKeyForUserId(googleUser.uid)
     : LOCAL_CHAT_STATE_KEY
   const mobileReplyGesture = useMediaQuery("(max-width: 720px)")
+  const mobileChatDragControls = useDragControls()
   const profileUsernameKey = usernameKeyFromName(profile.name)
   const remoteIdentityReady = !remoteEnabled || authorId !== "me"
   const hasUniqueUsername =
@@ -190,15 +196,25 @@ function App() {
     activeAdminRestriction?.action === "ban" &&
     activeAdminRestriction.bannedUntil > spamNow
   const shouldShowOnboarding = ready && remoteIdentityReady && !hasUniqueUsername
+  const unblockedMessages = useMemo(
+    () =>
+      blockedUserIds.size === 0
+        ? messages
+        : messages.filter(
+            (message) =>
+              message.authorId === authorId || !blockedUserIds.has(message.authorId)
+          ),
+    [authorId, blockedUserIds, messages]
+  )
 
   const replyTo = useMemo(
-    () => messages.find((message) => message.id === replyToId),
-    [messages, replyToId]
+    () => unblockedMessages.find((message) => message.id === replyToId),
+    [replyToId, unblockedMessages]
   )
 
   const allDisplayedMessages = useMemo(
-    () => (activeAdminBan ? [] : [...messages, ...pendingMessages]),
-    [activeAdminBan, messages, pendingMessages]
+    () => (activeAdminBan ? [] : [...unblockedMessages, ...pendingMessages]),
+    [activeAdminBan, pendingMessages, unblockedMessages]
   )
   const hiddenOlderMessageCount = Math.max(
     0,
@@ -214,20 +230,20 @@ function App() {
   )
   const pinnedMessages = useMemo(
     () =>
-      messages
+      unblockedMessages
         .filter((message) => message.pinnedAt)
         .toSorted((a, b) => (b.pinnedAt ?? 0) - (a.pinnedAt ?? 0))
         .slice(0, 4),
-    [messages]
+    [unblockedMessages]
   )
   const activeThreadMessages = useMemo(
     () =>
       threadPanelRootId
-        ? messages.filter(
+        ? unblockedMessages.filter(
             (message) => replyRootIdFor(messages, message.id) === threadPanelRootId
           )
         : [],
-    [messages, threadPanelRootId]
+    [messages, threadPanelRootId, unblockedMessages]
   )
 
   function jumpToMessage(messageId: string) {
@@ -403,6 +419,24 @@ function App() {
     usernameClaim,
   ])
 
+  const blockedUsers = useMemo(
+    () =>
+      Array.from(blockedUserIds)
+        .filter((id) => id !== authorId)
+        .map(
+          (id) =>
+            moderationUsers.find((user) => user.id === id) ?? {
+              avatar: "",
+              id,
+              isSelf: false,
+              lastSeenAt: 0,
+              messageCount: 0,
+              name: "Blocked user",
+            }
+        ),
+    [authorId, blockedUserIds, moderationUsers]
+  )
+
   const usernameByAuthorId = useMemo(() => {
     const usernames = new Map<string, string>()
     for (const user of remoteUsers) {
@@ -416,7 +450,10 @@ function App() {
 
     const query = mentionRange.query.toLowerCase()
     const people = moderationUsers
-      .filter((user) => user.id !== authorId && user.name.trim())
+      .filter(
+        (user) =>
+          user.id !== authorId && !blockedUserIds.has(user.id) && user.name.trim()
+      )
       .map((user) => {
         const mention = usernameByAuthorId.get(user.id) ?? usernameKeyFromName(user.name)
         return {
@@ -449,7 +486,14 @@ function App() {
         )
       })
       .slice(0, 6)
-  }, [adminUnlocked, authorId, mentionRange, moderationUsers, usernameByAuthorId])
+  }, [
+    adminUnlocked,
+    authorId,
+    blockedUserIds,
+    mentionRange,
+    moderationUsers,
+    usernameByAuthorId,
+  ])
 
   const stateForStorage = useMemo<PersistedChatState>(
     () => ({
@@ -460,6 +504,7 @@ function App() {
       moderationSettings,
       roomSettings,
       spamGuard,
+      blockedUserIds: Array.from(blockedUserIds),
       trustedSites,
       starredMessageIds: Array.from(starredMessageIds),
       messages,
@@ -471,6 +516,7 @@ function App() {
       moderationSettings,
       roomSettings,
       spamGuard,
+      blockedUserIds,
       trustedSites,
       starredMessageIds,
       messages,
@@ -493,6 +539,7 @@ function App() {
     setRoomSettings(next.roomSettings)
     setSpamGuard(nextSpamGuard)
     writeCachedSpamGuard(nextSpamGuard, storageKey)
+    setBlockedUserIds(new Set(next.blockedUserIds))
     setTrustedSites(next.trustedSites)
     setStarredMessageIds(new Set(next.starredMessageIds))
     setMessages(next.messages)
@@ -701,19 +748,26 @@ function App() {
   useEffect(() => {
     if (activeAdminBan) {
       setMessages([])
+      setRemoteMessagesReady(true)
       seenMessageIdsRef.current = new Set()
       seenMessagesReadyRef.current = false
       return
     }
 
-    if (!remoteEnabled || !remoteIdentityReady) return
+    if (!remoteEnabled || !remoteIdentityReady) {
+      setRemoteMessagesReady(true)
+      return
+    }
 
+    setRemoteMessagesReady(false)
     const unsubscribeMessages = listenToRemoteMessages(
       (nextMessages) => {
+        setRemoteMessagesReady(true)
         setMessages(nextMessages)
       },
       (error) => {
         console.warn("Remote chat listener failed", error)
+        setRemoteMessagesReady(true)
       }
     )
 
@@ -869,6 +923,15 @@ function App() {
   }, [profile.name, ready])
 
   useEffect(() => {
+    if (!replyToId || blockedUserIds.size === 0) return
+
+    const target = messages.find((message) => message.id === replyToId)
+    if (target && blockedUserIds.has(target.authorId)) {
+      setReplyToId(undefined)
+    }
+  }, [blockedUserIds, messages, replyToId])
+
+  useEffect(() => {
     scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
       behavior: reduceMotion ? "auto" : "smooth",
@@ -890,7 +953,8 @@ function App() {
       return true
     })
     const incomingMessages = unseenMessages.filter(
-      (message) => message.authorId !== authorId
+      (message) =>
+        message.authorId !== authorId && !blockedUserIds.has(message.authorId)
     )
 
     if (incomingMessages.length === 0) return
@@ -928,7 +992,15 @@ function App() {
         browserEnabled
       )
     })
-  }, [activeAdminBan, authorId, messages, notifications, profile.name, ready])
+  }, [
+    activeAdminBan,
+    authorId,
+    blockedUserIds,
+    messages,
+    notifications,
+    profile.name,
+    ready,
+  ])
 
   useEffect(() => {
     audioDraftRef.current = audioDraft
@@ -1637,13 +1709,31 @@ function App() {
     )
   }
 
-  function toggleMessagePin(message: ChatMessage) {
-    if (activeAdminBan) return
+  async function toggleMessagePin(message: ChatMessage) {
+    if (activeAdminBan || !adminUnlocked || message.id.startsWith("pending")) return
+
+    const previousPinnedAt = message.pinnedAt
+    const nextPinnedAt = previousPinnedAt ? undefined : Date.now()
     updateLocalMessage(message.id, (current) => ({
       ...current,
-      pinnedAt: current.pinnedAt ? undefined : Date.now(),
+      pinnedAt: nextPinnedAt,
     }))
     playConfirmationSound("soft")
+
+    if (!remoteEnabled) return
+
+    try {
+      await setRemoteMessagePin({
+        messageId: message.id,
+        pinnedAt: nextPinnedAt ?? null,
+      })
+    } catch (error) {
+      console.warn("Remote message pin failed", error)
+      updateLocalMessage(message.id, (current) => ({
+        ...current,
+        pinnedAt: previousPinnedAt,
+      }))
+    }
   }
 
   function toggleMessageStar(message: ChatMessage) {
@@ -1658,6 +1748,54 @@ function App() {
       return next
     })
     playConfirmationSound("pop")
+  }
+
+  function toggleUserBlock(user: { id: string; name: string }) {
+    if (!user.id || user.id === authorId) return
+
+    const wasBlocked = blockedUserIds.has(user.id)
+    setBlockedUserIds((current) => {
+      const next = new Set(current)
+      if (next.has(user.id)) {
+        next.delete(user.id)
+      } else {
+        next.add(user.id)
+      }
+      return next
+    })
+
+    if (!wasBlocked) {
+      setReplyToId((current) => {
+        const target = messages.find((message) => message.id === current)
+        return target?.authorId === user.id ? undefined : current
+      })
+      setSelectedMessageIds((current) => {
+        if (current.size === 0) return current
+        const blockedMessageIds = new Set(
+          messages
+            .filter((message) => message.authorId === user.id)
+            .map((message) => message.id)
+        )
+        const next = new Set(
+          Array.from(current).filter((messageId) => !blockedMessageIds.has(messageId))
+        )
+        return next.size === current.size ? current : next
+      })
+      setTranslatedMessageIds((current) => {
+        if (current.size === 0) return current
+        const blockedMessageIds = new Set(
+          messages
+            .filter((message) => message.authorId === user.id)
+            .map((message) => message.id)
+        )
+        const next = new Set(
+          Array.from(current).filter((messageId) => !blockedMessageIds.has(messageId))
+        )
+        return next.size === current.size ? current : next
+      })
+    }
+
+    playConfirmationSound(wasBlocked ? "soft" : "click")
   }
 
   function toggleMessageSelection(message: ChatMessage) {
@@ -2543,12 +2681,37 @@ function App() {
     roomSettings.archived
   const spamRemainingMs = Math.max(0, spamBannedUntil - spamNow)
   const composerError = recordingError ?? attachmentError ?? spamWarning
+  const roomAnnouncement = roomSettings.announcement.trim()
+  const waitingForRemoteMessages =
+    ready &&
+    remoteEnabled &&
+    remoteIdentityReady &&
+    !remoteMessagesReady &&
+    messages.length === 0
+  const mobileVoiceChatPopover =
+    voiceChatOpen && mobileReplyGesture && !activeAdminBan
   const chatShellStyle = voiceChatOpen
     ? ({
         "--voice-chat-width": `${voiceChatWidth}px`,
         "--voice-stage-height": `${voiceStageHeight}px`,
       } as CSSProperties)
     : undefined
+
+  useEffect(() => {
+    if (mobileVoiceChatPopover) return
+    setMobileChatPopoverOpen(false)
+  }, [mobileVoiceChatPopover])
+
+  useEffect(() => {
+    if (!mobileChatPopoverOpen) return
+
+    window.setTimeout(() => {
+      scrollRef.current?.scrollTo({
+        top: scrollRef.current.scrollHeight,
+        behavior: reduceMotion ? "auto" : "smooth",
+      })
+    }, reduceMotion ? 0 : 80)
+  }, [mobileChatPopoverOpen, reduceMotion])
 
   function toggleVoiceChat() {
     if (activeAdminBan) return
@@ -2560,11 +2723,42 @@ function App() {
 
     setPanel(null)
     setVoiceChatOpen((current) => !current)
+    setMobileChatPopoverOpen(false)
     playConfirmationSound("soft")
   }
 
   function closeVoiceChat() {
     setVoiceChatOpen(false)
+    setMobileChatPopoverOpen(false)
+  }
+
+  function toggleMobileChatPopover() {
+    if (!mobileVoiceChatPopover) return
+
+    const nextOpen = !mobileChatPopoverOpen
+    setMobileChatPopoverOpen(nextOpen)
+    if (nextOpen) {
+      setUnread(0)
+    }
+    playConfirmationSound("soft")
+  }
+
+  function closeMobileChatPopover() {
+    if (!mobileChatPopoverOpen) return
+
+    setMobileChatPopoverOpen(false)
+    playConfirmationSound("soft")
+  }
+
+  function handleMobileChatDragEnd(
+    _event: MouseEvent | TouchEvent | PointerEvent,
+    info: { offset: { y: number }; velocity: { y: number } }
+  ) {
+    if (!mobileVoiceChatPopover) return
+
+    if (info.offset.y > 76 || info.velocity.y > 560) {
+      closeMobileChatPopover()
+    }
   }
 
   function startVoiceChatResize(event: ReactPointerEvent<HTMLDivElement>) {
@@ -2650,18 +2844,22 @@ function App() {
               adminUnlocked={adminUnlocked}
               authorId={authorId}
               interactionLocked={activeAdminBan}
+              mobileChatOpen={mobileChatPopoverOpen}
               profile={profile}
               reduceMotion={Boolean(reduceMotion)}
               remoteEnabled={remoteEnabled}
+              showMobileChatToggle={mobileReplyGesture}
+              unreadCount={unread}
               usernameKey={usernameClaim?.key ?? profileUsernameKey}
               onClose={closeVoiceChat}
+              onMobileChatToggle={toggleMobileChatPopover}
               onParticipantsChange={setVoiceParticipantIds}
               onUiCue={playVoiceUiCue}
             />
           ) : null}
         </AnimatePresence>
 
-        {voiceChatOpen && !activeAdminBan ? (
+        {voiceChatOpen && !activeAdminBan && !mobileReplyGesture ? (
           <div
             aria-label="Resize voice chat"
             className="voice-chat-resizer"
@@ -2706,6 +2904,7 @@ function App() {
           authBusy={authBusy}
           authError={authError}
           authUser={authUser}
+          blockedUsers={blockedUsers}
           moderationLog={spamGuard.log ?? []}
           moderationSettings={moderationSettings}
           moderationUsers={moderationUsers}
@@ -2727,6 +2926,7 @@ function App() {
           onAvatarFile={updateAvatarFromFile}
           onAdminUnlockedChange={setAdminUnlocked}
           onBrowserToggle={updateBrowserNotifications}
+          onBlockUserToggle={toggleUserBlock}
           onNotificationSettingsChange={setNotifications}
           onClearUserModeration={clearUserModeration}
           onClose={() => setPanel(null)}
@@ -2771,12 +2971,78 @@ function App() {
           ) : null}
         </AnimatePresence>
 
-        <section className={cn("chat-window", roomSettings.compactMode && "compact-chat")} aria-label="Chat">
-          {(roomSettings.topic || roomSettings.announcement) ? (
+        <AnimatePresence>
+          {mobileVoiceChatPopover && mobileChatPopoverOpen ? (
+            <motion.button
+              animate={{ opacity: 1 }}
+              aria-label="Collapse chat"
+              className="voice-chat-popover-scrim"
+              exit={{ opacity: 0 }}
+              initial={reduceMotion ? false : { opacity: 0 }}
+              transition={{ duration: 0.16 }}
+              type="button"
+              onClick={closeMobileChatPopover}
+            />
+          ) : null}
+        </AnimatePresence>
+
+        <motion.section
+          animate={
+            mobileVoiceChatPopover
+              ? {
+                  opacity: mobileChatPopoverOpen ? 1 : 0,
+                  y: mobileChatPopoverOpen ? 0 : "calc(100% + 24px)",
+                }
+              : { opacity: 1, y: 0 }
+          }
+          aria-hidden={
+            mobileVoiceChatPopover && !mobileChatPopoverOpen ? true : undefined
+          }
+          aria-label={mobileVoiceChatPopover ? "Chat popover" : "Chat"}
+          className={cn(
+            "chat-window",
+            roomSettings.compactMode && "compact-chat",
+            mobileVoiceChatPopover && "voice-chat-popover",
+            mobileVoiceChatPopover && mobileChatPopoverOpen && "open"
+          )}
+          drag={mobileVoiceChatPopover && mobileChatPopoverOpen ? "y" : false}
+          dragConstraints={{ bottom: 160, top: 0 }}
+          dragControls={mobileChatDragControls}
+          dragElastic={0.14}
+          dragListener={false}
+          dragMomentum={false}
+          initial={false}
+          transition={{ duration: reduceMotion ? 0 : 0.18, ease: [0.2, 0.8, 0.2, 1] }}
+          onDragEnd={handleMobileChatDragEnd}
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && mobileVoiceChatPopover) {
+              closeMobileChatPopover()
+            }
+          }}
+        >
+          {mobileVoiceChatPopover ? (
+            <Button
+              aria-label="Collapse chat"
+              className="voice-chat-popover-handle"
+              data-tooltip="Pull down to close"
+              size="sm"
+              type="button"
+              variant="ghost"
+              onClick={closeMobileChatPopover}
+              onPointerDown={(event) => {
+                if (!mobileChatPopoverOpen) return
+                mobileChatDragControls.start(event)
+              }}
+            >
+              <span aria-hidden="true" />
+              <CaretDown weight="bold" />
+            </Button>
+          ) : null}
+          {roomAnnouncement ? (
             <div className="room-announcement-banner" aria-label="Room announcement">
               <div className="room-announcement-copy">
                 <strong>{roomSettings.topic || "Main Chat"}</strong>
-                {roomSettings.announcement ? <span>{roomSettings.announcement}</span> : null}
+                <span>{roomAnnouncement}</span>
               </div>
               <Badge className="room-announcement-role" variant="outline">{roomSettings.role}</Badge>
             </div>
@@ -2842,9 +3108,10 @@ function App() {
                     highlightedMessageId={highlightedMessageId}
                     mobileReplyGesture={mobileReplyGesture}
                     adminUnlocked={adminUnlocked}
+                    blocked={blockedUserIds.has(group.authorId)}
                     profile={profile}
                     quoteFor={(message) =>
-                      messages.find((item) => item.id === message.replyToId)
+                      unblockedMessages.find((item) => item.id === message.replyToId)
                     }
                     reducedData={roomSettings.reducedData}
                     onExternalLink={handleExternalLink}
@@ -2860,11 +3127,17 @@ function App() {
                     onSelectMessage={toggleMessageSelection}
                     onStarMessage={toggleMessageStar}
                     onTranslateMessage={toggleMessageTranslation}
+                    onUserBlockToggle={toggleUserBlock}
                     selectedMessageIds={selectedMessageIds}
                     starredMessageIds={starredMessageIds}
                     translatedMessageIds={translatedMessageIds}
                   />
                 ))
+              ) : waitingForRemoteMessages ? (
+                <div className="empty-chat-state" role="status">
+                  <strong>{roomSettings.topic || "Main Chat"}</strong>
+                  <span>Loading messages...</span>
+                </div>
               ) : (
                 <div className="empty-chat-state" role="status">
                   <strong>{roomSettings.topic || "Main Chat"}</strong>
@@ -2944,7 +3217,7 @@ function App() {
             onTextareaChange={updateDraftFromTextarea}
             onTextareaKeyDown={handleComposerKeyDown}
           />
-        </section>
+        </motion.section>
 
         <AnimatePresence>
           {pendingLink ? (

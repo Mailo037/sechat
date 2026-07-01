@@ -2,6 +2,7 @@ import {
   addDoc,
   collection,
   deleteDoc,
+  deleteField,
   doc,
   getDoc,
   getDocs,
@@ -12,6 +13,7 @@ import {
   runTransaction,
   serverTimestamp,
   setDoc,
+  updateDoc,
   where,
   type DocumentData,
   type Firestore,
@@ -191,6 +193,7 @@ export async function saveRemoteUserPreferences(input: UserPreferences) {
     doc(current.db, "users", user.uid),
     {
       clientUpdatedAt: Date.now(),
+      blockedUserIds: sanitizeStringList(input.blockedUserIds, 500),
       moderationSettings: sanitizeModerationSettings(input.moderationSettings),
       notifications: sanitizeNotificationSettings(input.notifications),
       profile: sanitizeProfile(input.profile),
@@ -226,8 +229,11 @@ export function listenToRemoteMessages(
   let currentMessages: ChatMessage[] = []
   let currentReactions: RemoteReaction[] = []
   let emitVersion = 0
+  let messagesReady = false
 
   function emitMessages() {
+    if (!messagesReady) return
+
     const version = ++emitVersion
     hydrateFirestoreFiles(
       withReactions(currentMessages, currentReactions),
@@ -245,6 +251,7 @@ export function listenToRemoteMessages(
   const unsubscribeMessages = onSnapshot(
     messagesQuery,
     (snapshot) => {
+      messagesReady = true
       currentMessages = snapshot.docs.map(toChatMessage)
       emitMessages()
     },
@@ -351,6 +358,25 @@ export async function sendRemoteMessage(input: SendRemoteMessageInput) {
   })
 
   return user.uid
+}
+
+export async function setRemoteMessagePin({
+  messageId,
+  pinnedAt,
+}: {
+  messageId: string
+  pinnedAt: number | null
+}) {
+  const current = getFirebaseServices()
+  const user = await ensureAnonymousUser()
+  if (!current || !user || !messageId || messageId.startsWith("pending")) {
+    throw new Error("Firebase is not configured")
+  }
+
+  const roomId = getFirebaseRoomId()
+  await updateDoc(doc(current.db, "rooms", roomId, "messages", messageId), {
+    pinnedAt: pinnedAt ?? deleteField(),
+  })
 }
 
 export async function sendRemoteReaction({
@@ -1135,6 +1161,7 @@ function toChatMessage(snapshot: QueryDocumentSnapshot<DocumentData>): ChatMessa
     audioDurationMs:
       typeof data.audioDurationMs === "number" ? data.audioDurationMs : undefined,
     attachments: normalizeAttachments(data.attachments),
+    pinnedAt: typeof data.pinnedAt === "number" ? data.pinnedAt : undefined,
     reactions: [],
     waveform: Array.isArray(data.waveform)
       ? data.waveform.filter((value): value is number => typeof value === "number")
@@ -1180,6 +1207,7 @@ function toUserPreferences(data: DocumentData): UserPreferences | null {
     profile,
     usernameClaim: toUsernameClaim(data.usernameClaim),
     notifications,
+    blockedUserIds: sanitizeStringList(data.blockedUserIds, 500),
     moderationSettings: toModerationSettings(data.moderationSettings),
     roomSettings: toRoomSettings(data.roomSettings),
     starredMessageIds: sanitizeStringList(data.starredMessageIds, 500),

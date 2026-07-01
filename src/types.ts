@@ -188,6 +188,7 @@ export type PersistedChatState = {
   moderationSettings: ModerationSettings
   roomSettings: RoomSettings
   spamGuard: SpamGuardState
+  blockedUserIds: string[]
   trustedSites: string[]
   starredMessageIds: string[]
   messages: ChatMessage[]
@@ -200,6 +201,7 @@ export type UserPreferences = {
   notifications: NotificationSettings
   moderationSettings: ModerationSettings
   roomSettings: RoomSettings
+  blockedUserIds: string[]
   trustedSites: string[]
   starredMessageIds: string[]
 }

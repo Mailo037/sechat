@@ -79,6 +79,20 @@ service cloud.firestore {
         && request.resource.data.waveform.size() <= 80;
     }
 
+    function validMessagePinUpdate() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "pinnedAt"
+        ])
+        && (
+          !request.resource.data.keys().hasAny(["pinnedAt"])
+          || (
+            request.resource.data.pinnedAt is number
+            && request.resource.data.pinnedAt > 0
+            && request.resource.data.pinnedAt <= request.time.toMillis()
+          )
+        );
+    }
+
     function validReactionPayload(roomId) {
       return request.resource.data.keys().hasOnly([
           "authorId",
@@ -300,6 +314,7 @@ service cloud.firestore {
     function validUserPreferencesPayload(userId) {
       return userId == request.auth.uid
         && request.resource.data.keys().hasOnly([
+          "blockedUserIds",
           "clientUpdatedAt",
           "moderationSettings",
           "notifications",
@@ -318,6 +333,8 @@ service cloud.firestore {
         && validPreferenceNotifications(request.resource.data.notifications)
         && validPreferenceRoomSettings(request.resource.data.roomSettings)
         && validPreferenceModerationSettings(request.resource.data.moderationSettings)
+        && request.resource.data.blockedUserIds is list
+        && request.resource.data.blockedUserIds.size() <= 500
         && request.resource.data.starredMessageIds is list
         && request.resource.data.starredMessageIds.size() <= 500
         && request.resource.data.trustedSites is list
@@ -426,7 +443,7 @@ service cloud.firestore {
       match /messages/{messageId} {
         allow read: if signedIn() && notBanned(roomId);
         allow create: if signedIn() && notModerated(roomId) && validMessagePayload(roomId);
-        allow update: if false;
+        allow update: if signedIn() && notModerated(roomId) && validMessagePinUpdate();
         allow delete: if signedIn();
       }
 

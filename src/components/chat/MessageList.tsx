@@ -1,8 +1,9 @@
+import { Button } from "@/components/ui/button"
 import { Modal } from "@/components/ui/modal"
 import { Tooltip } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 import type { ChatMessage, MessageAttachment, Profile } from "@/types"
-import { ArrowBendUpLeft, ArrowSquareOut, At, Check, CopySimple, DotsThreeVertical, DownloadSimple, File as FileIcon, Flag, GlobeSimple, LinkSimple, PencilSimple, Play, Plus, PushPinSimple, ShareFat, Smiley, Star, Trash } from "@phosphor-icons/react"
+import { ArrowBendUpLeft, ArrowSquareOut, At, Check, CopySimple, DotsThreeVertical, DownloadSimple, File as FileIcon, Flag, GlobeSimple, LinkSimple, PencilSimple, Play, Plus, PushPinSimple, ShareFat, Smiley, Star, Trash, UserCheck, UserMinus } from "@phosphor-icons/react"
 import { AnimatePresence, motion, useReducedMotion } from "motion/react"
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import type { CSSProperties, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react"
@@ -200,6 +201,7 @@ export function TenorGifEmbeds({
 export function MessageBlock({
   adminUnlocked,
   authorId,
+  blocked,
   group,
   highlightedMessageId,
   mobileReplyGesture,
@@ -216,6 +218,7 @@ export function MessageBlock({
   onSelectMessage,
   onStarMessage,
   onTranslateMessage,
+  onUserBlockToggle,
   profile,
   quoteFor,
   reducedData,
@@ -225,6 +228,7 @@ export function MessageBlock({
 }: {
   adminUnlocked: boolean
   authorId: string
+  blocked: boolean
   group: MessageGroup
   highlightedMessageId: string | null
   mobileReplyGesture: boolean
@@ -241,6 +245,7 @@ export function MessageBlock({
   onSelectMessage: (message: ChatMessage) => void
   onStarMessage: (message: ChatMessage) => void
   onTranslateMessage: (message: ChatMessage) => void
+  onUserBlockToggle: (user: { id: string; name: string }) => void
   profile: Profile
   quoteFor: (message: ChatMessage) => ChatMessage | undefined
   reducedData: boolean
@@ -256,6 +261,7 @@ export function MessageBlock({
   const own = firstMessage.authorId === authorId
   const displayName = own ? profile.name : firstMessage.authorName
   const avatar = own ? profile.avatar : firstMessage.avatar
+  const canBlockUser = !own && Boolean(firstMessage.authorId)
 
   return (
     <motion.article
@@ -280,6 +286,7 @@ export function MessageBlock({
         <div className="message-meta">
           <button
             aria-expanded={profileOpen}
+            aria-label={`Open ${displayName} profile`}
             className="message-author-button"
             type="button"
             onClick={() => setProfileOpen((current) => !current)}
@@ -297,17 +304,40 @@ export function MessageBlock({
               className="user-profile-popover"
               exit={{ opacity: 0, y: 4, scale: 0.98 }}
               initial={reduceMotion ? false : { opacity: 0, y: 4, scale: 0.98 }}
+              role="group"
+              aria-label={`${displayName} profile`}
               transition={{ duration: 0.15 }}
             >
               <ChatAvatar name={displayName} src={avatar} size="lg" />
-              <div>
+              <div className="user-profile-summary">
                 <strong>{displayName}</strong>
-                <span>{own ? profile.statusText || "You" : "Recent room participant"}</span>
+                <span>
+                  {own
+                    ? profile.statusText || "You"
+                    : blocked
+                      ? "Blocked locally"
+                      : "Recent room participant"}
+                </span>
                 <small>
                   Joined {formatTime(own ? profile.joinedAt ?? firstMessage.createdAt : firstMessage.createdAt)}
                   {" "}· last active {formatTime(group.messages.at(-1)?.createdAt ?? firstMessage.createdAt)}
                 </small>
               </div>
+              {canBlockUser ? (
+                <Button
+                  aria-pressed={blocked}
+                  className={cn("user-profile-block-button", blocked && "is-blocked")}
+                  size="sm"
+                  type="button"
+                  variant="ghost"
+                  onClick={() =>
+                    onUserBlockToggle({ id: firstMessage.authorId, name: displayName })
+                  }
+                >
+                  {blocked ? <UserCheck weight="bold" /> : <UserMinus weight="bold" />}
+                  <span>{blocked ? "Unblock" : "Block"}</span>
+                </Button>
+              ) : null}
             </motion.div>
           ) : null}
         </AnimatePresence>

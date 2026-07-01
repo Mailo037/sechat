@@ -2,7 +2,7 @@ import { Button } from "@/components/ui/button"
 import { deleteRemoteVoiceSignalsForUser, kickRemoteVoiceParticipant, listenToRemoteVoiceKick, listenToRemoteVoiceParticipants, listenToRemoteVoiceSignals, removeRemoteVoicePresence, sendRemoteVoiceSignal, setRemoteVoicePresence } from "@/lib/firebase/chatRepository"
 import { cn } from "@/lib/utils"
 import type { Profile, UiSoundKind, VoiceParticipantState, VoiceSignal } from "@/types"
-import { At, CaretUp, Check, Microphone, MicrophoneSlash, PhoneCall, PhoneDisconnect, SpeakerHigh, SpeakerSlash, VideoCamera, VideoCameraSlash, X } from "@phosphor-icons/react"
+import { At, CaretUp, ChatCircleText, Check, Microphone, MicrophoneSlash, PhoneCall, PhoneDisconnect, SpeakerHigh, SpeakerSlash, VideoCamera, VideoCameraSlash, WarningCircle, X } from "@phosphor-icons/react"
 import { AnimatePresence, motion } from "motion/react"
 import { useEffect, useMemo, useRef, useState } from "react"
 import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react"
@@ -31,10 +31,14 @@ export function VoiceChatStage({
   adminUnlocked,
   authorId,
   interactionLocked,
+  mobileChatOpen,
   profile,
   reduceMotion,
   remoteEnabled,
+  showMobileChatToggle,
+  unreadCount,
   usernameKey,
+  onMobileChatToggle,
   onClose,
   onParticipantsChange,
   onUiCue,
@@ -42,10 +46,14 @@ export function VoiceChatStage({
   adminUnlocked: boolean
   authorId: string
   interactionLocked: boolean
+  mobileChatOpen: boolean
   profile: Profile
   reduceMotion: boolean
   remoteEnabled: boolean
+  showMobileChatToggle: boolean
+  unreadCount: number
   usernameKey: string
+  onMobileChatToggle: () => void
   onClose: () => void
   onParticipantsChange: (participants: Set<string>) => void
   onUiCue: (kind: UiSoundKind) => void
@@ -1018,7 +1026,7 @@ export function VoiceChatStage({
       if (isPermissionDeniedError(error)) {
         voicePresenceForcePendingRef.current = false
         stopVoicePresenceHeartbeat()
-        setVoiceError("Could not sync voice presence. Reserve your username and rejoin voice.")
+        setVoiceError("Voice presence can't sync yet. Save a username, then rejoin voice.")
         return
       }
       voicePresenceForcePendingRef.current = true
@@ -1500,9 +1508,10 @@ export function VoiceChatStage({
         )}
       >
         {voiceError ? (
-          <p className="voice-stage-error" role="status">
-            {voiceError}
-          </p>
+          <div className="voice-stage-error" role="alert">
+            <WarningCircle weight="duotone" />
+            <span>{voiceError}</span>
+          </div>
         ) : null}
 
         {adminUnlocked ? (
@@ -1563,7 +1572,7 @@ export function VoiceChatStage({
               />
             ))}
           </div>
-        ) : (
+        ) : voiceError ? null : (
           <div className="voice-empty-state" role="status">
             <Microphone weight="duotone" />
             <strong>{connected ? "Voice is connecting" : "Voice is ready"}</strong>
@@ -1654,6 +1663,36 @@ export function VoiceChatStage({
         </AnimatePresence>
 
         <div className="voice-stage-controls">
+          {showMobileChatToggle ? (
+            <Button
+              aria-expanded={mobileChatOpen}
+              aria-label={
+                mobileChatOpen
+                  ? "Collapse chat"
+                  : unreadCount > 0
+                    ? `Open chat, ${unreadCount} unread`
+                    : "Open chat"
+              }
+              className={cn(
+                "voice-control-button chat-toggle",
+                mobileChatOpen && "active",
+                unreadCount > 0 && "has-unread"
+              )}
+              data-tooltip={mobileChatOpen ? "Collapse chat" : "Open chat"}
+              size="icon-lg"
+              type="button"
+              variant="ghost"
+              onClick={onMobileChatToggle}
+            >
+              <ChatCircleText data-icon="inline-start" weight="duotone" />
+              {unreadCount > 0 ? (
+                <span className="voice-chat-unread-count">
+                  {unreadCount > 9 ? "9+" : unreadCount}
+                </span>
+              ) : null}
+            </Button>
+          ) : null}
+
           <div className="voice-device-control">
             {connected ? (
               <Button

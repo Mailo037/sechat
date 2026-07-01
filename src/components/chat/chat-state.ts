@@ -87,6 +87,7 @@ export function createInitialState(): PersistedChatState {
     moderationSettings: defaultModerationSettings,
     roomSettings: defaultRoomSettings,
     spamGuard: defaultSpamGuard,
+    blockedUserIds: [],
     trustedSites: [],
     starredMessageIds: [],
     messages: [],
@@ -108,6 +109,7 @@ export function normalizeStoredState(stored: PersistedChatState | undefined) {
       moderationSettings: normalizeModerationSettings(stored.moderationSettings),
       roomSettings: normalizeRoomSettings(stored.roomSettings),
       spamGuard: normalizeSpamGuard(stored.spamGuard),
+      blockedUserIds: normalizeBlockedUserIds(stored.blockedUserIds),
       trustedSites: normalizeTrustedSites(stored.trustedSites),
       starredMessageIds: normalizeStarredMessageIds(stored.starredMessageIds),
     }
@@ -124,6 +126,7 @@ export function normalizeStoredState(stored: PersistedChatState | undefined) {
     moderationSettings: normalizeModerationSettings(stored.moderationSettings),
     roomSettings: normalizeRoomSettings(stored.roomSettings),
     spamGuard: normalizeSpamGuard(stored.spamGuard),
+    blockedUserIds: normalizeBlockedUserIds(stored.blockedUserIds),
     trustedSites: normalizeTrustedSites(stored.trustedSites),
     starredMessageIds: normalizeStarredMessageIds(stored.starredMessageIds),
     messages: stored.messages.filter((message) => !isLegacyMessage(message)),
@@ -138,6 +141,7 @@ export function preferencesFromState(state: PersistedChatState): UserPreferences
     notifications: state.notifications,
     moderationSettings: state.moderationSettings,
     roomSettings: state.roomSettings,
+    blockedUserIds: state.blockedUserIds,
     trustedSites: state.trustedSites,
     starredMessageIds: state.starredMessageIds,
   }
@@ -162,6 +166,7 @@ export function stateWithPreferences(
     notifications: normalized.notifications,
     moderationSettings: normalized.moderationSettings,
     roomSettings: normalized.roomSettings,
+    blockedUserIds: normalized.blockedUserIds,
     trustedSites: normalized.trustedSites,
     starredMessageIds: normalized.starredMessageIds,
   }
@@ -351,6 +356,19 @@ export function normalizeTrustedSites(value: unknown) {
         .filter(Boolean)
     )
   )
+}
+
+export function normalizeBlockedUserIds(value: unknown) {
+  if (!Array.isArray(value)) return []
+
+  return Array.from(
+    new Set(
+      value
+        .filter((id): id is string => typeof id === "string")
+        .map((id) => id.trim())
+        .filter(Boolean)
+    )
+  ).slice(0, 500)
 }
 
 export function normalizeStarredMessageIds(value: unknown) {
