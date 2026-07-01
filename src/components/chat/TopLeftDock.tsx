@@ -16,7 +16,7 @@ import { formatRemainingTime, formatTime, moderationActionLabel } from "@/compon
 import { cleanUsernameDisplayName, configuredAdminPassword, useCacheClearAction, writeAdminUnlocked } from "@/components/chat/chat-state"
 import type { Panel } from "@/components/chat/chat-types"
 import { ChatAvatar } from "@/components/chat/ChatAvatar"
-import { exportModerationLog } from "@/components/chat/media-utils"
+import { compressProfileImageFileToDataUrl, exportModerationLog } from "@/components/chat/media-utils"
 
 export function TopLeftDock({
   activePanel,
@@ -1484,12 +1484,11 @@ export function ProfilePanel({
     if (!profileCustomizationEnabled) return
     if (!file || !file.type.startsWith("image/")) return
 
-    const reader = new FileReader()
-    reader.onload = () => {
-      if (typeof reader.result !== "string") return
-      onProfileChange({ ...profile, banner: reader.result })
-    }
-    reader.readAsDataURL(file)
+    compressProfileImageFileToDataUrl(file)
+      .then((banner) => onProfileChange({ ...profile, banner }))
+      .catch((error) => {
+        console.warn("Profile banner compression failed", error)
+      })
   }
 
   function handleBannerUploadKeyDown(event: ReactKeyboardEvent<HTMLLabelElement>) {

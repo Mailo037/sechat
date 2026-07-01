@@ -2865,7 +2865,6 @@ function App() {
     <main className="chat-app">
       <TooltipLayer />
       <div
-        aria-hidden={activeAdminBan}
         className={cn(
           "chat-shell",
           voiceChatOpen && !activeAdminBan && "voice-active",
@@ -3031,9 +3030,6 @@ function App() {
                 }
               : { opacity: 1, y: 0 }
           }
-          aria-hidden={
-            mobileVoiceChatPopover && !mobileChatPopoverOpen ? true : undefined
-          }
           aria-label={mobileVoiceChatPopover ? "Chat popover" : "Chat"}
           className={cn(
             "chat-window",
@@ -3047,6 +3043,9 @@ function App() {
           dragElastic={0.14}
           dragListener={false}
           dragMomentum={false}
+          inert={
+            mobileVoiceChatPopover && !mobileChatPopoverOpen ? true : undefined
+          }
           initial={false}
           transition={{ duration: reduceMotion ? 0 : 0.18, ease: [0.2, 0.8, 0.2, 1] }}
           onDragEnd={handleMobileChatDragEnd}

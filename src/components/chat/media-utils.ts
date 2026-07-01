@@ -273,6 +273,47 @@ export async function compressImageFileToDataUrl(file: File, quality: number) {
   }
 }
 
+export async function compressProfileImageFileToDataUrl(
+  file: File,
+  {
+    maxSide = 1400,
+    quality = 0.78,
+  }: {
+    maxSide?: number
+    quality?: number
+  } = {}
+) {
+  if (typeof document === "undefined" || !file.type.startsWith("image/")) {
+    return fileToDataUrl(file)
+  }
+
+  const sourceUrl = URL.createObjectURL(file)
+  try {
+    const image = new Image()
+    image.decoding = "async"
+    const loaded = new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve()
+      image.onerror = () => reject(new Error("Profile image compression failed"))
+    })
+    image.src = sourceUrl
+    await loaded
+
+    const scale = Math.min(1, maxSide / Math.max(image.naturalWidth, image.naturalHeight))
+    const canvas = document.createElement("canvas")
+    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale))
+    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale))
+    const context = canvas.getContext("2d")
+    if (!context) return fileToDataUrl(file)
+
+    context.drawImage(image, 0, 0, canvas.width, canvas.height)
+    return canvasToDataUrl(canvas, "image/webp", quality)
+  } catch {
+    return fileToDataUrl(file)
+  } finally {
+    URL.revokeObjectURL(sourceUrl)
+  }
+}
+
 export async function cropAvatarDataUrl(dataUrl: string, zoom: number) {
   const image = new Image()
   image.decoding = "async"

@@ -89,6 +89,8 @@ const REMOTE_UPLOAD_LIMITS = {
 const USERNAME_STALE_TAKEOVER_MS = 24 * 60 * 60 * 1000
 type RemoteUploadKind = keyof typeof REMOTE_UPLOAD_LIMITS
 const FIRESTORE_FILE_PREFIX = "firestore-file:"
+const REMOTE_PROFILE_IMAGE_CHAR_LIMIT = 320_000
+const REMOTE_PROFILE_URL_CHAR_LIMIT = 4096
 const ALLOWED_ATTACHMENT_MIME_TYPES = new Set([
   "application/pdf",
   "application/zip",
@@ -430,6 +432,12 @@ export async function sendRemoteMessage(input: SendRemoteMessageInput) {
         .filter((value): value is number => typeof value === "number")
         .map((value) => Number(value.toFixed(3)))
     : []
+  const remoteAvatar = profileCustomizationEnabled
+    ? sanitizeRemoteProfileImage(input.avatar)
+    : ""
+  const remoteBanner = profileCustomizationEnabled
+    ? sanitizeRemoteProfileImage(input.banner)
+    : ""
 
   await addDoc(messagesRef, {
     accentColor:
@@ -441,13 +449,8 @@ export async function sendRemoteMessage(input: SendRemoteMessageInput) {
     authorId: user.uid,
     authorName: input.authorName.trim() || "You",
     authorIsAnonymous: user.isAnonymous,
-    avatar: profileCustomizationEnabled ? input.avatar ?? "" : "",
-    banner:
-      profileCustomizationEnabled &&
-      typeof input.banner === "string" &&
-      input.banner.length <= 800000
-        ? input.banner
-        : "",
+    avatar: remoteAvatar,
+    banner: remoteBanner,
     audioDurationMs: input.audioDurationMs ?? 0,
     audioMimeType: input.audioMimeType ?? "",
     audioUrl: remoteAudioUrl ?? "",
@@ -680,7 +683,7 @@ export async function setRemoteVoicePresence(input: {
     doc(current.db, "rooms", roomId, "voiceParticipants", user.uid),
     {
       authorId: user.uid,
-      avatar: user.isAnonymous ? "" : input.avatar ?? "",
+      avatar: user.isAnonymous ? "" : sanitizeRemoteProfileImage(input.avatar),
       cameraOn: input.cameraOn === true,
       clientUpdatedAt: now,
       isAnonymous: user.isAnonymous,
@@ -868,6 +871,27 @@ function normalizeWaveform(value: unknown) {
 
 function cleanUsernameDisplayName(displayName: string) {
   return displayName.trim().replace(/\s+/g, " ").slice(0, 40)
+}
+
+function sanitizeRemoteProfileImage(value: string | undefined) {
+  if (typeof value !== "string") return ""
+
+  const image = value.trim()
+  if (!image) return ""
+
+  if (image.startsWith("data:image/")) {
+    return image.length <= REMOTE_PROFILE_IMAGE_CHAR_LIMIT ? image : ""
+  }
+
+  if (
+    image.startsWith("https://") ||
+    image.startsWith("http://") ||
+    image.startsWith(FIRESTORE_FILE_PREFIX)
+  ) {
+    return image.slice(0, REMOTE_PROFILE_URL_CHAR_LIMIT)
+  }
+
+  return image.length <= REMOTE_PROFILE_IMAGE_CHAR_LIMIT ? image : ""
 }
 
 function usernameKeyFromDisplayName(displayName: string) {
@@ -1423,8 +1447,8 @@ function toNotificationSettings(value: unknown) {
 function sanitizeProfile(profile: UserPreferences["profile"]) {
   return {
     name: cleanUsernameDisplayName(profile.name) || "You",
-    avatar: profile.avatar.slice(0, 800000),
-    banner: profile.banner.slice(0, 800000),
+    avatar: sanitizeRemoteProfileImage(profile.avatar),
+    banner: sanitizeRemoteProfileImage(profile.banner),
     accentColor:
       profile.accentColor && /^#[0-9a-f]{6}$/i.test(profile.accentColor)
         ? profile.accentColor
