@@ -14,7 +14,18 @@ import type { MediaViewerState, MessageGroup, TenorGifPreview } from "@/componen
 import { ChatAvatar } from "@/components/chat/ChatAvatar"
 import { downloadAttachment, downloadItems, getMessageDownloads, isAudioAttachment, isGifAttachment, isVideoAttachment } from "@/components/chat/media-utils"
 import { StorageSafeVideo } from "@/components/chat/MediaElements"
-import { getTenorGifPreviews, hasReaction, messageElementId, messageLinkFor, messagePreview, renderRichText, shouldIgnoreLongPress, summarizeReactions, textWithoutTenorLinks, translateMessagePreview } from "@/components/chat/message-utils"
+import { getTenorGifPreviews, hasReaction, messageElementId, messageLinkFor, messagePreview, renderRichText, resolveMessageTranslation, shouldIgnoreLongPress, summarizeReactions, textWithoutTenorLinks } from "@/components/chat/message-utils"
+import type { MessageTranslationResult } from "@/components/chat/message-utils"
+
+type MessageTranslationViewState =
+  | {
+      status: "idle"
+    }
+  | {
+      message: string
+      status: "loading"
+    }
+  | MessageTranslationResult
 
 export function MessageAttachments({
   attachments,
@@ -527,11 +538,14 @@ export function MessageBubble({
   const [actionFeedback, setActionFeedback] = useState<
     "reply" | "copy" | "download" | "reaction" | "delete" | "link" | null
   >(null)
+  const [translationState, setTranslationState] =
+    useState<MessageTranslationViewState>({ status: "idle" })
   const [reactionMenuOpen, setReactionMenuOpen] = useState(false)
   const [swipeIntent, setSwipeIntent] = useState<"reply" | "copy" | null>(null)
   const [swipeProgress, setSwipeProgress] = useState(0)
   const bubbleLineRef = useRef<HTMLDivElement | null>(null)
   const actionMenuRef = useRef<HTMLDivElement | null>(null)
+  const translationRequestRef = useRef(0)
   const longPressTimeoutRef = useRef<number | null>(null)
   const actionFeedbackTimeoutRef = useRef<number | null>(null)
   const longPressStartRef = useRef<{ x: number; y: number } | null>(null)
@@ -564,10 +578,16 @@ export function MessageBubble({
 
   useEffect(() => {
     return () => {
+      translationRequestRef.current += 1
       clearLongPressTimer()
       clearActionFeedbackTimer()
     }
   }, [])
+
+  useEffect(() => {
+    translationRequestRef.current += 1
+    setTranslationState({ status: "idle" })
+  }, [message.body, message.id])
 
   useEffect(() => {
     if (!actionMenuOpen && !reactionMenuOpen) return
@@ -697,6 +717,33 @@ export function MessageBubble({
     copyMessage()
     setActionSheetOpen(false)
     setActionMenuOpen(false)
+  }
+
+  async function translateAndCloseMenu() {
+    if (!canCopy) return
+
+    if (translated || translationState.status !== "idle") {
+      onTranslate()
+      setActionSheetOpen(false)
+      setActionMenuOpen(false)
+      setReactionMenuOpen(false)
+      return
+    }
+
+    const requestId = translationRequestRef.current + 1
+    translationRequestRef.current = requestId
+    setTranslationState({
+      message: "Translating...",
+      status: "loading",
+    })
+    onTranslate()
+    setActionSheetOpen(false)
+    setActionMenuOpen(false)
+    setReactionMenuOpen(false)
+
+    const result = await resolveMessageTranslation(message.body)
+    if (translationRequestRef.current !== requestId) return
+    setTranslationState(result)
   }
 
   function replyAndCloseMenu() {
@@ -943,7 +990,9 @@ export function MessageBubble({
           <button
             className={cn("message-menu-action-row", translated && "active")}
             type="button"
-            onClick={() => runActionAndClose(onTranslate)}
+            onClick={() => {
+              void translateAndCloseMenu()
+            }}
           >
             <GlobeSimple weight="bold" />
             <span>{translated ? "Hide translation" : "Translate"}</span>
@@ -1133,9 +1182,13 @@ export function MessageBubble({
                     {renderRichText(message.body, profile.name, onExternalLink)}
                   </p>
                   {translated ? (
-                    <div className="message-translation">
+                    <div
+                      aria-live="polite"
+                      className="message-translation"
+                      role={translationState.status === "loading" ? "status" : undefined}
+                    >
                       <GlobeSimple weight="bold" />
-                      <span>{translateMessagePreview(message.body)}</span>
+                      <span>{messageTranslationText(translationState)}</span>
                     </div>
                   ) : null}
                 </>
@@ -1297,6 +1350,19 @@ export function MessageBubble({
       </Modal>
     </motion.div>
   )
+}
+
+function messageTranslationText(state: MessageTranslationViewState) {
+  switch (state.status) {
+    case "ready":
+      return state.text
+    case "loading":
+    case "unavailable":
+    case "error":
+      return state.message
+    case "idle":
+      return "Preparing translation..."
+  }
 }
 
 export function PendingMessageSkeleton({

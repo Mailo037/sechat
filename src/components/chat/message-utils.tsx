@@ -134,6 +134,61 @@ export function messagePreview(message: ChatMessage) {
   return firstAttachment.kind === "image" ? "Photo" : firstAttachment.name
 }
 
+export type MessageTranslationResult =
+  | {
+      status: "ready"
+      text: string
+    }
+  | {
+      message: string
+      status: "unavailable" | "error"
+    }
+
+type BrowserTranslationAvailability =
+  | "available"
+  | "downloadable"
+  | "downloading"
+  | "unavailable"
+
+type BrowserTranslationOptions = {
+  sourceLanguage: string
+  targetLanguage: string
+}
+
+type BrowserTranslator = {
+  destroy?: () => void
+  translate: (input: string) => Promise<string>
+}
+
+type BrowserTranslatorApi = {
+  availability?: (
+    options: BrowserTranslationOptions
+  ) => Promise<BrowserTranslationAvailability>
+  create: (options: BrowserTranslationOptions) => Promise<BrowserTranslator>
+}
+
+type BrowserLanguageDetectionResult = {
+  confidence: number
+  detectedLanguage: string
+}
+
+type BrowserLanguageDetector = {
+  destroy?: () => void
+  detect: (input: string) => Promise<BrowserLanguageDetectionResult[]>
+}
+
+type BrowserLanguageDetectorApi = {
+  availability?: () => Promise<BrowserTranslationAvailability>
+  create: () => Promise<BrowserLanguageDetector>
+}
+
+type BrowserTranslationScope = typeof globalThis & {
+  LanguageDetector?: BrowserLanguageDetectorApi
+  Translator?: BrowserTranslatorApi
+}
+
+const MESSAGE_TRANSLATION_TARGET_LANGUAGE = "en"
+
 export function translateMessagePreview(body: string) {
   const dictionary: Array<[RegExp, string]> = [
     [/\bhallo\b/gi, "hello"],
@@ -154,9 +209,156 @@ export function translateMessagePreview(body: string) {
     (current, [pattern, replacement]) => current.replace(pattern, replacement),
     body
   )
-  return translated === body
-    ? "Translation preview: no offline dictionary match. Original text is shown below."
-    : translated
+  return translated === body ? null : translated
+}
+
+export async function resolveMessageTranslation(
+  body: string
+): Promise<MessageTranslationResult> {
+  const text = body.trim()
+  const offlineTranslation = translateMessagePreview(body)
+  if (!text) {
+    return {
+      message: "No text to translate.",
+      status: "unavailable",
+    }
+  }
+
+  try {
+    const sourceLanguage = browserTranslationSupported()
+      ? await detectMessageLanguage(text)
+      : null
+    if (sourceLanguage) {
+      if (samePrimaryLanguage(sourceLanguage, MESSAGE_TRANSLATION_TARGET_LANGUAGE)) {
+        return {
+          message: "Already in English.",
+          status: "unavailable",
+        }
+      }
+
+      const browserTranslation = await translateWithBrowser(
+        text,
+        sourceLanguage,
+        MESSAGE_TRANSLATION_TARGET_LANGUAGE
+      )
+      if (browserTranslation) {
+        return {
+          status: "ready",
+          text: browserTranslation,
+        }
+      }
+    }
+  } catch {
+    return offlineTranslation
+      ? {
+          status: "ready",
+          text: offlineTranslation,
+        }
+      : {
+          message: "Could not translate this message.",
+          status: "error",
+      }
+  }
+
+  return offlineTranslation
+    ? {
+        status: "ready",
+        text: offlineTranslation,
+      }
+    : {
+        message: "Translation unavailable for this message.",
+        status: "unavailable",
+      }
+}
+
+function browserTranslationSupported() {
+  return Boolean((globalThis as BrowserTranslationScope).Translator?.create)
+}
+
+async function translateWithBrowser(
+  text: string,
+  sourceLanguage: string,
+  targetLanguage: string
+) {
+  const translatorApi = (globalThis as BrowserTranslationScope).Translator
+  if (!translatorApi?.create) return null
+
+  const source = normalizedLanguageCode(sourceLanguage)
+  const target = normalizedLanguageCode(targetLanguage)
+  if (!source || !target || samePrimaryLanguage(source, target)) return null
+
+  const availability = translatorApi.availability
+    ? await translatorApi.availability({
+        sourceLanguage: source,
+        targetLanguage: target,
+      })
+    : "downloadable"
+  if (availability === "unavailable") return null
+
+  const translator = await translatorApi.create({
+    sourceLanguage: source,
+    targetLanguage: target,
+  })
+  try {
+    const translated = (await translator.translate(text)).trim()
+    return translated && translated !== text ? translated : null
+  } finally {
+    translator.destroy?.()
+  }
+}
+
+async function detectMessageLanguage(text: string) {
+  const offlineLanguage = detectMessageLanguageOffline(text)
+  if (offlineLanguage) return offlineLanguage
+  if (!shouldUseBrowserLanguageDetector(text)) return null
+
+  const detectorApi = (globalThis as BrowserTranslationScope).LanguageDetector
+  if (!detectorApi?.create) return null
+
+  const availability = detectorApi.availability
+    ? await detectorApi.availability()
+    : "downloadable"
+  if (availability === "unavailable") return null
+
+  const detector = await detectorApi.create()
+  try {
+    const [bestMatch] = await detector.detect(text)
+    if (!bestMatch || bestMatch.confidence < 0.45) return null
+    return normalizedLanguageCode(bestMatch.detectedLanguage)
+  } finally {
+    detector.destroy?.()
+  }
+}
+
+function detectMessageLanguageOffline(text: string) {
+  if (/[äöüß]/i.test(text)) return "de"
+
+  const normalized = text.toLowerCase()
+  const languageHints: Array<[RegExp, string]> = [
+    [/\b(der|die|das|und|nicht|ich|du|wir|bitte|danke|hallo|morgen|abend)\b/, "de"],
+    [/\b(el|la|los|las|hola|gracias|por favor|que|estoy|eres|buenos)\b|[¿¡ñ]/, "es"],
+    [/\b(le|la|les|bonjour|merci|s'il|vous|nous|avec|pourquoi)\b|[ç]/, "fr"],
+    [/\b(il|lo|la|gli|ciao|grazie|per favore|sono|sei|buongiorno)\b/, "it"],
+    [/\b(de|het|een|hallo|dank je|alsjeblieft|niet|voor|waarom)\b/, "nl"],
+    [/\b(olá|obrigado|obrigada|por favor|você|não|bom dia)\b|[ãõ]/, "pt"],
+  ]
+
+  return languageHints.find(([pattern]) => pattern.test(normalized))?.[1] ?? null
+}
+
+function shouldUseBrowserLanguageDetector(text: string) {
+  const words = text.trim().split(/\s+/).filter(Boolean)
+  return text.trim().length >= 24 && words.length >= 4
+}
+
+function normalizedLanguageCode(language: string) {
+  const cleanLanguage = language.trim()
+  if (!cleanLanguage) return null
+  return cleanLanguage.split("-").filter(Boolean).slice(0, 2).join("-").toLowerCase()
+}
+
+function samePrimaryLanguage(left: string, right: string) {
+  return left.split("-")[0] === right.split("-")[0]
 }
 
 export function replyChainFor(messages: ChatMessage[], messageId: string) {
