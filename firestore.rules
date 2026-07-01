@@ -33,7 +33,10 @@ service cloud.firestore {
           "audioMimeType",
           "audioUrl",
           "attachments",
+          "accentColor",
           "avatar",
+          "authorIsAnonymous",
+          "banner",
           "body",
           "clientCreatedAt",
           "createdAt",
@@ -65,9 +68,15 @@ service cloud.firestore {
         && request.resource.data.audioDurationMs is number
         && request.resource.data.audioDurationMs >= 0
         && request.resource.data.audioDurationMs <= 120000
+        && request.resource.data.accentColor is string
+        && request.resource.data.accentColor.matches('#[0-9A-Fa-f]{6}')
+        && request.resource.data.authorIsAnonymous is bool
+        && request.resource.data.banner is string
+        && request.resource.data.banner.size() <= 800000
         && request.resource.data.clientCreatedAt is number
         && request.resource.data.createdAt == request.time
         && request.resource.data.avatar is string
+        && request.resource.data.avatar.size() <= 800000
         && request.resource.data.replyToId is string
         && request.resource.data.soundKind is string
         && claimedUsernameMatches(
@@ -198,6 +207,7 @@ service cloud.firestore {
         && profile.keys().hasOnly([
           "accentColor",
           "avatar",
+          "banner",
           "joinedAt",
           "name",
           "statusText"
@@ -207,6 +217,8 @@ service cloud.firestore {
         && profile.name.size() <= 80
         && profile.avatar is string
         && profile.avatar.size() <= 800000
+        && profile.banner is string
+        && profile.banner.size() <= 800000
         && profile.accentColor is string
         && profile.accentColor.matches('#[0-9A-Fa-f]{6}')
         && profile.joinedAt is number
@@ -348,6 +360,7 @@ service cloud.firestore {
           "avatar",
           "cameraOn",
           "clientUpdatedAt",
+          "isAnonymous",
           "joinedAt",
           "lastSeenAt",
           "name",
@@ -360,6 +373,7 @@ service cloud.firestore {
         && request.resource.data.avatar.size() <= 800000
         && request.resource.data.cameraOn is bool
         && request.resource.data.clientUpdatedAt is number
+        && request.resource.data.isAnonymous is bool
         && request.resource.data.joinedAt is number
         && request.resource.data.lastSeenAt is number
         && request.resource.data.name is string

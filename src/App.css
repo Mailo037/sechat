@@ -2925,6 +2925,7 @@ body,
 .user-profile-avatar-ring .chat-avatar {
   width: 46px;
   height: 46px;
+  box-shadow: 0 0 0 2px var(--user-profile-accent, #f4f4f5);
 }
 
 .user-profile-summary {
@@ -5993,6 +5994,7 @@ body,
 .profile-avatar-upload .chat-avatar {
   width: 60px;
   height: 60px;
+  box-shadow: 0 0 0 2px var(--profile-accent, #f4f4f5);
 }
 
 .profile-avatar-upload-badge {
