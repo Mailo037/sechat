@@ -9,10 +9,10 @@ import { cn } from "@/lib/utils"
 import type { ModerationSettings, ModerationUser, NotificationSettings, Profile, RoomSettings, SoundKind, SpamModerationLogEntry, UiSoundKind, UserModerationState, UsernameClaim } from "@/types"
 import { ArrowBendUpLeft, At, Bell, BellRinging, Broom, Camera, CaretUp, Clock, DotsThreeVertical, GlobeSimple, LockKey, Microphone, Paperclip, PencilSimple, PhoneCall, PhoneDisconnect, Play, Prohibit, ShieldCheck, SpeakerHigh, SpeakerSlash, X } from "@phosphor-icons/react"
 import { AnimatePresence, motion, useReducedMotion } from "motion/react"
-import { useEffect, useMemo, useState } from "react"
-import type { FormEvent as ReactFormEvent } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
+import type { CSSProperties, FormEvent as ReactFormEvent, KeyboardEvent as ReactKeyboardEvent } from "react"
 import { SPAM_BAN_TRIGGER_COUNT, defaultProfile, moderationReasonPresets, uiCuePreviewOptions, uiSoundOptions } from "@/components/chat/chat-constants"
-import { formatRemainingTime, formatTime, initials, moderationActionLabel } from "@/components/chat/chat-format"
+import { formatRemainingTime, formatTime, moderationActionLabel } from "@/components/chat/chat-format"
 import { cleanUsernameDisplayName, configuredAdminPassword, useCacheClearAction, writeAdminUnlocked } from "@/components/chat/chat-state"
 import type { Panel } from "@/components/chat/chat-types"
 import { ChatAvatar } from "@/components/chat/ChatAvatar"
@@ -210,6 +210,7 @@ export function TopLeftDock({
   const notificationStatus = notifications.soundsEnabled
     ? `${enabledSoundKinds}/3 sounds on`
     : "Muted"
+  const profileCustomizationEnabled = Boolean(authUser && !authUser.isAnonymous)
 
   return (
     <div className="top-chrome">
@@ -455,7 +456,11 @@ export function TopLeftDock({
               transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
             >
               <div className="quick-menu-head">
-                <ChatAvatar name={profile.name} src={profile.avatar} size="sm" />
+                <ChatAvatar
+                  name={profile.name}
+                  src={profileCustomizationEnabled ? profile.avatar : ""}
+                  size="sm"
+                />
                 <div>
                   <strong>Main Chat</strong>
                   <span>Signed in as {profile.name}</span>
@@ -495,6 +500,16 @@ export function TopLeftDock({
 
               <button
                 className="quick-menu-row"
+                type="button"
+                onClick={() => openPanel("blocked")}
+              >
+                <Prohibit weight="duotone" />
+                <span>Blocked users</span>
+                <small>{blockedUsers.length}</small>
+              </button>
+
+              <button
+                className="quick-menu-row"
                 disabled={cacheClearing}
                 type="button"
                 onClick={() => void clearBrowserCache()}
@@ -520,18 +535,21 @@ export function TopLeftDock({
               className={cn(
                 "control-panel",
                 activePanel === "profile" && "profile-control-panel",
+                activePanel === "blocked" && "blocked-users-control-panel",
                 activePanel === "notifications" && "notifications-control-panel"
               )}
               exit={{ opacity: 0, y: -8, scale: 0.98 }}
               initial={reduceMotion ? false : { opacity: 0, y: -8, scale: 0.98 }}
               transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
-              >
+            >
               <div className="panel-head">
                 <div className="panel-title-with-icon">
                   {activePanel === "profile" ? (
                     <PencilSimple weight="duotone" />
                   ) : activePanel === "trusted" ? (
                     <ShieldCheck weight="duotone" />
+                  ) : activePanel === "blocked" ? (
+                    <Prohibit weight="duotone" />
                   ) : (
                     <NotificationIcon weight="duotone" />
                   )}
@@ -540,7 +558,9 @@ export function TopLeftDock({
                       ? "Your profile"
                       : activePanel === "trusted"
                         ? "Trusted sites"
-                        : "Notifications"}
+                        : activePanel === "blocked"
+                          ? "Blocked users"
+                          : "Notifications"}
                   </strong>
                 </div>
                 <Button
@@ -560,7 +580,6 @@ export function TopLeftDock({
                   authBusy={authBusy}
                   authError={authError}
                   authUser={authUser}
-                  blockedUsers={blockedUsers}
                   profile={profile}
                   usernameBusy={usernameBusy}
                   usernameClaim={usernameClaim}
@@ -570,7 +589,6 @@ export function TopLeftDock({
                   onAvatarFile={onAvatarFile}
                   onGoogleSignIn={onGoogleSignIn}
                   onGoogleSignOut={onGoogleSignOut}
-                  onBlockUserToggle={onBlockUserToggle}
                   onProfileChange={onProfileChange}
                   onUsernameClaim={onUsernameClaim}
                   onUsernameDraftChange={onUsernameDraftChange}
@@ -579,6 +597,11 @@ export function TopLeftDock({
                 <TrustedSitesPanel
                   trustedSites={trustedSites}
                   onRemoveTrustedSite={onRemoveTrustedSite}
+                />
+              ) : activePanel === "blocked" ? (
+                <BlockedUsersPanel
+                  blockedUsers={blockedUsers}
+                  onBlockUserToggle={onBlockUserToggle}
                 />
               ) : (
                 <NotificationsPanel
@@ -1398,7 +1421,6 @@ export function ProfilePanel({
   authBusy,
   authError,
   authUser,
-  blockedUsers,
   profile,
   usernameBusy,
   usernameClaim,
@@ -1406,7 +1428,6 @@ export function ProfilePanel({
   usernameError,
   usernameReady,
   onAvatarFile,
-  onBlockUserToggle,
   onGoogleSignIn,
   onGoogleSignOut,
   onProfileChange,
@@ -1416,7 +1437,6 @@ export function ProfilePanel({
   authBusy: boolean
   authError: string | null
   authUser: FirebaseAuthUser | null
-  blockedUsers: ModerationUser[]
   profile: Profile
   usernameBusy: boolean
   usernameClaim: UsernameClaim | null
@@ -1424,23 +1444,217 @@ export function ProfilePanel({
   usernameError: string | null
   usernameReady: boolean
   onAvatarFile: (file: File | undefined) => void
-  onBlockUserToggle: (user: { id: string; name: string }) => void
   onGoogleSignIn: () => void | Promise<void>
   onGoogleSignOut: () => void | Promise<void>
   onProfileChange: (profile: Profile) => void
   onUsernameClaim: (name?: string) => Promise<boolean>
   onUsernameDraftChange: (value: string) => void
 }) {
-  const hasAvatar = profile.avatar.trim().length > 0
-  const displayedInitials = initials(profile.name) || "Y"
+  const avatarInputRef = useRef<HTMLInputElement | null>(null)
+  const bannerInputRef = useRef<HTMLInputElement | null>(null)
+  const googleConnected = Boolean(authUser && !authUser.isAnonymous)
+  const profileCustomizationEnabled = googleConnected
+  const displayAvatar = profileCustomizationEnabled ? profile.avatar : ""
+  const displayBanner = profileCustomizationEnabled ? profile.banner : ""
+  const hasAvatar = displayAvatar.trim().length > 0
+  const hasBanner = displayBanner.trim().length > 0
+  const displayName = profile.name.trim() || usernameDraft.trim() || "You"
   const usernameChanged =
     cleanUsernameDisplayName(usernameDraft) !== cleanUsernameDisplayName(profile.name)
-  const googleConnected = Boolean(authUser && !authUser.isAnonymous)
+  const profileSubtitle = usernameChanged
+    ? "Unsaved username"
+    : profile.statusText?.trim()
+      ? profile.statusText
+      : usernameReady && usernameClaim
+        ? `@${usernameClaim.key}`
+        : "Pick a username"
+  const profileAccent = profileCustomizationEnabled
+    ? profile.accentColor ?? defaultProfile.accentColor
+    : defaultProfile.accentColor
+
+  function handleAvatarUploadKeyDown(event: ReactKeyboardEvent<HTMLLabelElement>) {
+    if (!profileCustomizationEnabled) return
+    if (event.key !== "Enter" && event.key !== " ") return
+
+    event.preventDefault()
+    avatarInputRef.current?.click()
+  }
+
+  function handleBannerFile(file: File | undefined) {
+    if (!profileCustomizationEnabled) return
+    if (!file || !file.type.startsWith("image/")) return
+
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result !== "string") return
+      onProfileChange({ ...profile, banner: reader.result })
+    }
+    reader.readAsDataURL(file)
+  }
+
+  function handleBannerUploadKeyDown(event: ReactKeyboardEvent<HTMLLabelElement>) {
+    if (!profileCustomizationEnabled) return
+    if (event.key !== "Enter" && event.key !== " ") return
+
+    event.preventDefault()
+    bannerInputRef.current?.click()
+  }
+
+  function handlePreviewNameKeyDown(event: ReactKeyboardEvent<HTMLInputElement>) {
+    if (event.key === "Enter") {
+      event.preventDefault()
+      void onUsernameClaim(usernameDraft)
+      return
+    }
+
+    if (event.key === "Escape") {
+      event.preventDefault()
+      onUsernameDraftChange(profile.name === defaultProfile.name ? "" : profile.name)
+    }
+  }
 
   return (
-    <div className="profile-form">
-      <div className="profile-card profile-hero-card">
-        <ChatAvatar name={profile.name} src={profile.avatar} size="lg" />
+    <div
+      className="profile-form"
+      style={{ "--profile-accent": profileAccent } as CSSProperties}
+    >
+      <input
+        ref={avatarInputRef}
+        accept="image/*"
+        className="sr-only"
+        disabled={!profileCustomizationEnabled}
+        id="avatar-file"
+        type="file"
+        onChange={(event) => {
+          if (profileCustomizationEnabled) {
+            onAvatarFile(event.target.files?.[0])
+          }
+          event.currentTarget.value = ""
+        }}
+      />
+      <input
+        ref={bannerInputRef}
+        accept="image/*"
+        className="sr-only"
+        disabled={!profileCustomizationEnabled}
+        id="banner-file"
+        type="file"
+        onChange={(event) => {
+          handleBannerFile(event.target.files?.[0])
+          event.currentTarget.value = ""
+        }}
+      />
+
+      <div className="profile-preview-card">
+        <label
+          aria-disabled={!profileCustomizationEnabled}
+          aria-label={
+            profileCustomizationEnabled
+              ? hasBanner
+                ? "Change profile banner"
+                : "Upload profile banner"
+              : "Sign in to choose profile banner"
+          }
+          className={cn(
+            "profile-preview-cover",
+            hasBanner && "has-banner",
+            !profileCustomizationEnabled && "locked"
+          )}
+          data-tooltip={
+            profileCustomizationEnabled
+              ? hasBanner
+                ? "Change banner"
+                : "Upload banner"
+              : "Sign in with Google"
+          }
+          htmlFor={profileCustomizationEnabled ? "banner-file" : undefined}
+          role="button"
+          style={
+            hasBanner
+              ? ({ "--profile-banner-image": `url(${displayBanner})` } as CSSProperties)
+              : undefined
+          }
+          tabIndex={profileCustomizationEnabled ? 0 : -1}
+          onKeyDown={
+            profileCustomizationEnabled ? handleBannerUploadKeyDown : undefined
+          }
+        >
+          <span className="profile-banner-upload-badge">
+            <Camera weight="bold" />
+            <span>
+              {profileCustomizationEnabled
+                ? hasBanner
+                  ? "Change banner"
+                  : "Add banner"
+                : "Sign in"}
+            </span>
+          </span>
+        </label>
+        <div className="profile-preview-main">
+          <label
+            aria-disabled={!profileCustomizationEnabled}
+            aria-label={
+              profileCustomizationEnabled
+                ? "Upload profile picture"
+                : "Sign in to choose profile picture"
+            }
+            className={cn(
+              "profile-avatar-upload",
+              !profileCustomizationEnabled && "locked"
+            )}
+            data-tooltip={
+              profileCustomizationEnabled
+                ? hasAvatar
+                  ? "Change picture"
+                  : "Upload picture"
+                : "Sign in with Google"
+            }
+            htmlFor={profileCustomizationEnabled ? "avatar-file" : undefined}
+            role="button"
+            tabIndex={profileCustomizationEnabled ? 0 : -1}
+            onKeyDown={
+              profileCustomizationEnabled ? handleAvatarUploadKeyDown : undefined
+            }
+          >
+            <ChatAvatar name={displayName} src={displayAvatar} size="lg" />
+            <span className="profile-avatar-upload-badge">
+              <Camera weight="bold" />
+            </span>
+          </label>
+          <div className="profile-preview-copy">
+            <Input
+              aria-label="Profile name"
+              className="profile-preview-name-input"
+              maxLength={40}
+              placeholder="Pick a username"
+              value={usernameDraft}
+              onChange={(event) => onUsernameDraftChange(event.target.value)}
+              onKeyDown={handlePreviewNameKeyDown}
+            />
+            <span>{profileSubtitle}</span>
+            <small>
+              {profileCustomizationEnabled
+                ? hasAvatar
+                  ? "Press picture to change"
+                  : "Press picture to upload"
+                : "Sign in for picture, banner, and accent"}
+            </small>
+          </div>
+          {hasAvatar && profileCustomizationEnabled ? (
+            <button
+              aria-label="Remove profile picture"
+              className="profile-avatar-remove"
+              data-tooltip="Remove picture"
+              type="button"
+              onClick={() => onProfileChange({ ...profile, avatar: "" })}
+            >
+              <X data-icon="inline-start" />
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="profile-card profile-identity-card">
         <form
           className="field-stack profile-username-form"
           onSubmit={(event) => {
@@ -1448,7 +1662,10 @@ export function ProfilePanel({
             void onUsernameClaim(usernameDraft)
           }}
         >
-          <label htmlFor="profile-name">Unique username</label>
+          <label htmlFor="profile-name">
+            <At weight="duotone" />
+            Unique username
+          </label>
           <div className="profile-username-row">
             <Input
               id="profile-name"
@@ -1475,9 +1692,12 @@ export function ProfilePanel({
         </form>
       </div>
 
-      <div className="profile-detail-grid profile-preference-grid">
-        <label>
-          <span>Custom status</span>
+      <div className="profile-preference-grid">
+        <label className="profile-setting-row profile-status-row">
+          <span>
+            <strong>Custom status</strong>
+            <small>Shown beside your profile.</small>
+          </span>
           <Input
             maxLength={80}
             placeholder="Available, busy, building..."
@@ -1487,138 +1707,110 @@ export function ProfilePanel({
             }
           />
         </label>
-        <label>
-          <span>Accent color</span>
-          <input
-            aria-label="Profile accent color"
-            type="color"
-            value={profile.accentColor ?? defaultProfile.accentColor}
-            onChange={(event) =>
-              onProfileChange({ ...profile, accentColor: event.target.value })
+        <div className="profile-compact-grid">
+          <label
+            className={cn(
+              "profile-setting-row profile-color-row",
+              !profileCustomizationEnabled && "locked"
+            )}
+            data-tooltip={
+              profileCustomizationEnabled ? undefined : "Sign in with Google"
             }
-          />
-        </label>
-        <span className="profile-joined-at">
-          Joined {formatTime(profile.joinedAt ?? Date.now())}
-        </span>
-      </div>
-
-      <div className="auth-card profile-auth-card">
-        <div>
-          <span className="setting-label">
-            <GlobeSimple weight="duotone" />
-            Google account
-          </span>
-          <p>
-            {googleConnected
-              ? authUser?.email || authUser?.displayName || "Connected with Google."
-              : "Login or sign up with Google."}
-          </p>
-          {authError ? <small className="auth-error">{authError}</small> : null}
-        </div>
-        <Button
-          disabled={authBusy}
-          size="sm"
-          type="button"
-          variant="outline"
-          onClick={() => void (googleConnected ? onGoogleSignOut() : onGoogleSignIn())}
-        >
-          {authBusy ? "Working" : googleConnected ? "Sign out" : "Google"}
-        </Button>
-      </div>
-
-      <div className="profile-blocked-panel">
-        <div className="profile-blocked-head">
-          <span className="setting-label">
-            <Prohibit weight="duotone" />
-            Blocked users
-          </span>
-          <small>{blockedUsers.length}</small>
-        </div>
-        {blockedUsers.length > 0 ? (
-          <div className="profile-blocked-list">
-            {blockedUsers.map((user) => (
-              <div className="profile-blocked-row" key={user.id}>
-                <ChatAvatar name={user.name} size="sm" src={user.avatar} />
-                <span>
-                  <strong>{user.name}</strong>
-                  <small>Messages hidden</small>
-                </span>
-                <Button
-                  size="xs"
-                  type="button"
-                  variant="ghost"
-                  onClick={() => onBlockUserToggle(user)}
-                >
-                  Unblock
-                </Button>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <small className="profile-blocked-empty">No blocked users.</small>
-        )}
-      </div>
-
-      {hasAvatar ? (
-        <div className="profile-avatar-state has-photo">
-          <span className="profile-photo-thumb">
-            <img alt="Current profile picture" src={profile.avatar} />
-          </span>
-          <div>
-            <strong>Profile photo set</strong>
-            <span>Upload a new one or remove it.</span>
-          </div>
-          <button
-            aria-label="Remove profile picture"
-            className="profile-avatar-remove"
-            data-tooltip="Remove profile picture"
-            type="button"
-            onClick={() => onProfileChange({ ...profile, avatar: "" })}
           >
-            <X data-icon="inline-start" />
-          </button>
-        </div>
-      ) : (
-        <>
-          <div className="profile-avatar-state">
-            <span className="profile-initials-chip">{displayedInitials}</span>
-            <div>
-              <strong>Using initials</strong>
-              <span>No photo is set yet.</span>
-            </div>
-          </div>
-
-          <div className="field-stack">
-            <label htmlFor="profile-avatar">Profile picture URL</label>
-            <Input
-              id="profile-avatar"
-              placeholder="Paste image URL or leave empty"
-              value={profile.avatar}
+            <span>
+              <strong>Accent</strong>
+              <small>Profile tint.</small>
+            </span>
+            <input
+              aria-label="Profile accent color"
+              disabled={!profileCustomizationEnabled}
+              type="color"
+              value={profileAccent}
               onChange={(event) =>
-                onProfileChange({
-                  ...profile,
-                  avatar: event.target.value,
-                })
+                profileCustomizationEnabled
+                  ? onProfileChange({ ...profile, accentColor: event.target.value })
+                  : undefined
               }
             />
-          </div>
-        </>
-      )}
-
-      <div className="profile-actions">
-        <label className="file-button" htmlFor="avatar-file">
-          <Camera weight="duotone" />
-          Upload picture
-        </label>
-        <input
-          hidden
-          accept="image/*"
-          id="avatar-file"
-          type="file"
-          onChange={(event) => onAvatarFile(event.target.files?.[0])}
-        />
+          </label>
+          <span className="profile-joined-at">
+            <strong>Joined</strong>
+            <small>{formatTime(profile.joinedAt ?? Date.now())}</small>
+          </span>
+        </div>
       </div>
+
+      {googleConnected ? (
+        <div className="profile-auth-actions">
+          <Button
+            className="profile-logout-button"
+            disabled={authBusy}
+            size="sm"
+            type="button"
+            variant="outline"
+            onClick={() => void onGoogleSignOut()}
+          >
+            {authBusy ? "Logging out" : "Log out"}
+          </Button>
+          {authError ? <small className="auth-error">{authError}</small> : null}
+        </div>
+      ) : (
+        <div className="auth-card profile-auth-card">
+          <div>
+            <span className="setting-label">
+              <GlobeSimple weight="duotone" />
+              Google account
+            </span>
+            <p>Login or sign up with Google.</p>
+            {authError ? <small className="auth-error">{authError}</small> : null}
+          </div>
+          <Button
+            disabled={authBusy}
+            size="sm"
+            type="button"
+            variant="outline"
+            onClick={() => void onGoogleSignIn()}
+          >
+            {authBusy ? "Working" : "Google"}
+          </Button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export function BlockedUsersPanel({
+  blockedUsers,
+  onBlockUserToggle,
+}: {
+  blockedUsers: ModerationUser[]
+  onBlockUserToggle: (user: { id: string; name: string }) => void
+}) {
+  return (
+    <div className="blocked-users-list-shell">
+      {blockedUsers.length > 0 ? (
+        <div className="blocked-users-list">
+          {blockedUsers.map((user) => (
+            <div className="blocked-users-row" key={user.id}>
+              <ChatAvatar name={user.name} size="sm" src={user.avatar} />
+              <span>
+                <strong>{user.name}</strong>
+                <small>Messages hidden</small>
+              </span>
+              <Button
+                size="xs"
+                type="button"
+                variant="ghost"
+                onClick={() => onBlockUserToggle(user)}
+              >
+                Unblock
+              </Button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <small className="blocked-users-empty">No blocked users.</small>
+      )}
     </div>
   )
 }

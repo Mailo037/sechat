@@ -1,6 +1,6 @@
 import type { ChatMessage, MessageAttachment, MessageType } from "@/types"
 
-export type Panel = "profile" | "notifications" | "trusted" | null
+export type Panel = "profile" | "notifications" | "trusted" | "blocked" | null
 
 export type LinkDialogState = {
   origin: string

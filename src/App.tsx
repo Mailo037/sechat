@@ -112,6 +112,7 @@ function App() {
   const [voiceStageHeight, setVoiceStageHeight] = useState(340)
   const [visibleMessageLimit, setVisibleMessageLimit] = useState(80)
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null)
+  const [openProfileGroupId, setOpenProfileGroupId] = useState<string | null>(null)
   const analyserRef = useRef<AnalyserNode | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
   const audioDraftRef = useRef<AudioDraft | null>(null)
@@ -141,6 +142,18 @@ function App() {
   const configuredRemoteEnabled = remoteChatAvailable()
   const remoteEnabled = configuredRemoteEnabled && !remoteUnavailableReason
   const googleUser = authUser && !authUser.isAnonymous ? authUser : null
+  const profileCustomizationEnabled = Boolean(googleUser)
+  const publicProfile = useMemo<Profile>(
+    () => ({
+      ...profile,
+      accentColor: profileCustomizationEnabled
+        ? profile.accentColor
+        : defaultProfile.accentColor,
+      avatar: profileCustomizationEnabled ? profile.avatar : "",
+      banner: profileCustomizationEnabled ? profile.banner : "",
+    }),
+    [profile, profileCustomizationEnabled]
+  )
   const accountStorageKey = googleUser
     ? chatStateKeyForUserId(googleUser.uid)
     : LOCAL_CHAT_STATE_KEY
@@ -228,6 +241,13 @@ function App() {
     () => groupMessages(displayedMessages),
     [displayedMessages]
   )
+
+  useEffect(() => {
+    if (!openProfileGroupId) return
+    if (messageGroups.some((group) => group.id === openProfileGroupId)) return
+    setOpenProfileGroupId(null)
+  }, [messageGroups, openProfileGroupId])
+
   const pinnedMessages = useMemo(
     () =>
       unblockedMessages
@@ -364,7 +384,7 @@ function App() {
     for (const user of remoteUsers) {
       const isSelf = user.id === authorId
       users.set(user.id, {
-        avatar: isSelf ? profile.avatar : "",
+        avatar: isSelf ? publicProfile.avatar : "",
         id: user.id,
         isSelf,
         lastSeenAt: user.lastSeenAt,
@@ -377,7 +397,7 @@ function App() {
     if (usernameClaim) {
       const current = users.get(authorId)
       users.set(authorId, {
-        avatar: profile.avatar,
+        avatar: publicProfile.avatar,
         id: authorId,
         isSelf: true,
         lastSeenAt: Math.max(current?.lastSeenAt ?? 0, Date.now()),
@@ -393,7 +413,7 @@ function App() {
       const isSelf = message.authorId === authorId
       const current = users.get(message.authorId)
       users.set(message.authorId, {
-        avatar: isSelf ? profile.avatar : message.avatar || current?.avatar || "",
+        avatar: isSelf ? publicProfile.avatar : message.avatar || current?.avatar || "",
         id: message.authorId,
         isSelf,
         lastSeenAt: Math.max(current?.lastSeenAt ?? 0, message.createdAt),
@@ -410,7 +430,7 @@ function App() {
   }, [
     authorId,
     messages,
-    profile.avatar,
+    publicProfile.avatar,
     profile.name,
     remoteModerations,
     remoteUsers,
@@ -1349,7 +1369,9 @@ function App() {
       authorId,
       authorName: profile.name,
       usernameKey: usernameClaim?.key,
-      avatar: profile.avatar,
+      avatar: publicProfile.avatar,
+      accentColor: publicProfile.accentColor,
+      banner: publicProfile.banner,
       body: input.body,
       createdAt: Date.now(),
       attachments: input.attachments,
@@ -1883,8 +1905,10 @@ function App() {
     updateLocalMessage(message.id, (current) => ({ ...current, sendStatus: "sending", uploadProgress: 0 }))
     try {
       const remoteAuthorId = await sendRemoteMessage({
+        accentColor: publicProfile.accentColor,
         authorName: profile.name,
-        avatar: profile.avatar,
+        avatar: publicProfile.avatar,
+        banner: publicProfile.banner,
         body: message.body,
         attachments: message.attachments,
         audioDurationMs: message.audioDurationMs,
@@ -1944,7 +1968,9 @@ function App() {
       authorId,
       authorName: profile.name,
       usernameKey: usernameClaim?.key ?? profileUsernameKey,
-      avatar: profile.avatar,
+      avatar: publicProfile.avatar,
+      accentColor: publicProfile.accentColor,
+      banner: publicProfile.banner,
       body,
       createdAt: Date.now(),
       attachments,
@@ -1968,8 +1994,10 @@ function App() {
 
       try {
         const remoteAuthorId = await sendRemoteMessage({
+          accentColor: publicProfile.accentColor,
           authorName: profile.name,
-          avatar: profile.avatar,
+          avatar: publicProfile.avatar,
+          banner: publicProfile.banner,
           body,
           attachments,
           onUploadProgress: (progress) =>
@@ -2028,7 +2056,9 @@ function App() {
       authorId,
       authorName: profile.name,
       usernameKey: usernameClaim?.key ?? profileUsernameKey,
-      avatar: profile.avatar,
+      avatar: publicProfile.avatar,
+      accentColor: publicProfile.accentColor,
+      banner: publicProfile.banner,
       body: "Voice message",
       createdAt: Date.now(),
       messageType: "audio",
@@ -2056,8 +2086,10 @@ function App() {
 
       try {
         const remoteAuthorId = await sendRemoteMessage({
+          accentColor: publicProfile.accentColor,
           authorName: profile.name,
-          avatar: profile.avatar,
+          avatar: publicProfile.avatar,
+          banner: publicProfile.banner,
           body: sent.body,
           messageType: "audio",
           onUploadProgress: (progress) =>
@@ -2555,7 +2587,7 @@ function App() {
   }
 
   function updateAvatarFromFile(file: File | undefined) {
-    if (!file) return
+    if (!profileCustomizationEnabled || !file) return
     const reader = new FileReader()
     reader.onload = () => {
       if (typeof reader.result === "string") {
@@ -2567,6 +2599,10 @@ function App() {
 
   async function applyAvatarCrop() {
     if (!avatarCrop) return
+    if (!profileCustomizationEnabled) {
+      setAvatarCrop(null)
+      return
+    }
     try {
       const cropped = await cropAvatarDataUrl(avatarCrop.dataUrl, avatarCrop.zoom)
       setProfile((current) => ({ ...current, avatar: cropped }))
@@ -2845,7 +2881,7 @@ function App() {
               authorId={authorId}
               interactionLocked={activeAdminBan}
               mobileChatOpen={mobileChatPopoverOpen}
-              profile={profile}
+              profile={publicProfile}
               reduceMotion={Boolean(reduceMotion)}
               remoteEnabled={remoteEnabled}
               showMobileChatToggle={mobileReplyGesture}
@@ -3088,7 +3124,15 @@ function App() {
               </Button>
             </div>
           ) : null}
-          <div className="message-scroll" ref={scrollRef}>
+          <div
+            className="message-scroll"
+            ref={scrollRef}
+            onScroll={() => {
+              if (openProfileGroupId) {
+                setOpenProfileGroupId(null)
+              }
+            }}
+          >
             <div className={cn("message-stack", messageGroups.length === 0 && "empty")}>
               {hiddenOlderMessageCount > 0 ? (
                 <button
@@ -3107,9 +3151,10 @@ function App() {
                     group={group}
                     highlightedMessageId={highlightedMessageId}
                     mobileReplyGesture={mobileReplyGesture}
+                    profileOpen={openProfileGroupId === group.id}
                     adminUnlocked={adminUnlocked}
                     blocked={blockedUserIds.has(group.authorId)}
-                    profile={profile}
+                    profile={publicProfile}
                     quoteFor={(message) =>
                       unblockedMessages.find((item) => item.id === message.replyToId)
                     }
@@ -3120,6 +3165,9 @@ function App() {
                     onEditMessage={openMessageEdit}
                     onJumpToMessage={jumpToMessage}
                     onPinMessage={toggleMessagePin}
+                    onProfileOpenChange={(open) =>
+                      setOpenProfileGroupId(open ? group.id : null)
+                    }
                     onReportMessage={reportMessage}
                     onRetryMessage={retryFailedMessage}
                     onReact={toggleReaction}

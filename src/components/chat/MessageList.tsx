@@ -6,7 +6,7 @@ import type { ChatMessage, MessageAttachment, Profile } from "@/types"
 import { ArrowBendUpLeft, ArrowSquareOut, At, Check, CopySimple, DotsThreeVertical, DownloadSimple, File as FileIcon, Flag, GlobeSimple, LinkSimple, PencilSimple, Play, Plus, PushPinSimple, ShareFat, Smiley, Star, Trash, UserCheck, UserMinus } from "@phosphor-icons/react"
 import { AnimatePresence, motion, useReducedMotion } from "motion/react"
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
-import type { CSSProperties, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react"
+import type { CSSProperties, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from "react"
 import { AudioMessage, AudioMessagePlayer } from "@/components/chat/AudioMessage"
 import { REACTION_ANIMATED_EMOJIS, REACTION_OPTIONS } from "@/components/chat/chat-constants"
 import { formatFileSize, formatTime } from "@/components/chat/chat-format"
@@ -205,6 +205,7 @@ export function MessageBlock({
   group,
   highlightedMessageId,
   mobileReplyGesture,
+  profileOpen,
   onDeleteMessage,
   onEditMessage,
   onExternalLink,
@@ -213,6 +214,7 @@ export function MessageBlock({
   onPinMessage,
   onReportMessage,
   onRetryMessage,
+  onProfileOpenChange,
   onReact,
   onReply,
   onSelectMessage,
@@ -232,6 +234,7 @@ export function MessageBlock({
   group: MessageGroup
   highlightedMessageId: string | null
   mobileReplyGesture: boolean
+  profileOpen: boolean
   onDeleteMessage: (message: ChatMessage) => void | Promise<void>
   onEditMessage: (message: ChatMessage) => void
   onExternalLink: (url: string, displayUrl: string) => void
@@ -240,6 +243,7 @@ export function MessageBlock({
   onPinMessage: (message: ChatMessage) => void
   onReportMessage: (message: ChatMessage) => void
   onRetryMessage: (message: ChatMessage) => void | Promise<void>
+  onProfileOpenChange: (open: boolean) => void
   onReact: (messageId: string, emoji: string) => void
   onReply: (messageId: string) => void
   onSelectMessage: (message: ChatMessage) => void
@@ -254,19 +258,83 @@ export function MessageBlock({
   translatedMessageIds: Set<string>
 }) {
   const reduceMotion = useReducedMotion()
-  const [profileOpen, setProfileOpen] = useState(false)
+  const rowRef = useRef<HTMLElement | null>(null)
+  const profilePointerHandledRef = useRef(false)
+  const [profilePlacement, setProfilePlacement] = useState<"above" | "below">("below")
   const firstMessage = group.messages[0]
+
+  function nextProfilePlacement() {
+    const row = rowRef.current
+    if (!row || typeof window === "undefined") return "below"
+
+    const rowRect = row.getBoundingClientRect()
+    const composer = document.querySelector<HTMLElement>(".composer")
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight
+    const composerTop = composer?.getBoundingClientRect().top ?? viewportHeight
+    const safeBottom = Math.min(composerTop, viewportHeight) - 10
+    const estimatedPopoverHeight = 168
+    const availableBelow = safeBottom - rowRect.bottom
+    const availableAbove = rowRect.top - 10
+
+    return availableBelow < estimatedPopoverHeight && availableAbove > availableBelow
+      ? "above"
+      : "below"
+  }
+
+  function toggleProfileOpen() {
+    const nextOpen = !profileOpen
+    if (nextOpen) {
+      setProfilePlacement(nextProfilePlacement())
+    }
+    onProfileOpenChange(nextOpen)
+  }
+
+  useLayoutEffect(() => {
+    if (!profileOpen) return
+    setProfilePlacement(nextProfilePlacement())
+  }, [profileOpen, group.id, group.messages.length])
+
   if (!firstMessage) return null
 
   const own = firstMessage.authorId === authorId
   const displayName = own ? profile.name : firstMessage.authorName
   const avatar = own ? profile.avatar : firstMessage.avatar
+  const profileAccent =
+    (own ? profile.accentColor : firstMessage.accentColor) ?? "#f4f4f5"
+  const profileBanner = own ? profile.banner : firstMessage.banner ?? ""
   const canBlockUser = !own && Boolean(firstMessage.authorId)
+
+  function handleProfilePointerUp(event: ReactPointerEvent<HTMLButtonElement>) {
+    if (event.pointerType === "mouse") return
+
+    event.preventDefault()
+    event.stopPropagation()
+    profilePointerHandledRef.current = true
+    toggleProfileOpen()
+  }
+
+  function handleProfileClick(event: ReactMouseEvent<HTMLButtonElement>) {
+    if (profilePointerHandledRef.current) {
+      event.preventDefault()
+      event.stopPropagation()
+      profilePointerHandledRef.current = false
+      return
+    }
+
+    toggleProfileOpen()
+  }
 
   return (
     <motion.article
+      ref={rowRef}
       animate={{ opacity: 1, y: 0, scale: 1 }}
-      className={cn("message-row", "message-block", own && "own")}
+      className={cn(
+        "message-row",
+        "message-block",
+        own && "own",
+        profileOpen && "profile-open",
+        profileOpen && profilePlacement === "above" && "profile-open-above"
+      )}
       initial={reduceMotion ? false : { opacity: 0, y: 12, scale: 0.985 }}
       layout
       transition={{ duration: 0.22, ease: [0.2, 0.8, 0.2, 1] }}
@@ -277,7 +345,8 @@ export function MessageBlock({
           aria-label={`Open ${displayName} profile`}
           className="message-avatar-button"
           type="button"
-          onClick={() => setProfileOpen((current) => !current)}
+          onClick={handleProfileClick}
+          onPointerUp={handleProfilePointerUp}
         >
           <ChatAvatar name={displayName} src={avatar} />
         </button>
@@ -289,7 +358,8 @@ export function MessageBlock({
             aria-label={`Open ${displayName} profile`}
             className="message-author-button"
             type="button"
-            onClick={() => setProfileOpen((current) => !current)}
+            onClick={handleProfileClick}
+            onPointerUp={handleProfilePointerUp}
           >
             <strong>{displayName}</strong>
           </button>
@@ -301,27 +371,40 @@ export function MessageBlock({
           {profileOpen ? (
             <motion.div
               animate={{ opacity: 1, y: 0, scale: 1 }}
-              className="user-profile-popover"
+              className={cn("user-profile-popover", profileBanner && "has-banner")}
               exit={{ opacity: 0, y: 4, scale: 0.98 }}
               initial={reduceMotion ? false : { opacity: 0, y: 4, scale: 0.98 }}
               role="group"
               aria-label={`${displayName} profile`}
+              style={
+                {
+                  "--user-profile-accent": profileAccent,
+                  ...(profileBanner
+                    ? { "--user-profile-banner": `url(${profileBanner})` }
+                    : {}),
+                } as CSSProperties
+              }
               transition={{ duration: 0.15 }}
             >
-              <ChatAvatar name={displayName} src={avatar} size="lg" />
-              <div className="user-profile-summary">
-                <strong>{displayName}</strong>
-                <span>
-                  {own
-                    ? profile.statusText || "You"
-                    : blocked
-                      ? "Blocked locally"
-                      : "Recent room participant"}
+              <div className="user-profile-banner" aria-hidden="true" />
+              <div className="user-profile-main">
+                <span className="user-profile-avatar-ring">
+                  <ChatAvatar name={displayName} src={avatar} size="lg" />
                 </span>
-                <small>
-                  Joined {formatTime(own ? profile.joinedAt ?? firstMessage.createdAt : firstMessage.createdAt)}
-                  {" "}· last active {formatTime(group.messages.at(-1)?.createdAt ?? firstMessage.createdAt)}
-                </small>
+                <div className="user-profile-summary">
+                  <strong>{displayName}</strong>
+                  <span>
+                    {own
+                      ? profile.statusText || "You"
+                      : blocked
+                        ? "Blocked locally"
+                        : "Recent room participant"}
+                  </span>
+                  <small>
+                    Joined {formatTime(own ? profile.joinedAt ?? firstMessage.createdAt : firstMessage.createdAt)}
+                    {" "}· last active {formatTime(group.messages.at(-1)?.createdAt ?? firstMessage.createdAt)}
+                  </small>
+                </div>
               </div>
               {canBlockUser ? (
                 <Button
@@ -779,7 +862,11 @@ export function MessageBubble({
     if (!canReact) return null
 
     return (
-      <div className={className} aria-label="Quick reactions">
+      <div
+        className={className}
+        aria-label="Quick reactions"
+        onWheel={handleQuickReactionWheel}
+      >
         {REACTION_OPTIONS.map((emoji) => (
           <ReactionActionButton
             active={hasReaction(message.reactions, emoji, authorId)}
@@ -897,6 +984,28 @@ export function MessageBubble({
         ) : null}
       </div>
     )
+  }
+
+  function handleQuickReactionWheel(event: ReactWheelEvent<HTMLDivElement>) {
+    const strip = event.currentTarget
+    const maxScrollLeft = strip.scrollWidth - strip.clientWidth
+    if (maxScrollLeft <= 0) return
+
+    const delta =
+      Math.abs(event.deltaX) > Math.abs(event.deltaY)
+        ? event.deltaX
+        : event.deltaY
+    if (delta === 0) return
+
+    const nextScrollLeft = Math.max(
+      0,
+      Math.min(maxScrollLeft, strip.scrollLeft + delta)
+    )
+    if (nextScrollLeft === strip.scrollLeft) return
+
+    event.preventDefault()
+    event.stopPropagation()
+    strip.scrollLeft = nextScrollLeft
   }
 
   return (

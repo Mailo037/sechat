@@ -181,6 +181,7 @@ export function suggestedProfileFromGoogle(user: FirebaseAuthUser): Profile {
   return {
     name,
     avatar: user.photoURL,
+    banner: "",
   }
 }
 
@@ -217,6 +218,7 @@ export function normalizeProfile(value: unknown): Profile {
         ? cleanUsernameDisplayName(input.name)
         : defaultProfile.name,
     avatar: typeof input.avatar === "string" ? input.avatar : "",
+    banner: typeof input.banner === "string" ? input.banner : "",
     joinedAt:
       typeof input.joinedAt === "number" && Number.isFinite(input.joinedAt)
         ? input.joinedAt

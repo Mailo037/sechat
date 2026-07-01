@@ -20,6 +20,7 @@ export type Profile = {
   accentColor?: string
   name: string
   avatar: string
+  banner: string
   joinedAt?: number
   statusText?: string
 }
@@ -157,7 +158,9 @@ export type ChatMessage = {
   authorId: AuthorId
   authorName: string
   usernameKey?: string
+  accentColor?: string
   avatar?: string
+  banner?: string
   body: string
   createdAt: number
   messageType?: MessageType

@@ -123,6 +123,7 @@ export const USERNAME_MAX_KEY_LENGTH = 24
 export const defaultProfile: Profile = {
   name: "You",
   avatar: "",
+  banner: "",
   joinedAt: Date.now(),
   statusText: "",
   accentColor: "#f4f4f5",

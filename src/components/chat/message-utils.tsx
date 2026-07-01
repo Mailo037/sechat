@@ -203,30 +203,38 @@ export function renderRichText(
   ownName: string,
   onExternalLink: (url: string, displayUrl: string) => void
 ) {
-  const urlPattern = /(?:https?:\/\/[^\s<]+|www\.[^\s<]+)/gi
+  const linkPattern = /\[([^\]\n]+)\]\(((?:https?:\/\/|www\.)[^\s<)]+)\)|(?:https?:\/\/[^\s<]+|www\.[^\s<]+)/gi
   const parts: React.ReactNode[] = []
   let lastIndex = 0
 
-  body.replace(urlPattern, (match, index: number) => {
+  body.replace(linkPattern, (...args) => {
+    const match = args[0] as string
+    const markdownLabel = args[1] as string | undefined
+    const markdownUrl = args[2] as string | undefined
+    const index = args.at(-2) as number
+
     if (index > lastIndex) {
       parts.push(...renderInlineRichText(body.slice(lastIndex, index), ownName, `t-${index}`))
     }
 
-    const { displayUrl, trailing, url } = normalizeUrlToken(match)
+    const { displayUrl, trailing, url } = normalizeUrlToken(markdownUrl ?? match)
     if (url) {
+      const label = markdownLabel ?? displayUrl
       parts.push(
         <button
           className="external-link"
           key={`url-${index}`}
           type="button"
-          onClick={() => onExternalLink(url, displayUrl)}
+          onClick={() => onExternalLink(url, label)}
         >
-          {displayUrl}
+          {markdownLabel
+            ? renderInlineRichText(markdownLabel, ownName, `url-label-${index}`)
+            : displayUrl}
           <ArrowSquareOut weight="bold" />
         </button>
       )
     } else {
-      parts.push(match)
+      parts.push(...renderInlineRichText(match, ownName, `u-${index}`))
     }
 
     if (trailing) {

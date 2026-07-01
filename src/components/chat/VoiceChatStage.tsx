@@ -27,6 +27,11 @@ function isPermissionDeniedError(error: unknown) {
   )
 }
 
+function normalizeVoicePeerVolume(volume: number) {
+  if (!Number.isFinite(volume)) return 1
+  return Math.max(0, Math.min(1, volume))
+}
+
 export function VoiceChatStage({
   adminUnlocked,
   authorId,
@@ -658,9 +663,9 @@ export function VoiceChatStage({
     audioElement.muted =
       deafenedRef.current ||
       (Boolean(peerId) && mutedVoicePeersRef.current.has(peerId as string))
-    audioElement.volume = peerId
-      ? voicePeerVolumesRef.current[peerId] ?? 1
-      : 1
+    audioElement.volume = normalizeVoicePeerVolume(
+      peerId ? voicePeerVolumesRef.current[peerId] ?? 1 : 1
+    )
 
     const sinkElement = audioElement as SinkAudioElement
     const outputId = selectedOutputIdRef.current
@@ -1566,7 +1571,7 @@ export function VoiceChatStage({
                 onVolumeChange={(peerId, volume) =>
                   setVoicePeerVolumes((current) => ({
                     ...current,
-                    [peerId]: volume,
+                    [peerId]: normalizeVoicePeerVolume(volume),
                   }))
                 }
               />
@@ -2094,10 +2099,14 @@ export function VoiceParticipantCard({
 }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const cardRef = useRef<HTMLDivElement | null>(null)
+  const clickSuppressTimerRef = useRef<number | null>(null)
   const longPressTimerRef = useRef<number | null>(null)
+  const pressMovedRef = useRef(false)
+  const suppressClickRef = useRef(false)
   const pointerStartRef = useRef<{ x: number; y: number } | null>(null)
   const canOpenMenu = !participant.isSelf
   const hasVideo = participant.cameraOn === true
+  const normalizedVolume = normalizeVoicePeerVolume(volume)
 
   useEffect(() => {
     if (!menuOpen) return
@@ -2112,11 +2121,43 @@ export function VoiceParticipantCard({
     return () => window.removeEventListener("pointerdown", close)
   }, [menuOpen])
 
+  useEffect(() => {
+    return () => {
+      if (longPressTimerRef.current !== null) {
+        window.clearTimeout(longPressTimerRef.current)
+      }
+      if (clickSuppressTimerRef.current !== null) {
+        window.clearTimeout(clickSuppressTimerRef.current)
+      }
+    }
+  }, [])
+
   function clearLongPressTimer() {
     if (longPressTimerRef.current !== null) {
       window.clearTimeout(longPressTimerRef.current)
       longPressTimerRef.current = null
     }
+  }
+
+  function suppressNextClick() {
+    suppressClickRef.current = true
+    if (clickSuppressTimerRef.current !== null) {
+      window.clearTimeout(clickSuppressTimerRef.current)
+    }
+    clickSuppressTimerRef.current = window.setTimeout(() => {
+      suppressClickRef.current = false
+      clickSuppressTimerRef.current = null
+    }, 360)
+  }
+
+  function consumeSuppressedClick() {
+    if (!suppressClickRef.current) return false
+    suppressClickRef.current = false
+    if (clickSuppressTimerRef.current !== null) {
+      window.clearTimeout(clickSuppressTimerRef.current)
+      clickSuppressTimerRef.current = null
+    }
+    return true
   }
 
   function openMenu() {
@@ -2131,10 +2172,16 @@ export function VoiceParticipantCard({
   }
 
   function handlePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
-    if (!canOpenMenu || event.pointerType === "mouse") return
+    if (event.pointerType === "mouse" || (!canOpenMenu && !hasVideo)) return
     pointerStartRef.current = { x: event.clientX, y: event.clientY }
+    pressMovedRef.current = false
     clearLongPressTimer()
-    longPressTimerRef.current = window.setTimeout(openMenu, 420)
+    if (canOpenMenu) {
+      longPressTimerRef.current = window.setTimeout(() => {
+        suppressNextClick()
+        openMenu()
+      }, 420)
+    }
   }
 
   function handlePointerMove(event: ReactPointerEvent<HTMLDivElement>) {
@@ -2143,13 +2190,26 @@ export function VoiceParticipantCard({
 
     const moved = Math.hypot(event.clientX - start.x, event.clientY - start.y)
     if (moved > 14) {
+      pressMovedRef.current = true
       clearLongPressTimer()
     }
   }
 
   function handlePointerEnd() {
+    const shouldFocusVideo =
+      hasVideo &&
+      Boolean(pointerStartRef.current) &&
+      !pressMovedRef.current &&
+      !menuOpen &&
+      !suppressClickRef.current
+
     clearLongPressTimer()
     pointerStartRef.current = null
+
+    if (shouldFocusVideo) {
+      suppressNextClick()
+      onFocusVideo(participant.id)
+    }
   }
 
   function handleToggleMute() {
@@ -2163,6 +2223,7 @@ export function VoiceParticipantCard({
   }
 
   function handleCardClick() {
+    if (consumeSuppressedClick()) return
     if (!hasVideo || menuOpen) return
     onFocusVideo(participant.id)
   }
@@ -2179,10 +2240,14 @@ export function VoiceParticipantCard({
       )}
       data-tooltip={
         hasVideo
-          ? `${participant.isSelf ? "Your camera" : `${participant.name}'s camera`} · press to focus`
-          : `${participant.isSelf ? "You" : participant.name}${muted ? " is muted for you" : speaking ? " is speaking" : ""}`
+          ? `${participant.isSelf ? "Your camera" : `${participant.name}'s camera`} · tap to focus${canOpenMenu ? ", hold for audio" : ""}`
+          : canOpenMenu
+            ? `${participant.name}${muted ? " is muted for you" : speaking ? " is speaking" : ""} · hold for audio`
+            : `${participant.isSelf ? "You" : participant.name}${speaking ? " is speaking" : ""}`
       }
       ref={cardRef}
+      aria-expanded={canOpenMenu ? menuOpen : undefined}
+      aria-haspopup={canOpenMenu ? "menu" : undefined}
       role={hasVideo || canOpenMenu ? "button" : undefined}
       tabIndex={hasVideo || canOpenMenu ? 0 : undefined}
       onClick={handleCardClick}
@@ -2219,8 +2284,12 @@ export function VoiceParticipantCard({
             className="voice-participant-menu"
             exit={{ opacity: 0, y: 4, scale: 0.96 }}
             initial={{ opacity: 0, y: 4, scale: 0.96 }}
+            aria-label={`${participant.name} audio options`}
             role="menu"
             transition={{ duration: 0.14, ease: [0.2, 0.8, 0.2, 1] }}
+            onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => event.stopPropagation()}
+            onPointerDown={(event) => event.stopPropagation()}
           >
             <button
               data-tooltip={muted ? "Hear this user again" : "Mute this user locally"}
@@ -2232,14 +2301,14 @@ export function VoiceParticipantCard({
               <span>{muted ? "Unmute" : "Mute"}</span>
             </button>
             <label className="voice-participant-volume">
-              <span>Volume {Math.round(volume * 100)}%</span>
+              <span>Volume {Math.round(normalizedVolume * 100)}%</span>
               <input
                 aria-label={`${participant.name} volume`}
-                max="1.5"
+                max="1"
                 min="0"
                 step="0.05"
                 type="range"
-                value={volume}
+                value={normalizedVolume}
                 onChange={(event) =>
                   onVolumeChange(participant.id, Number(event.currentTarget.value))
                 }

@@ -52,8 +52,10 @@ import {
 } from "./client"
 
 type SendRemoteMessageInput = {
+  accentColor?: string
   authorName: string
   avatar?: string
+  banner?: string
   body: string
   usernameKey: string
   messageType?: MessageType
@@ -84,6 +86,7 @@ const REMOTE_UPLOAD_LIMITS = {
   video: 80 * 1024 * 1024,
   file: 15 * 1024 * 1024,
 } as const
+const USERNAME_STALE_TAKEOVER_MS = 24 * 60 * 60 * 1000
 type RemoteUploadKind = keyof typeof REMOTE_UPLOAD_LIMITS
 const FIRESTORE_FILE_PREFIX = "firestore-file:"
 const ALLOWED_ATTACHMENT_MIME_TYPES = new Set([
@@ -136,22 +139,39 @@ export async function claimRemoteUsername(
     previousKey && previousKey !== key
       ? doc(current.db, "rooms", roomId, "usernames", previousKey)
       : null
+  const now = Date.now()
 
   await runTransaction(current.db, async (transaction) => {
     const existing = await transaction.get(usernameRef)
     const oldUsername = oldUsernameRef
       ? await transaction.get(oldUsernameRef)
       : null
-    if (existing.exists() && existing.data().authorId !== user.uid) {
-      throw new UsernameTakenError()
+    if (existing.exists()) {
+      const existingData = existing.data()
+      const existingAuthorId =
+        typeof existingData.authorId === "string" ? existingData.authorId : ""
+
+      if (existingAuthorId && existingAuthorId !== user.uid) {
+        const existingUpdatedAt = remoteTimestampMillis(existingData)
+        const ownerCanBeReclaimed =
+          !user.isAnonymous &&
+          existingData.isAnonymous !== false &&
+          existingUpdatedAt > 0 &&
+          now - existingUpdatedAt >= USERNAME_STALE_TAKEOVER_MS
+
+        if (!ownerCanBeReclaimed) {
+          throw new UsernameTakenError()
+        }
+      }
     }
 
     transaction.set(
       usernameRef,
       {
         authorId: user.uid,
-        clientUpdatedAt: Date.now(),
+        clientUpdatedAt: now,
         displayName: name,
+        isAnonymous: user.isAnonymous,
         updatedAt: serverTimestamp(),
         usernameKey: key,
       },
@@ -189,10 +209,16 @@ export async function saveRemoteUserPreferences(input: UserPreferences) {
     return
   }
 
+  const usernameClaim =
+    input.usernameClaim?.authorId === user.uid
+      ? sanitizeUsernameClaim(input.usernameClaim)
+      : null
+  const now = Date.now()
+
   await setDoc(
     doc(current.db, "users", user.uid),
     {
-      clientUpdatedAt: Date.now(),
+      clientUpdatedAt: now,
       blockedUserIds: sanitizeStringList(input.blockedUserIds, 500),
       moderationSettings: sanitizeModerationSettings(input.moderationSettings),
       notifications: sanitizeNotificationSettings(input.notifications),
@@ -201,14 +227,70 @@ export async function saveRemoteUserPreferences(input: UserPreferences) {
       starredMessageIds: sanitizeStringList(input.starredMessageIds, 500),
       trustedSites: sanitizeTrustedSites(input.trustedSites),
       updatedAt: serverTimestamp(),
-      usernameClaim:
-        input.usernameClaim?.authorId === user.uid
-          ? sanitizeUsernameClaim(input.usernameClaim)
-          : null,
+      usernameClaim,
       version: input.version,
     },
     { merge: true }
   )
+
+  if (usernameClaim) {
+    const roomId = getFirebaseRoomId()
+    try {
+      await refreshRemoteUsernameReservation({
+        db: current.db,
+        displayName: usernameClaim.name,
+        isAnonymous: false,
+        now,
+        roomId,
+        uid: user.uid,
+        usernameKey: usernameClaim.key,
+      })
+    } catch (error) {
+      console.warn("Remote username preference refresh failed", error)
+    }
+  }
+}
+
+async function refreshRemoteUsernameReservation(input: {
+  db: Firestore
+  displayName: string
+  isAnonymous: boolean
+  now?: number
+  roomId: string
+  uid: string
+  usernameKey: string
+}) {
+  const key = input.usernameKey.trim()
+  if (!isValidUsernameKey(key)) return
+
+  const now = input.now ?? Date.now()
+  const name = cleanUsernameDisplayName(input.displayName) || key
+  const usernameRef = doc(input.db, "rooms", input.roomId, "usernames", key)
+
+  await runTransaction(input.db, async (transaction) => {
+    const existing = await transaction.get(usernameRef)
+    if (existing.exists()) {
+      const existingAuthorId =
+        typeof existing.data().authorId === "string" ? existing.data().authorId : ""
+
+      if (existingAuthorId && existingAuthorId !== input.uid) {
+        throw new UsernameTakenError()
+      }
+    }
+
+    transaction.set(
+      usernameRef,
+      {
+        authorId: input.uid,
+        clientUpdatedAt: now,
+        displayName: name,
+        isAnonymous: input.isAnonymous,
+        updatedAt: serverTimestamp(),
+        usernameKey: key,
+      },
+      { merge: true }
+    )
+  })
 }
 
 export function listenToRemoteMessages(
@@ -308,12 +390,22 @@ export async function sendRemoteMessage(input: SendRemoteMessageInput) {
   const body = input.body.trim()
   const messageType = input.messageType ?? "text"
   const usernameKey = input.usernameKey.trim()
+  const profileCustomizationEnabled = !user.isAnonymous
 
   const attachments = input.attachments ?? []
 
   if (!body && messageType !== "audio" && attachments.length === 0) {
     throw new Error("Cannot send an empty message")
   }
+
+  await refreshRemoteUsernameReservation({
+    db: current.db,
+    displayName: input.authorName,
+    isAnonymous: user.isAnonymous,
+    roomId,
+    uid: user.uid,
+    usernameKey,
+  })
 
   const remoteAttachments = await uploadRemoteAttachments(
     attachments,
@@ -340,9 +432,22 @@ export async function sendRemoteMessage(input: SendRemoteMessageInput) {
     : []
 
   await addDoc(messagesRef, {
+    accentColor:
+      profileCustomizationEnabled &&
+      input.accentColor &&
+      /^#[0-9a-f]{6}$/i.test(input.accentColor)
+        ? input.accentColor
+        : "",
     authorId: user.uid,
     authorName: input.authorName.trim() || "You",
-    avatar: input.avatar ?? "",
+    authorIsAnonymous: user.isAnonymous,
+    avatar: profileCustomizationEnabled ? input.avatar ?? "" : "",
+    banner:
+      profileCustomizationEnabled &&
+      typeof input.banner === "string" &&
+      input.banner.length <= 800000
+        ? input.banner
+        : "",
     audioDurationMs: input.audioDurationMs ?? 0,
     audioMimeType: input.audioMimeType ?? "",
     audioUrl: remoteAudioUrl ?? "",
@@ -575,9 +680,10 @@ export async function setRemoteVoicePresence(input: {
     doc(current.db, "rooms", roomId, "voiceParticipants", user.uid),
     {
       authorId: user.uid,
-      avatar: input.avatar ?? "",
+      avatar: user.isAnonymous ? "" : input.avatar ?? "",
       cameraOn: input.cameraOn === true,
       clientUpdatedAt: now,
+      isAnonymous: user.isAnonymous,
       joinedAt: input.joinedAt,
       lastSeenAt: now,
       name: input.name.trim() || "User",
@@ -1132,8 +1238,16 @@ function firestoreFileIdFromRef(value: string | undefined) {
   return value.slice(FIRESTORE_FILE_PREFIX.length)
 }
 
+function remoteTimestampMillis(data: DocumentData) {
+  if (typeof data.clientUpdatedAt === "number") return data.clientUpdatedAt
+  if (typeof data.lastSeenAt === "number") return data.lastSeenAt
+  if (typeof data.updatedAt?.toMillis === "function") return data.updatedAt.toMillis()
+  return 0
+}
+
 function toChatMessage(snapshot: QueryDocumentSnapshot<DocumentData>): ChatMessage {
   const data = snapshot.data()
+  const authorIsAnonymous = data.authorIsAnonymous === true
   const createdAt =
     typeof data.clientCreatedAt === "number"
       ? data.clientCreatedAt
@@ -1146,7 +1260,13 @@ function toChatMessage(snapshot: QueryDocumentSnapshot<DocumentData>): ChatMessa
     authorId: typeof data.authorId === "string" ? data.authorId : "",
     authorName: typeof data.authorName === "string" ? data.authorName : "User",
     usernameKey: typeof data.usernameKey === "string" ? data.usernameKey : undefined,
-    avatar: typeof data.avatar === "string" ? data.avatar : "",
+    accentColor:
+      !authorIsAnonymous &&
+      typeof data.accentColor === "string" && /^#[0-9a-f]{6}$/i.test(data.accentColor)
+        ? data.accentColor
+        : undefined,
+    avatar: !authorIsAnonymous && typeof data.avatar === "string" ? data.avatar : "",
+    banner: !authorIsAnonymous && typeof data.banner === "string" ? data.banner : "",
     body: typeof data.body === "string" ? data.body : "",
     createdAt,
     messageType: isMessageType(data.messageType) ? data.messageType : "text",
@@ -1224,6 +1344,7 @@ function toProfile(value: unknown) {
       ? cleanUsernameDisplayName(input.name)
       : "You"
   const avatar = typeof input.avatar === "string" ? input.avatar.slice(0, 800000) : ""
+  const banner = typeof input.banner === "string" ? input.banner.slice(0, 800000) : ""
 
   return {
     accentColor:
@@ -1232,6 +1353,7 @@ function toProfile(value: unknown) {
         : "#f4f4f5",
     name,
     avatar,
+    banner,
     joinedAt:
       typeof input.joinedAt === "number" && Number.isFinite(input.joinedAt)
         ? input.joinedAt
@@ -1302,6 +1424,7 @@ function sanitizeProfile(profile: UserPreferences["profile"]) {
   return {
     name: cleanUsernameDisplayName(profile.name) || "You",
     avatar: profile.avatar.slice(0, 800000),
+    banner: profile.banner.slice(0, 800000),
     accentColor:
       profile.accentColor && /^#[0-9a-f]{6}$/i.test(profile.accentColor)
         ? profile.accentColor
@@ -1488,7 +1611,12 @@ function toVoiceParticipant(
   if (!id || !lastSeenAt) return null
 
   return {
-    avatar: typeof data.avatar === "string" ? data.avatar : "",
+    avatar:
+      data.isAnonymous === true
+        ? ""
+        : typeof data.avatar === "string"
+          ? data.avatar
+          : "",
     cameraOn: data.cameraOn === true,
     id,
     joinedAt: typeof data.joinedAt === "number" ? data.joinedAt : lastSeenAt,
