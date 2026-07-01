@@ -69,7 +69,10 @@ service cloud.firestore {
         && request.resource.data.audioDurationMs >= 0
         && request.resource.data.audioDurationMs <= 120000
         && request.resource.data.accentColor is string
-        && request.resource.data.accentColor.matches('#[0-9A-Fa-f]{6}')
+        && (
+          request.resource.data.accentColor == ""
+          || request.resource.data.accentColor.matches('#[0-9A-Fa-f]{6}')
+        )
         && request.resource.data.authorIsAnonymous is bool
         && request.resource.data.banner is string
         && request.resource.data.banner.size() <= 800000
@@ -169,6 +172,7 @@ service cloud.firestore {
           "authorId",
           "clientUpdatedAt",
           "displayName",
+          "isAnonymous",
           "updatedAt",
           "usernameKey"
         ])
@@ -178,6 +182,7 @@ service cloud.firestore {
         && request.resource.data.displayName.size() >= 3
         && request.resource.data.displayName.size() <= 40
         && request.resource.data.displayName.matches('[A-Za-z0-9 _-]{3,40}')
+        && request.resource.data.isAnonymous is bool
         && request.resource.data.updatedAt == request.time
         && request.resource.data.usernameKey == usernameKey
         && request.resource.data.usernameKey.matches('[a-z0-9][a-z0-9_-]{2,23}');
