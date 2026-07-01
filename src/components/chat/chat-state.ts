@@ -355,9 +355,9 @@ export function normalizeTrustedSites(value: unknown) {
       value
         .filter((site): site is string => typeof site === "string")
         .map((site) => site.trim())
-        .filter(Boolean)
+        .filter((site) => site.length > 0 && site.length <= 2048)
     )
-  )
+  ).slice(0, 50)
 }
 
 export function normalizeBlockedUserIds(value: unknown) {

@@ -204,21 +204,24 @@ export async function loadRemoteUserPreferences(userId: string) {
   return snapshot.exists() ? toUserPreferences(snapshot.data()) : null
 }
 
-export async function saveRemoteUserPreferences(input: UserPreferences) {
+export async function saveRemoteUserPreferences(
+  userId: string,
+  input: UserPreferences
+) {
   const current = getFirebaseServices()
   const user = await ensureAnonymousUser()
-  if (!current || !user || user.isAnonymous) {
-    return
+  if (!current || !user || user.isAnonymous || user.uid !== userId) {
+    return false
   }
 
   const usernameClaim =
-    input.usernameClaim?.authorId === user.uid
+    input.usernameClaim?.authorId === userId
       ? sanitizeUsernameClaim(input.usernameClaim)
       : null
   const now = Date.now()
 
   await setDoc(
-    doc(current.db, "users", user.uid),
+    doc(current.db, "users", userId),
     {
       clientUpdatedAt: now,
       blockedUserIds: sanitizeStringList(input.blockedUserIds, 500),
@@ -244,13 +247,15 @@ export async function saveRemoteUserPreferences(input: UserPreferences) {
         isAnonymous: false,
         now,
         roomId,
-        uid: user.uid,
+        uid: userId,
         usernameKey: usernameClaim.key,
       })
     } catch (error) {
       console.warn("Remote username preference refresh failed", error)
     }
   }
+
+  return true
 }
 
 async function refreshRemoteUsernameReservation(input: {

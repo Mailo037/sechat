@@ -667,9 +667,11 @@ function App() {
     if (serialized === lastSavedRemotePreferencesRef.current) return
 
     const timeout = window.setTimeout(() => {
-      saveRemoteUserPreferences(stateForPreferences)
-        .then(() => {
-          lastSavedRemotePreferencesRef.current = serialized
+      saveRemoteUserPreferences(googleUser.uid, stateForPreferences)
+        .then((saved) => {
+          if (saved) {
+            lastSavedRemotePreferencesRef.current = serialized
+          }
         })
         .catch((error) => {
           console.warn("Remote user preferences save failed", error)
