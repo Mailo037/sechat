@@ -35,6 +35,7 @@ function normalizeVoicePeerVolume(volume: number) {
 export function VoiceChatStage({
   adminUnlocked,
   authorId,
+  autoJoinRequestId,
   interactionLocked,
   mobileChatOpen,
   profile,
@@ -50,6 +51,7 @@ export function VoiceChatStage({
 }: {
   adminUnlocked: boolean
   authorId: string
+  autoJoinRequestId: number
   interactionLocked: boolean
   mobileChatOpen: boolean
   profile: Profile
@@ -136,6 +138,7 @@ export function VoiceChatStage({
   const authorIdRef = useRef(authorId)
   const connectedRef = useRef(false)
   const isSpeakingRef = useRef(false)
+  const joinVoiceRef = useRef<() => void>(() => undefined)
   const leaveVoiceRef = useRef<() => void>(() => undefined)
   const deafenedRef = useRef(false)
   const micMeterVisibleRef = useRef(micMeterVisible)
@@ -144,6 +147,9 @@ export function VoiceChatStage({
   const remoteEnabledRef = useRef(remoteEnabled)
   const selectedOutputIdRef = useRef("")
   const cameraEnabledRef = useRef(false)
+  const lastAutoJoinRequestIdRef = useRef(0)
+  const mountedRef = useRef(true)
+  const voiceJoinInFlightRef = useRef(false)
   const voiceMutedRef = useRef(false)
   const voiceStreamRef = useRef<MediaStream | null>(null)
   const isSpeaking = connected && !muted && voiceLevel > voiceSensitivity
@@ -277,8 +283,21 @@ export function VoiceChatStage({
   }, [profile.avatar, profile.name, usernameKey])
 
   useEffect(() => {
+    joinVoiceRef.current = () => {
+      void joinVoice()
+    }
     leaveVoiceRef.current = leaveVoice
   })
+
+  useEffect(() => {
+    if (autoJoinRequestId <= 0) return
+    if (lastAutoJoinRequestIdRef.current === autoJoinRequestId) return
+
+    lastAutoJoinRequestIdRef.current = autoJoinRequestId
+    if (connectedRef.current) return
+
+    joinVoiceRef.current()
+  }, [autoJoinRequestId])
 
   useEffect(() => {
     isSpeakingRef.current = isSpeaking
@@ -405,6 +424,7 @@ export function VoiceChatStage({
 
   useEffect(() => {
     return () => {
+      mountedRef.current = false
       speechRecognitionRef.current?.stop()
       removeVoiceRemoteSession()
       cleanupVoiceResources(false)
@@ -1291,6 +1311,9 @@ export function VoiceChatStage({
       return
     }
 
+    if (connectedRef.current || voiceJoinInFlightRef.current) return
+
+    voiceJoinInFlightRef.current = true
     setVoiceError(null)
 
     try {
@@ -1318,6 +1341,12 @@ export function VoiceChatStage({
       analyser.smoothingTimeConstant = 0.28
       source.connect(analyser)
 
+      if (!mountedRef.current) {
+        stream.getTracks().forEach((track) => track.stop())
+        audioContext.close().catch(() => undefined)
+        return
+      }
+
       cleanupVoiceResources()
       voiceStreamRef.current = stream
       voiceAudioContextRef.current = audioContext
@@ -1344,6 +1373,8 @@ export function VoiceChatStage({
       runVoiceMeter()
       startVoiceStatsPolling()
     } catch (error) {
+      if (!mountedRef.current) return
+
       console.warn("Voice chat failed", error)
       cleanupVoiceResources()
       setConnected(false)
@@ -1352,6 +1383,8 @@ export function VoiceChatStage({
           ? "Microphone permission is needed for voice chat."
           : "Could not start voice chat."
       )
+    } finally {
+      voiceJoinInFlightRef.current = false
     }
   }
 

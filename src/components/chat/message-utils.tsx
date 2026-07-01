@@ -97,6 +97,36 @@ export function messageIdFromHash(hash: string) {
   }
 }
 
+export function isVoiceChatHash(hash: string) {
+  let cleanHash = hash.replace(/^#/, "").trim()
+  if (!cleanHash) return false
+
+  try {
+    cleanHash = decodeURIComponent(cleanHash)
+  } catch {
+    return false
+  }
+
+  const target = cleanHash
+    .toLowerCase()
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "")
+    .split(/[?&]/)[0]
+    ?.replace(/_/g, "-")
+
+  return Boolean(
+    target &&
+      [
+        "voice",
+        "voice-chat",
+        "voicechat",
+        "vc",
+        "join-voice",
+        "join-vc",
+      ].includes(target)
+  )
+}
+
 export function clearMessageLinkHash() {
   if (typeof window === "undefined") return
   if (!messageIdFromHash(window.location.hash)) return

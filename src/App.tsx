@@ -18,7 +18,7 @@ import { activeMentionRange, cleanUsernameDisplayName, clearCachedSpamGuard, cre
 import type { AudioDraft, AvatarCropState, LinkDialogState, MediaViewerState, MentionRange, MentionSuggestion, MessageEditState, Panel, PendingMessageInput, RecordingMode, SpamCandidate, SpamSendEntry, ThreadPromptState } from "@/components/chat/chat-types"
 import { AvatarCropDialog, ExternalLinkDialog, MediaViewerDialog, MessageEditDialog, ThreadPanelDialog } from "@/components/chat/ChatDialogs"
 import { attachmentLimitForFile, attachmentLimitKindForFile, attachmentLimitLabel, blobToDataUrl, clampLevel, clampNumber, compactWaveform, cropAvatarDataUrl, fileToAttachment, filesFromClipboard, getSupportedAudioMimeType, isAcceptedAttachmentFile, isMicrophonePermissionError, makeId, makeQuietWaveform } from "@/components/chat/media-utils"
-import { clearMessageLinkHash, groupMessages, hasReaction, messageElementId, messageIdFromHash, messagePreview, openExternalLink, originFromUrl, replyChainFor, replyRootIdFor, updateMessageReaction } from "@/components/chat/message-utils"
+import { clearMessageLinkHash, groupMessages, hasReaction, isVoiceChatHash, messageElementId, messageIdFromHash, messagePreview, openExternalLink, originFromUrl, replyChainFor, replyRootIdFor, updateMessageReaction } from "@/components/chat/message-utils"
 import { MessageComposer } from "@/components/chat/MessageComposer"
 import { MessageBlock } from "@/components/chat/MessageList"
 import { OnboardingOverlay } from "@/components/chat/OnboardingOverlay"
@@ -107,6 +107,7 @@ function App() {
   const [permission, setPermission] = useState(getNotificationPermission())
   const [unread, setUnread] = useState(0)
   const [voiceChatOpen, setVoiceChatOpen] = useState(false)
+  const [voiceAutoJoinRequestId, setVoiceAutoJoinRequestId] = useState(0)
   const [mobileChatPopoverOpen, setMobileChatPopoverOpen] = useState(false)
   const [voiceChatWidth, setVoiceChatWidth] = useState(420)
   const [voiceStageHeight, setVoiceStageHeight] = useState(340)
@@ -137,6 +138,7 @@ function App() {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const highlightTimeoutRef = useRef<number | null>(null)
+  const handledVoiceHashRef = useRef("")
   const lastSavedRemotePreferencesRef = useRef("")
   const cleanupRan = useRef(false)
   const configuredRemoteEnabled = remoteChatAvailable()
@@ -344,6 +346,38 @@ function App() {
       window.removeEventListener("hashchange", focusLinkedMessage)
     }
   }, [displayedMessages, ready, reduceMotion])
+
+  useEffect(() => {
+    function openLinkedVoiceChat() {
+      const hash = window.location.hash
+      if (!isVoiceChatHash(hash)) return
+      if (!ready || activeAdminBan) return
+
+      if (!hasUniqueUsername) {
+        setUsernameError("Choose a unique username before joining voice.")
+        return
+      }
+
+      const voiceHashKey = hash.trim().toLowerCase()
+      if (handledVoiceHashRef.current === voiceHashKey) return
+
+      handledVoiceHashRef.current = voiceHashKey
+      setPanel(null)
+      setVoiceChatOpen(true)
+      setMobileChatPopoverOpen(false)
+      setVoiceAutoJoinRequestId((current) => current + 1)
+    }
+
+    openLinkedVoiceChat()
+
+    const handleHashChange = () => {
+      handledVoiceHashRef.current = ""
+      openLinkedVoiceChat()
+    }
+
+    window.addEventListener("hashchange", handleHashChange)
+    return () => window.removeEventListener("hashchange", handleHashChange)
+  }, [activeAdminBan, hasUniqueUsername, ready])
 
   const moderationUsers = useMemo<ModerationUser[]>(() => {
     const users = new Map<string, ModerationUser>()
@@ -2880,6 +2914,7 @@ function App() {
             <VoiceChatStage
               adminUnlocked={adminUnlocked}
               authorId={authorId}
+              autoJoinRequestId={voiceAutoJoinRequestId}
               interactionLocked={activeAdminBan}
               mobileChatOpen={mobileChatPopoverOpen}
               profile={publicProfile}
